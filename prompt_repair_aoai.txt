@@ -1,0 +1,40 @@
+Return ONLY one strict JSON object (no markdown/prose) that is a corrected version of previous_output.
+Do NOT change semantic content except as required to make it valid JSON and satisfy the schema below.
+
+Exact top-level keys (no extras, same order):
+tokenization, ops, ct_combine, ct_fix, ct_punct, corrected_text, verification, machine_transcription_probability.
+
+Schema:
+- tokenization = {"scheme":"universal_v1","tokens": array}
+- ops = array
+- ct_combine/ct_fix/ct_punct/corrected_text = string
+- verification = {"edit_count": int, "op_details": array}
+- machine_transcription_probability = number in [0,1]
+- verification.edit_count == len(ops)
+- verification.op_details[0] starts with "TOKEN_COMBINE_RESULT:"
+- verification.op_details[1] starts with "ERROR_FIX_RESULT:"
+- verification.op_details[2] starts with "PUNCTUATION_RESULT:"
+- verification.op_details[3] starts with "CASING_RESULT:"
+
+Repair rules:
+- Remove any non-JSON text (including markdown/code fences).
+- Quote all keys/strings properly; escape quotes/newlines.
+- Remove trailing commas; use []/{} correctly.
+- If a required field is missing, add it with a safe default:
+  tokens=[], ops=[], ct_*="", corrected_text="", verification.edit_count=0,
+  verification.op_details=[
+    "TOKEN_COMBINE_RESULT: no change",
+    "ERROR_FIX_RESULT: no change",
+    "PUNCTUATION_RESULT: no change",
+    "CASING_RESULT: no change"
+  ],
+  machine_transcription_probability=0.0
+- If types are wrong, coerce to the required type.
+- Ensure verification.op_details has at least those 4 required prefixed entries in order; append them if missing.
+- Ensure the final output parses as JSON and matches the schema.
+
+Validation error:
+{validation_error}
+
+Previous output:
+{previous_output}
