@@ -252,6 +252,7 @@ async def main():
             return
 
         print(f"Using model: {model}")
+        print("Note: Copilot treats this as a requested model; backend may resolve/fallback and may not expose final model ID.")
         print(f"Using prompt file: {prompt_template_path}")
         print(f"Using repair prompt file: {repair_prompt_template_path}")
         print(f"Timeout: {timeout_seconds}s, retries: {timeout_retries}")
