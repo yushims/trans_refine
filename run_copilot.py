@@ -321,6 +321,28 @@ async def main():
                 print(f"Processing transcription {index}/{total}...")
 
             session = await client.create_session({"model": model})
+
+            requested_model = model
+            resolved_model_holder = {"value": None}
+
+            def handle_event(event):
+                event_type = getattr(event.type, "value", event.type)
+
+                if event_type == "assistant.usage":
+                    actual_model = (
+                        getattr(event.data, "model", None)
+                        or getattr(event.data, "model_id", None)
+                    )
+                    if actual_model:
+                        resolved_model_holder["value"] = actual_model
+                        # output only when requested model is not equal to resolved model
+                        if actual_model != requested_model:
+                            print(
+                                f"[MODEL MISMATCH] requested={requested_model}, "
+                                f"actual={actual_model}"
+                            )
+            session.on(handle_event)
+
             prompt = prompt_template + transcription
 
             payload = await get_payload_with_repair(
