@@ -58,6 +58,10 @@ Defaults:
 - strict JSON repair: enabled
 - output validation: enabled
 
+Model note:
+- `COPILOT_MODEL` / `--model` is treated as a requested model name.
+- In this SDK path, backend may resolve/fallback the model and may not expose the final effective model ID in response metadata.
+
 ## Input / output
 
 - Default input: `sample_multi_input.txt` (one transcription per line).
