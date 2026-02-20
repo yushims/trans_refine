@@ -1,5 +1,5 @@
 param(
-    [string]$Model = 'gpt-5.2-thinking',
+    [string]$Model = 'gpt-5.2',
     [string]$PromptFile = 'prompt_patch_copilot.txt',
     [string]$RepairPromptFile = 'prompt_repair_copilot.txt',
     [double]$Timeout = 180,
@@ -12,6 +12,7 @@ param(
     [string]$InputFile = '.\sample_multi_input.txt',
     [string]$OutputFile = '.\sample_multi_output_copilot.json',
     [string]$OutputPlainFile = '',
+    [switch]$ListModelsOnly,
     [switch]$HelpOnly
 )
 
@@ -61,7 +62,7 @@ if (-not [string]::IsNullOrWhiteSpace($OutputPlainFile)) {
     }
 }
 
-if (-not $HelpOnly) {
+if (-not $HelpOnly -and -not $ListModelsOnly) {
     if (-not (Test-Path -LiteralPath $resolvedInputPath)) {
         Write-Error "Input file not found: $resolvedInputPath"
         exit 1
@@ -107,7 +108,10 @@ if (-not $pythonCommand) {
 }
 
 Write-Host "Launching run_copilot with $pythonCommand" -ForegroundColor Cyan
-if (-not $HelpOnly) {
+if ($ListModelsOnly) {
+    Write-Host "List-models-only mode enabled." -ForegroundColor Cyan
+}
+elseif (-not $HelpOnly) {
     Write-Host "Input file: $resolvedInputPath" -ForegroundColor Cyan
     Write-Host "Output file: $resolvedOutputPath" -ForegroundColor Cyan
     Write-Host "Prompt file: $resolvedPromptPath" -ForegroundColor Cyan
@@ -123,6 +127,14 @@ if ($HelpOnly) {
     }
     else {
         & $pythonCommand $resolvedScriptPath --help
+    }
+}
+elseif ($ListModelsOnly) {
+    if ($pythonCommand -eq 'py -3.13') {
+        & py -3.13 $resolvedScriptPath --list-models-only --model $Model
+    }
+    else {
+        & $pythonCommand $resolvedScriptPath --list-models-only --model $Model
     }
 }
 else {
