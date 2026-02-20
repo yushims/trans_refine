@@ -50,11 +50,12 @@ Defaults:
 
 ```powershell
 ./run-copilot.ps1 -HelpOnly
+./run-copilot.ps1 -ListModelsOnly
 ./run-copilot.ps1
 ```
 
 Defaults:
-- model: `gpt-5.2-thinking`
+- model: `gpt-5.2`
 - strict JSON repair: enabled
 - output validation: enabled
 
@@ -75,6 +76,7 @@ Model note:
 - `--input-file`
 - `--output-file`
 - `--output-plain-file`
+- `--list-models-only`
 - `--validate-output {0,1}`
 
 Use `-HelpOnly` on either PowerShell launcher to see effective CLI options.

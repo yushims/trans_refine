@@ -37,8 +37,55 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt-file", dest="prompt_file")
     parser.add_argument("--repair-prompt-file", dest="repair_prompt_file")
     parser.add_argument("--model", dest="model")
+    parser.add_argument("--list-models-only", dest="list_models_only", action="store_true")
     parser.add_argument("--validate-output", dest="validate_output", choices=["0", "1"])
     return parser.parse_args()
+
+
+async def print_available_models(client: CopilotClient) -> None:
+    try:
+        models_result = client.list_models()
+        if asyncio.iscoroutine(models_result):
+            models_result = await models_result
+
+        models = models_result
+        if models is None:
+            print("Available models: <none returned>")
+            return
+
+        if isinstance(models, dict):
+            for key in ("models", "items", "data"):
+                candidate = models.get(key)
+                if isinstance(candidate, list):
+                    models = candidate
+                    break
+
+        if not isinstance(models, list):
+            print(f"Available models (raw): {models}")
+            return
+
+        print("Available models from client.list_models():")
+        for item in models:
+            if isinstance(item, dict):
+                model_id = item.get("id") or item.get("model") or item.get("name")
+                display_name = item.get("display_name") or item.get("displayName") or item.get("description")
+            else:
+                model_id = getattr(item, "id", None) or getattr(item, "model", None) or getattr(item, "name", None)
+                display_name = (
+                    getattr(item, "display_name", None)
+                    or getattr(item, "displayName", None)
+                    or getattr(item, "description", None)
+                )
+
+            if not model_id:
+                model_id = str(item)
+
+            if display_name and display_name != model_id:
+                print(f"- {model_id}: {display_name}")
+            else:
+                print(f"- {model_id}")
+    except Exception as error:
+        print(f"Warning: client.list_models() failed: {error}")
 
 
 async def send_with_timeout_retry(
@@ -205,6 +252,10 @@ async def main():
 
     try:
         args = parse_args()
+        await print_available_models(client)
+
+        if args.list_models_only:
+            return
 
         input_file_value = args.input_file or os.getenv("INPUT_FILE")
         output_file_value = args.output_file or os.getenv("OUTPUT_FILE")
@@ -226,7 +277,7 @@ async def main():
             print("No transcription provided.")
             return
 
-        model = args.model or os.getenv("COPILOT_MODEL", "gpt-5.2-thinking")
+        model = args.model or os.getenv("COPILOT_MODEL", "gpt-5.2")
         timeout_seconds = get_env_float("COPILOT_TIMEOUT", 180.0)
         timeout_retries = max(0, get_env_int("COPILOT_TIMEOUT_RETRIES", 2))
         empty_result_retries = max(0, get_env_int("COPILOT_EMPTY_RESULT_RETRIES", 1))

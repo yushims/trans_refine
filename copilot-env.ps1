@@ -2,7 +2,7 @@ param(
     [ValidateSet('show', 'set', 'clear')]
     [string]$Action = 'show',
 
-    [string]$Model = 'gpt-5.2-thinking',
+    [string]$Model = 'gpt-5.2',
     [string]$PromptFile = 'prompt_patch_copilot.txt',
     [double]$Timeout = 180,
     [int]$TimeoutRetries = 2,
