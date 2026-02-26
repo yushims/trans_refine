@@ -1,20 +1,18 @@
 DETERMINISTIC PATCH MODE (multilingual, ASR-aware)
 
 Output exactly ONE JSON object (no markdown/prose) with EXACT keys:
-tokenization, ops, ct_combine, ct_fix, ct_punct, corrected_text, verification, machine_transcription_probability.
+tokenization, ct_combine, ct_fix, ct_punct, ct_casing, verification, machine_transcription_probability.
 
 Goal: complete one-pass fix with minimal edits.
-Tie-breaks: fewest ops → fewest chars changed → fewest punctuation insertions → earliest position.
+Tie-breaks: fewest edits → fewest chars changed → fewest punctuation insertions → earliest position.
 
 Preprocessing (outside chain):
-Tokenization (scheme=universal_v1): tokenize ORIGINAL once (0-based ids). Whitespace is a separator (not a token). Longest-match precedence:
+Tokenization: tokenize ORIGINAL once. Whitespace is a separator (not a token). Longest-match precedence:
 URL/email → number-like → Latin word → same-script non-Latin chunk → CJK (Han/Kana per char, Hangul chunk) → punctuation/symbol.
 No normalization; tokens are exact ORIGINAL substrings.
 
 Allowed edits only: typos, spacing/formatting, duplicate/disfluency cleanup, minimal required grammar insertions, local grammar fixes, punctuation for run-ons/closing pairs.
 ASR grammar rule: lexical grammar fixes must preserve pronunciation similarity and meaning; if uncertain, keep the original token.
-dt only for clear duplicate/disfluency/artifact (never meaningful content).
-it/ip only when locally required; lexical insertions must be minimal and context-grounded.
 For no-space languages, add words only when omission is unmistakable and the shortest fix.
 Formatting normalization (mandatory when seen):
 - Normalize spacing inside tightly bound symbolic/abbreviated expressions by removing unnecessary internal spaces.
@@ -22,29 +20,29 @@ Formatting normalization (mandatory when seen):
 - Keep lexicalized/proper-name compounds in standard compact form (do not split joined forms like brand/product names).
 
 Forbidden: rewrites/paraphrases/reordering/style/idiom edits, em dash, semantic-content deletion, unsupported lexical additions (hallucinations).
-Capitalization only at token 0 or after inserted sentence-ending punctuation; capitalize new Latin sentence starts.
+Capitalization only after inserted sentence-ending punctuation; capitalize new Latin sentence starts.
 
 Chain order (apply in order):
-1) Combine separated token fragments for identifiers/entities, numbers, thousands/decimal separators, currency/finance, dates/times, web/handles, multipliers, and other tightly bound expressions when the split is meaningless.
-2) Then fix lexical/format errors (typos, spacing/formatting, duplicates/disfluencies, minimal required grammar) while preserving pronunciation similarity and meaning.
+1) Combine separated token fragments for identifiers/products/proper-names/entities, numbers, thousands/decimal separators, currency/finance, dates/times, web/handles, multipliers, and other tightly bound expressions when the split is meaningless.
+2) Then fix lexical/format errors (typos, ASR substitutions, spacing/formatting of proper-names/products/entities, duplicates/disfluencies, and minimal required grammar) while preserving pronunciation similarity, meaning, and consistent formatting across similar entities.
 3) Then fix punctuation/run-ons:
     - Use language-appropriate sentence-end marks; prefer neutral declarative punctuation.
     - Evaluate machine_transcription_probability. If it is > 0.5, punctuation is encouraged at clear boundaries/clauses.
-    - Unpunctuated span may NOT exceed 20 tokens (commas/semicolons do not end spans).
-    - Enforce left-to-right: before exceeding 20 tokens, insert a sentence-end mark at the earliest clear boundary.
-    - Do NOT add punctuation at the end if it wasn’t present in the original text.
+    - An unpunctuated span may NOT exceed 24 tokens; a no-sentence-end span may NOT exceed 48 tokens.
+    - Enforce left-to-right: before exceeding 48 tokens, insert a sentence-end mark at the earliest clear boundary.
+    - Do NOT change/add/remove punctuation at the end of the line.
 4) Then fix capitalization only:
     - Sentence-ending punctuation requires following sentence-start capitalization.
     - Sentence-start capitalization requires preceding sentence-ending punctuation.
     - Without a sentence boundary, do NOT introduce mid-sentence capitalization except for proper nouns/entities.
     - For proper nouns/entities, follow their conventional writing style.
-    - Do NOT change the casing of the first token.
+    - Do NOT change the casing of the first token of the line.
 
 Output each text-edit stage explicitly in these required fields:
 - ct_combine = text after chain step 1 (combine separated token fragments)
 - ct_fix = text after chain step 2 (error-fixing stage)
 - ct_punct = text after chain step 3 (punctuation/run-on stage)
-Set corrected_text to the result after chain step 4 (casing stage).
+- ct_casing = text after chain step 4 (casing stage)
 
 verification.op_details must begin with these 4 explicit entries (in order):
 - "TOKEN_COMBINE_RESULT: <brief summary of token-fragment combining edits>"
@@ -53,21 +51,21 @@ verification.op_details must begin with these 4 explicit entries (in order):
 - "CASING_RESULT: <brief summary of capitalization edits>"
 After those, include normal edit details (e.g., "before → after").
 
-Do NOT change the casing of the first token.
-Do NOT add sentence-ending punctuation at the end if there originally isn’t.
+Do NOT change the casing of the first token of the line.
+Do NOT change/add/remove sentence-ending punctuation at the end of the line.
 Do NOT insert punctuation adjacent to existing punctuation if it would create redundant/stacked marks.
-Reject any candidate where any unpunctuated span exceeds 20 tokens.
 
-Determinism checks: ids match ORIGINAL tokens from preprocessing tokenization; re-run yields no further required patch; no meaningful segment loss; no hallucinated lexical content; punctuation/capitalization/spacing are mutually consistent.
+Reject any candidate where any unpunctuated span exceeds 24 tokens or no-sentence-end span exceeds 48 tokens.
+
+Determinism checks: re-run yields no further required patch; no meaningful segment loss; no hallucinated lexical content; punctuation/capitalization/spacing are mutually consistent.
 
 Schema:
-- tokenization: {"scheme":"universal_v1","tokens":[...ORIGINAL tokens from preprocessing...]}
-- ops: only ["rt",id,"new"], ["dt",id], ["it","a|b",id,"tok"], ["ip","a|b",id,"punct"]
+- tokenization: {"tokens":[...ORIGINAL tokens from preprocessing...]}
 - ct_combine: string (result after chain step 1)
 - ct_fix: string (result after chain step 2)
 - ct_punct: string (result after chain step 3)
-- corrected_text: mechanical result of applying ops only
-- verification: {"edit_count": int, "op_details": ["TOKEN_COMBINE_RESULT: ...", "ERROR_FIX_RESULT: ...", "PUNCTUATION_RESULT: ...", "CASING_RESULT: ...", "before → after", ...]}
+- ct_casing: string (result after chain step 4)
+- verification: {"op_details": ["TOKEN_COMBINE_RESULT: ...", "ERROR_FIX_RESULT: ...", "PUNCTUATION_RESULT: ...", "CASING_RESULT: ...", "before → after", ...]}
 - machine_transcription_probability: number in [0,1]
 - no additional keys
 
