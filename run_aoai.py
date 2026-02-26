@@ -1,77 +1,96 @@
 import argparse
 import asyncio
-import os
 import random
+import re
 
-from dotenv import load_dotenv
 from openai import AzureOpenAI
 from pipeline_common import (
-    apply_corrected_text_fallback,
-    get_env_bool,
-    get_env_float,
-    get_env_int,
-    format_repair_prompt,
-    load_prompt_template,
-    parse_and_validate_json,
-    parse_transcriptions_from_file,
-    resolve_bool_with_override,
-    resolve_float_with_fallback,
-    resolve_path,
-    resolve_required_template_path,
-    validate_output_payloads,
-    validate_patch_payload,
-    write_output_artifacts,
+    assign_payload_or_emit_empty,
+    build_empty_payload,
+    build_repair_prompt_after_invalid_json,
+    collect_transcriptions_from_input,
+    extract_text_content,
+    finalize_payloads_and_write,
+    handle_invalid_repair_json_result,
+    is_non_repairable_validation_error,
+    load_patch_and_repair_templates,
+    log_json_validation_with_key_error,
+    non_repairable_prefix,
+    parse_validate_and_apply_text_fixes,
+    print_common_runtime_settings,
+    print_timeout_and_retry_guidance,
+    resolve_payload_or_retry_on_empty_corrected_text,
+    resolve_patch_and_repair_template_paths,
+    run_transcriptions_with_concurrency,
+    run_with_timeout_retry,
+    should_retry_after_failure,
 )
 
-load_dotenv()
 
+PATCH_SCHEMA = {
+    "name": "deterministic_patch_output",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "tokenization": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "tokens": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": ["tokens"]
+            },
+            "ct_combine": {"type": "string"},
+            "ct_fix": {"type": "string"},
+            "ct_punct": {"type": "string"},
+            "ct_casing": {"type": "string"},
+            "verification": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "op_details": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": ["op_details"]
+            },
+            "machine_transcription_probability": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+            }
+        },
+        "required": [
+            "tokenization",
+            "ct_combine",
+            "ct_fix",
+            "ct_punct",
+            "ct_casing",
+            "verification",
+            "machine_transcription_probability"
+        ]
+    }
+}
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input-file", dest="input_file")
     parser.add_argument("--output-file", dest="output_file")
-    parser.add_argument("--output-plain-file", dest="output_plain_file")
-    parser.add_argument("--prompt-file", dest="prompt_file")
+    parser.add_argument("--patch-prompt-file", dest="patch_prompt_file")
     parser.add_argument("--repair-prompt-file", dest="repair_prompt_file")
-    parser.add_argument("--deployment", dest="deployment")
-    parser.add_argument("--endpoint", dest="endpoint")
-    parser.add_argument("--api-version", dest="api_version")
-    parser.add_argument("--validate-output", dest="validate_output", choices=["0", "1"])
+    parser.add_argument("--deployment", dest="deployment", default="gpt-5-chat")
+    parser.add_argument("--endpoint", dest="endpoint", default="https://adaptationdev-resource.openai.azure.com/")
+    parser.add_argument("--api-version", dest="api_version", default="2025-01-01-preview")
+    parser.add_argument("--api-key", dest="api_key")
+    parser.add_argument("--concurrency", dest="concurrency", type=int, default=10)
+    parser.add_argument("--timeout", dest="timeout", type=float, default=600.0)
+    parser.add_argument("--timeout-retries", dest="timeout_retries", type=int, default=2)
+    parser.add_argument("--empty-result-retries", dest="empty_result_retries", type=int, default=2)
+    parser.add_argument("--temperature", dest="temperature", type=float, default=0.0)
+    parser.add_argument("--top-p", dest="top_p", type=float, default=1.0)
+    parser.add_argument("--retry-temperature-jitter", dest="retry_temperature_jitter", type=float, default=0.08)
+    parser.add_argument("--retry-top-p-jitter", dest="retry_top_p_jitter", type=float, default=0.03)
     return parser.parse_args()
-
-
-def _extract_text_content(completion) -> str:
-    choices = getattr(completion, "choices", None)
-    if not choices:
-        return ""
-
-    first_choice = choices[0]
-    message = getattr(first_choice, "message", None)
-    if message is None:
-        return ""
-
-    content = getattr(message, "content", "")
-    if isinstance(content, str):
-        return content
-
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, dict):
-                text = item.get("text")
-                if isinstance(text, str):
-                    parts.append(text)
-            else:
-                text = getattr(item, "text", None)
-                if isinstance(text, str):
-                    parts.append(text)
-        return "".join(parts)
-
-    return ""
-
-
-def _chat_completion_create(client: AzureOpenAI, request_kwargs: dict):
-    return client.chat.completions.create(**request_kwargs)
 
 
 async def send_once(
@@ -85,16 +104,29 @@ async def send_once(
     request_kwargs = {
         "model": deployment,
         "messages": [{"role": "user", "content": prompt}],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": PATCH_SCHEMA
+        },
         "temperature": temperature,
         "top_p": top_p,
     }
 
     completion = await asyncio.wait_for(
-        asyncio.to_thread(_chat_completion_create, client, request_kwargs),
+        asyncio.to_thread(client.chat.completions.create, **request_kwargs),
         timeout=timeout_seconds,
     )
+    choices = getattr(completion, "choices", None)
+    if not choices:
+        return ""
 
-    return _extract_text_content(completion).strip()
+    first_choice = choices[0]
+    message = getattr(first_choice, "message", None)
+    if message is None:
+        return ""
+
+    content = getattr(message, "content", "")
+    return extract_text_content(content).strip()
 
 
 async def send_with_timeout_retry(
@@ -105,31 +137,61 @@ async def send_with_timeout_retry(
     top_p: float,
     timeout_seconds: float,
     timeout_retries: int,
+    processing_id: str | None = None,
 ) -> str | None:
-    current_timeout_seconds = timeout_seconds
-    for attempt in range(timeout_retries + 1):
-        try:
-            return await send_once(
-                client,
-                deployment,
-                prompt,
-                temperature,
-                top_p,
-                current_timeout_seconds,
-            )
-        except asyncio.TimeoutError:
-            is_last_attempt = attempt == timeout_retries
-            if is_last_attempt:
-                return None
+    def _extract_retry_after_seconds(error: Exception) -> float | None:
+        response = getattr(error, "response", None)
+        headers = getattr(response, "headers", None)
+        if headers is not None:
+            retry_after_header = headers.get("retry-after") or headers.get("Retry-After")
+            if retry_after_header is not None:
+                try:
+                    retry_after_seconds = float(str(retry_after_header).strip())
+                    if retry_after_seconds > 0:
+                        return retry_after_seconds
+                except ValueError:
+                    pass
 
-            backoff_seconds = 2 ** attempt
-            next_timeout_seconds = current_timeout_seconds + timeout_seconds
-            print(
-                f"Timeout on attempt {attempt + 1}/{timeout_retries + 1}. "
-                f"Retrying in {backoff_seconds}s with timeout={next_timeout_seconds}s..."
-            )
-            current_timeout_seconds = next_timeout_seconds
-            await asyncio.sleep(backoff_seconds)
+        message = str(error)
+        match = re.search(r"retry after\s+(\d+(?:\.\d+)?)\s+second", message, flags=re.IGNORECASE)
+        if not match:
+            return None
+
+        try:
+            retry_after_seconds = float(match.group(1))
+            return retry_after_seconds if retry_after_seconds > 0 else None
+        except ValueError:
+            return None
+
+    def _is_rate_limited_error(error: Exception) -> bool:
+        status_code = getattr(error, "status_code", None)
+        if status_code == 429:
+            return True
+
+        message = str(error).lower()
+        return (
+            "ratelimitreached" in message
+            or "rate limit" in message
+            or "error code: 429" in message
+        )
+
+    async def operation() -> str:
+        return await send_once(
+            client,
+            deployment,
+            prompt,
+            temperature,
+            top_p,
+            timeout_seconds,
+        )
+
+    return await run_with_timeout_retry(
+        operation,
+        timeout_retries,
+        processing_id,
+        is_retryable_error=_is_rate_limited_error,
+        resolve_backoff_seconds=lambda error, _attempt: _extract_retry_after_seconds(error),
+    )
 
 
 async def get_payload_with_repair(
@@ -137,12 +199,12 @@ async def get_payload_with_repair(
     deployment: str,
     prompt: str,
     transcription: str,
+    processing_id: str,
     repair_prompt_template: str,
     temperature: float,
     top_p: float,
     timeout_seconds: float,
     timeout_retries: int,
-    strict_json_repair: bool,
     empty_result_retries: int,
     retry_temperature_jitter: float,
     retry_top_p_jitter: float,
@@ -160,7 +222,7 @@ async def get_payload_with_repair(
                 min(1.0, top_p + random.uniform(-retry_top_p_jitter, retry_top_p_jitter)),
             )
             print(
-                f"Retry decode jitter applied: temperature={attempt_temperature:.3f}, "
+                f"[{processing_id}] Retry decode jitter applied: temperature={attempt_temperature:.3f}, "
                 f"top_p={attempt_top_p:.3f}"
             )
 
@@ -172,39 +234,40 @@ async def get_payload_with_repair(
             attempt_top_p,
             timeout_seconds,
             timeout_retries,
+            processing_id,
         )
 
         if content is None:
-            print(
-                f"Request timed out after {timeout_seconds}s "
-                f"for {timeout_retries + 1} attempt(s)."
-            )
-            print(
-                "Increase AOAI_TIMEOUT or AOAI_TIMEOUT_RETRIES "
-                "and try again."
-            )
+            print_timeout_and_retry_guidance(timeout_seconds, timeout_retries, processing_id)
             return None
 
-        if not content:
-            validation_error = "Model returned empty output."
-            payload = None
-        else:
-            payload, validation_error = parse_and_validate_json(content)
+        payload, validation_error, content = parse_validate_and_apply_text_fixes(
+            content,
+            transcription,
+            processing_id,
+        )
 
         if payload is None:
-            if not strict_json_repair:
-                print("Initial response was not valid strict JSON.")
-                if validation_error:
-                    print(validation_error)
-                print("Raw output:")
-                print(content)
-                return None
+            log_json_validation_with_key_error(validation_error, content, processing_id)
 
-            print("Initial response was not valid strict JSON. Running one repair attempt...")
-            repair_prompt = format_repair_prompt(
+            if is_non_repairable_validation_error(validation_error):
+                reason = validation_error.removeprefix(non_repairable_prefix()).strip() if isinstance(validation_error, str) else "Model output is not repairable."
+                print(f"[{processing_id}] Skipping repair: {reason}")
+                should_retry = should_retry_after_failure(
+                    empty_attempt,
+                    empty_result_retries,
+                    "Model output is not repairable.",
+                    processing_id=processing_id,
+                )
+                if not should_retry:
+                    return None
+                continue
+
+            repair_prompt = build_repair_prompt_after_invalid_json(
                 repair_prompt_template,
                 validation_error,
                 content,
+                processing_id,
             )
 
             repaired_content = await send_with_timeout_retry(
@@ -215,47 +278,46 @@ async def get_payload_with_repair(
                 attempt_top_p,
                 timeout_seconds,
                 timeout_retries,
+                processing_id,
             )
 
             if not repaired_content:
-                is_last_empty_attempt = empty_attempt == empty_result_retries
-                if is_last_empty_attempt:
-                    print("Repair returned empty output or timed out.")
-                    return None
-                print(
-                    f"Repair returned empty output or timed out. "
-                    f"Retrying item {empty_attempt + 1}/{empty_result_retries + 1}..."
+                should_retry = should_retry_after_failure(
+                    empty_attempt,
+                    empty_result_retries,
+                    "Repair returned empty output or timed out.",
+                    processing_id=processing_id,
                 )
+                if not should_retry:
+                    return None
                 continue
 
-            payload, validation_error = parse_and_validate_json(repaired_content)
+            payload, validation_error, repaired_content = parse_validate_and_apply_text_fixes(
+                repaired_content,
+                transcription,
+                processing_id,
+            )
             if payload is None:
-                is_last_empty_attempt = empty_attempt == empty_result_retries
-                if is_last_empty_attempt:
-                    print("Repair attempt did not return valid JSON.")
-                    print(validation_error)
-                    print("Raw output:")
-                    print(repaired_content)
-                    return None
-                print(
-                    f"Repair attempt did not return valid JSON ({validation_error}). "
-                    f"Retrying item {empty_attempt + 1}/{empty_result_retries + 1}..."
+                should_retry = handle_invalid_repair_json_result(
+                    empty_attempt,
+                    empty_result_retries,
+                    validation_error,
+                    repaired_content,
+                    processing_id,
                 )
+                if not should_retry:
+                    return None
                 continue
 
-        corrected_text = payload.get("corrected_text") if isinstance(payload, dict) else None
-        if isinstance(corrected_text, str) and corrected_text.strip():
-            return payload
-
-        is_last_empty_attempt = empty_attempt == empty_result_retries
-        if is_last_empty_attempt:
-            print("Model returned empty corrected_text after retries. Applying fallback to original transcription text.")
-            return apply_corrected_text_fallback(payload, transcription)
-
-        print(
-            f"Model returned empty corrected_text. "
-            f"Retrying item {empty_attempt + 1}/{empty_result_retries + 1}..."
+        result_payload, should_retry = resolve_payload_or_retry_on_empty_corrected_text(
+            payload,
+            transcription,
+            empty_attempt,
+            empty_result_retries,
+            processing_id,
         )
+        if not should_retry:
+            return result_payload
 
     return None
 
@@ -263,76 +325,43 @@ async def get_payload_with_repair(
 async def main():
     args = parse_args()
 
-    input_file_value = args.input_file or os.getenv("INPUT_FILE")
-    output_file_value = args.output_file or os.getenv("OUTPUT_FILE")
-    output_plain_file_value = args.output_plain_file or os.getenv("OUTPUT_PLAIN_FILE")
+    input_file_value = args.input_file
+    output_file_value = args.output_file
 
     transcriptions: list[str]
-    if input_file_value:
-        input_path = resolve_path(input_file_value)
-        if not input_path.exists():
-            print(f"Input file not found: {input_path}")
-            return
-        transcriptions = parse_transcriptions_from_file(input_path)
-        print(f"Read {len(transcriptions)} transcription(s) from: {input_path}")
-    else:
-        transcription = input("Enter transcription: ").strip()
-        transcriptions = [transcription] if transcription else []
-
-    if not transcriptions:
-        print("No transcription provided.")
+    loaded_transcriptions = collect_transcriptions_from_input(input_file_value)
+    if loaded_transcriptions is None:
         return
+    transcriptions = loaded_transcriptions
 
-    endpoint = args.endpoint or os.getenv(
-        "ENDPOINT_URL",
-        "https://adaptationdev-resource.openai.azure.com/",
-    )
-    deployment = args.deployment or os.getenv("DEPLOYMENT_NAME", "gpt-5-chat")
-    api_version = args.api_version or os.getenv("AZURE_OPENAI_API_VERSION", "2025-01-01-preview")
-    api_key = os.getenv("AZURE_OPENAI_API_KEY")
+    endpoint = args.endpoint
+    deployment = args.deployment
+    api_version = args.api_version
+    api_key = args.api_key
     if not api_key:
-        print("AZURE_OPENAI_API_KEY is not set.")
+        print("--api-key is required.")
         return
 
-    temperature_default = 0.0
-    top_p_default = 1.0
+    configured_concurrency = args.concurrency
+    concurrency = max(1, configured_concurrency)
 
-    temperature, temperature_source = resolve_float_with_fallback(
-        "AOAI_TEMPERATURE",
-        "TEMPERATURE",
-        temperature_default,
+    timeout_seconds = args.timeout
+    timeout_retries = max(0, args.timeout_retries)
+    empty_result_retries = max(0, args.empty_result_retries)
+
+    temperature = args.temperature
+    top_p = args.top_p
+    retry_temperature_jitter = max(0.0, args.retry_temperature_jitter)
+    retry_top_p_jitter = max(0.0, args.retry_top_p_jitter)
+
+    prompt_template_path, repair_prompt_template_path, template_error = resolve_patch_and_repair_template_paths(
+        args.patch_prompt_file,
+        args.repair_prompt_file,
     )
-
-    top_p, top_p_source = resolve_float_with_fallback(
-        "AOAI_TOP_P",
-        "TOP_P",
-        top_p_default,
-    )
-
-    timeout_seconds = get_env_float("AOAI_TIMEOUT", 180.0)
-    timeout_retries = max(0, get_env_int("AOAI_TIMEOUT_RETRIES", 2))
-    empty_result_retries = max(0, get_env_int("AOAI_EMPTY_RESULT_RETRIES", 1))
-    retry_temperature_jitter = max(0.0, get_env_float("AOAI_RETRY_TEMPERATURE_JITTER", 0.08))
-    retry_top_p_jitter = max(0.0, get_env_float("AOAI_RETRY_TOP_P_JITTER", 0.03))
-    strict_json_repair = get_env_bool("STRICT_JSON_REPAIR", True)
-    validate_output = resolve_bool_with_override(args.validate_output, "AOAI_VALIDATE_OUTPUT", True)
-
-    prompt_template_path, prompt_path_error = resolve_required_template_path(
-        args.prompt_file or os.getenv("PROMPT_FILE"),
-        "prompt_patch_aoai.txt",
-        "Prompt",
-    )
-    if prompt_path_error:
-        print(prompt_path_error)
+    if template_error:
+        print(template_error)
         return
-
-    repair_prompt_template_path, repair_path_error = resolve_required_template_path(
-        args.repair_prompt_file or os.getenv("AOAI_REPAIR_PROMPT_FILE"),
-        "prompt_repair_aoai.txt",
-        "Repair prompt",
-    )
-    if repair_path_error:
-        print(repair_path_error)
+    if prompt_template_path is None or repair_prompt_template_path is None:
         return
 
     print(f"Using deployment: {deployment}")
@@ -340,25 +369,19 @@ async def main():
     print(f"API version: {api_version}")
     print(f"Temperature: {temperature}")
     print(f"Top p: {top_p}")
-    print(f"Using prompt file: {prompt_template_path}")
-    print(f"Using repair prompt file: {repair_prompt_template_path}")
-    print(f"Timeout: {timeout_seconds}s, retries: {timeout_retries}")
-    print(f"Empty-result retries: {empty_result_retries}")
     print(f"Retry jitter: temperature<=+{retry_temperature_jitter}, top_p±{retry_top_p_jitter}")
-    print(f"Strict JSON repair: {strict_json_repair}")
-    print(f"Validate output: {validate_output}")
-    if temperature_source is not None and temperature != temperature_default:
-        print(
-            f"Warning: {temperature_source} overrides deterministic "
-            f"temperature default {temperature_default} -> {temperature}"
-        )
-    if top_p_source is not None and top_p != top_p_default:
-        print(
-            f"Warning: {top_p_source} overrides deterministic "
-            f"top_p default {top_p_default} -> {top_p}"
-        )
-    prompt_template = load_prompt_template(prompt_template_path)
-    repair_prompt_template = load_prompt_template(repair_prompt_template_path)
+    print_common_runtime_settings(
+        prompt_template_path,
+        repair_prompt_template_path,
+        concurrency,
+        timeout_seconds,
+        timeout_retries,
+        empty_result_retries,
+    )
+    prompt_template, repair_prompt_template = load_patch_and_repair_templates(
+        prompt_template_path,
+        repair_prompt_template_path,
+    )
 
     client = AzureOpenAI(
         azure_endpoint=endpoint,
@@ -366,51 +389,57 @@ async def main():
         api_version=api_version,
     )
 
-    payloads: list[dict] = []
-    total = len(transcriptions)
-    for index, transcription in enumerate(transcriptions, start=1):
-        if total > 1:
-            print(f"Processing transcription {index}/{total}...")
+    payloads: list[dict | None] = [None] * len(transcriptions)
+
+    async def process_item(index: int, transcription: str, total: int) -> None:
+        slot = index - 1
+        processing_id = f"{index}/{total}"
+        if not transcription.strip():
+            payloads[slot] = build_empty_payload()
+            print(
+                f"Input transcription {index}/{total} is empty; "
+                "emitting empty payload."
+            )
+            return
 
         prompt = prompt_template + transcription
+        try:
+            payload = await get_payload_with_repair(
+                client,
+                deployment,
+                prompt,
+                transcription,
+                processing_id,
+                repair_prompt_template,
+                temperature,
+                top_p,
+                timeout_seconds,
+                timeout_retries,
+                empty_result_retries,
+                retry_temperature_jitter,
+                retry_top_p_jitter,
+            )
 
-        result = await get_payload_with_repair(
-            client,
-            deployment,
-            prompt,
-            transcription,
-            repair_prompt_template,
-            temperature,
-            top_p,
-            timeout_seconds,
-            timeout_retries,
-            strict_json_repair,
-            empty_result_retries,
-            retry_temperature_jitter,
-            retry_top_p_jitter,
-        )
-        if result is None:
-            print(f"Failed on transcription {index}/{total}.")
+            assign_payload_or_emit_empty(payload, payloads, slot, index, total)
+        except asyncio.CancelledError:
+            payloads[slot] = build_empty_payload()
+            print(
+                f"Cancelled while processing transcription {index}/{total}; "
+                "emitting empty payload."
+            )
+            return
+        except Exception as error:
+            payloads[slot] = build_empty_payload()
+            print(
+                f"Unexpected error on transcription {index}/{total}: {error}; "
+                "emitting empty payload."
+            )
             return
 
-        if validate_output:
-            is_valid, validation_error = validate_patch_payload(result)
-            if not is_valid:
-                print(
-                    f"Output validation failed on transcription {index}/{total}: "
-                    f"{validation_error}"
-                )
-                return
+    await run_transcriptions_with_concurrency(transcriptions, concurrency, process_item)
 
-        payloads.append(result)
-
-    if validate_output:
-        is_valid, validation_error = validate_output_payloads(payloads)
-        if not is_valid:
-            print(validation_error)
-            return
-
-    write_output_artifacts(payloads, output_file_value, output_plain_file_value)
+    if not finalize_payloads_and_write(payloads, output_file_value):
+        return
 
 
 if __name__ == "__main__":

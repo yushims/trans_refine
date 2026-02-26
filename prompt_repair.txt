@@ -2,15 +2,13 @@ Return ONLY one strict JSON object (no markdown/prose) that is a corrected versi
 Do NOT change semantic content except as required to make it valid JSON and satisfy the schema below.
 
 Exact top-level keys (no extras, same order):
-tokenization, ops, ct_combine, ct_fix, ct_punct, corrected_text, verification, machine_transcription_probability.
+tokenization, ct_combine, ct_fix, ct_punct, ct_casing, verification, machine_transcription_probability.
 
 Schema:
-- tokenization = {"scheme":"universal_v1","tokens": array}
-- ops = array
-- ct_combine/ct_fix/ct_punct/corrected_text = string
-- verification = {"edit_count": int, "op_details": array}
+- tokenization = {"tokens": array}
+- ct_combine/ct_fix/ct_punct/ct_casing = string
+- verification = {"op_details": array}
 - machine_transcription_probability = number in [0,1]
-- verification.edit_count == len(ops)
 - verification.op_details[0] starts with "TOKEN_COMBINE_RESULT:"
 - verification.op_details[1] starts with "ERROR_FIX_RESULT:"
 - verification.op_details[2] starts with "PUNCTUATION_RESULT:"
@@ -21,7 +19,7 @@ Repair rules:
 - Quote all keys/strings properly; escape quotes/newlines.
 - Remove trailing commas; use []/{} correctly.
 - If a required field is missing, add it with a safe default:
-  tokens=[], ops=[], ct_*="", corrected_text="", verification.edit_count=0,
+  tokens=[], ct_*="",
   verification.op_details=[
     "TOKEN_COMBINE_RESULT: no change",
     "ERROR_FIX_RESULT: no change",
