@@ -180,7 +180,6 @@ async def _get_payload_with_repair_on_session(
         if empty_attempt > 0:
             retry_nonce = random.randint(1, 1_000_000_000)
             attempt_prompt = f"{prompt}\n\nRetry nonce: {retry_nonce}"
-            print(f"[{processing_id}] Retry prompt nonce applied: {retry_nonce}")
         json_instruction_boost = "".join(["NO prose/reasoning!!! Only JSON!!! "] * (empty_attempt+1) * 2)
         attempt_prompt = f"{attempt_prompt}\n\nDirectly output JSON, {json_instruction_boost}Output JSON here:"
 
@@ -314,19 +313,17 @@ async def get_payload_with_repair(
                 empty_result_retries,
             )
         except ModelMismatchError as mismatch_error:
-            print(
-                f"[{processing_id}] [MODEL MISMATCH] requested={mismatch_error.requested_model}, "
-                f"actual={mismatch_error.actual_model}"
-            )
             is_last_mismatch_attempt = mismatch_attempt == model_mismatch_retries
             if is_last_mismatch_attempt:
                 print(
                     f"[{processing_id}] Failed due to model mismatch "
+                    f"(requested={mismatch_error.requested_model}, actual={mismatch_error.actual_model}) "
                     f"after {model_mismatch_retries + 1} attempt(s); emitting empty payload."
                 )
                 return None
 
             backoff_seconds = 2 ** mismatch_attempt
+            backoff_seconds *= 10
             print(
                 f"[{processing_id}] Model mismatch "
                 f"(requested={mismatch_error.requested_model}, actual={mismatch_error.actual_model}). "
