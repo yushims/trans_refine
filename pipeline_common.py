@@ -138,6 +138,7 @@ async def run_with_timeout_retry(
                 else None
             )
             backoff_seconds = configured_backoff if isinstance(configured_backoff, (int, float)) and configured_backoff > 0 else 2 ** attempt
+            backoff_seconds *= 10
             error_text = str(error).strip() or error.__class__.__name__
             print(
                 f"{prefix}Retryable error on attempt {attempt + 1}/{timeout_retries + 1}: {error_text}. "
