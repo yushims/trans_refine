@@ -6,12 +6,25 @@ Transcription refinement pipeline with shared JSON-schema validation and one-pas
 
 - `run_aoai.py`: AOAI pipeline runner.
 - `run_copilot.py`: Copilot pipeline runner.
-- `pipeline_common.py`: shared parsing/validation/output utilities.
 - `run-aoai.ps1`: AOAI launcher.
 - `run-copilot.ps1`: Copilot launcher.
+- Core modules:
+	- `common.py`: shared provider-agnostic utilities (schema validation, parsing, template/path helpers, output shaping).
+	- `common_aoai.py`: AOAI patch runtime only (AOAI transport + patch payload retry/repair flow).
+	- `common_copilot.py`: Copilot patch runtime only (Copilot transport/session helpers + patch payload retry/repair flow).
+	- `common_eval.py`: eval-only flows and eval reporting helpers.
 - Prompt templates:
 	- `prompt_patch.txt`
 	- `prompt_repair.txt`
+
+## Module ownership rules
+
+- Keep patch runtime logic in provider modules only:
+	- AOAI patch flow in `common_aoai.py`
+	- Copilot patch flow in `common_copilot.py`
+- Keep evaluation logic in `common_eval.py` only.
+- Keep cross-provider/shared primitives in `common.py` only.
+- New code should follow these boundaries to avoid module drift and import cycles.
 
 ## Prerequisites
 
@@ -86,8 +99,8 @@ Defaults:
 Use the unified retry flag across all evaluated models:
 
 ```powershell
-python .\run_e2e_evaluation.py --empty-result-retries 2
-python .\run_e2e_evaluation.py --empty-result-retries 2 --timeout 600 --timeout-retries 2
+python .\eval_e2e.py --empty-result-retries 2
+python .\eval_e2e.py --empty-result-retries 2 --timeout 600 --timeout-retries 2
 ```
 
 ## Input / output
@@ -116,7 +129,6 @@ Use `-HelpOnly` on either PowerShell launcher to see effective CLI options.
 ## Minimal files for repro handoff
 
 - `requirements.txt`
-- `pipeline_common.py`
 - `run_aoai.py`
 - `run_copilot.py`
 - `launcher-common.ps1`

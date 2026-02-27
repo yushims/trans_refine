@@ -1,30 +1,18 @@
 import argparse
 import asyncio
-import random
-import re
 
 from openai import AzureOpenAI
-from pipeline_common import (
+from common import (
     assign_payload_or_emit_empty,
     build_empty_payload,
-    build_repair_prompt_after_invalid_json,
     collect_transcriptions_from_input,
-    extract_text_content,
     finalize_payloads_and_write,
-    handle_invalid_repair_json_result,
-    is_non_repairable_validation_error,
     load_patch_and_repair_templates,
-    log_json_validation_with_key_error,
-    non_repairable_prefix,
-    parse_validate_and_apply_text_fixes,
     print_common_runtime_settings,
-    print_timeout_and_retry_guidance,
-    resolve_payload_or_retry_on_empty_corrected_text,
     resolve_patch_and_repair_template_paths,
     run_transcriptions_with_concurrency,
-    run_with_timeout_retry,
-    should_retry_after_failure,
 )
+from common_aoai import get_patch_payload_with_repair
 
 
 PATCH_SCHEMA = {
@@ -72,6 +60,7 @@ PATCH_SCHEMA = {
     }
 }
 
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input-file", dest="input_file")
@@ -93,107 +82,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-async def send_once(
-    client: AzureOpenAI,
-    deployment: str,
-    prompt: str,
-    temperature: float,
-    top_p: float,
-    timeout_seconds: float,
-) -> str:
-    request_kwargs = {
-        "model": deployment,
-        "messages": [{"role": "user", "content": prompt}],
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": PATCH_SCHEMA
-        },
-        "temperature": temperature,
-        "top_p": top_p,
-    }
-
-    completion = await asyncio.wait_for(
-        asyncio.to_thread(client.chat.completions.create, **request_kwargs),
-        timeout=timeout_seconds,
-    )
-    choices = getattr(completion, "choices", None)
-    if not choices:
-        return ""
-
-    first_choice = choices[0]
-    message = getattr(first_choice, "message", None)
-    if message is None:
-        return ""
-
-    content = getattr(message, "content", "")
-    return extract_text_content(content).strip()
-
-
-async def send_with_timeout_retry(
-    client: AzureOpenAI,
-    deployment: str,
-    prompt: str,
-    temperature: float,
-    top_p: float,
-    timeout_seconds: float,
-    timeout_retries: int,
-    processing_id: str | None = None,
-) -> str | None:
-    def _extract_retry_after_seconds(error: Exception) -> float | None:
-        response = getattr(error, "response", None)
-        headers = getattr(response, "headers", None)
-        if headers is not None:
-            retry_after_header = headers.get("retry-after") or headers.get("Retry-After")
-            if retry_after_header is not None:
-                try:
-                    retry_after_seconds = float(str(retry_after_header).strip())
-                    if retry_after_seconds > 0:
-                        return retry_after_seconds
-                except ValueError:
-                    pass
-
-        message = str(error)
-        match = re.search(r"retry after\s+(\d+(?:\.\d+)?)\s+second", message, flags=re.IGNORECASE)
-        if not match:
-            return None
-
-        try:
-            retry_after_seconds = float(match.group(1))
-            return retry_after_seconds if retry_after_seconds > 0 else None
-        except ValueError:
-            return None
-
-    def _is_rate_limited_error(error: Exception) -> bool:
-        status_code = getattr(error, "status_code", None)
-        if status_code == 429:
-            return True
-
-        message = str(error).lower()
-        return (
-            "ratelimitreached" in message
-            or "rate limit" in message
-            or "error code: 429" in message
-        )
-
-    async def operation() -> str:
-        return await send_once(
-            client,
-            deployment,
-            prompt,
-            temperature,
-            top_p,
-            timeout_seconds,
-        )
-
-    return await run_with_timeout_retry(
-        operation,
-        timeout_retries,
-        processing_id,
-        is_retryable_error=_is_rate_limited_error,
-        resolve_backoff_seconds=lambda error, _attempt: _extract_retry_after_seconds(error),
-    )
-
-
 async def get_payload_with_repair(
     client: AzureOpenAI,
     deployment: str,
@@ -209,126 +97,30 @@ async def get_payload_with_repair(
     retry_temperature_jitter: float,
     retry_top_p_jitter: float,
 ):
-    for empty_attempt in range(empty_result_retries + 1):
-        attempt_temperature = temperature
-        attempt_top_p = top_p
-        if empty_attempt > 0:
-            attempt_temperature = max(
-                0.0,
-                min(1.0, temperature + random.uniform(0.0, retry_temperature_jitter)),
-            )
-            attempt_top_p = max(
-                0.0,
-                min(1.0, top_p + random.uniform(-retry_top_p_jitter, retry_top_p_jitter)),
-            )
-            print(
-                f"[{processing_id}] Retry decode jitter applied: temperature={attempt_temperature:.3f}, "
-                f"top_p={attempt_top_p:.3f}"
-            )
-
-        content = await send_with_timeout_retry(
-            client,
-            deployment,
-            prompt,
-            attempt_temperature,
-            attempt_top_p,
-            timeout_seconds,
-            timeout_retries,
-            processing_id,
-        )
-
-        if content is None:
-            print_timeout_and_retry_guidance(timeout_seconds, timeout_retries, processing_id)
-            return None
-
-        payload, validation_error, content = parse_validate_and_apply_text_fixes(
-            content,
-            transcription,
-            processing_id,
-        )
-
-        if payload is None:
-            log_json_validation_with_key_error(validation_error, content, processing_id)
-
-            if is_non_repairable_validation_error(validation_error):
-                reason = validation_error.removeprefix(non_repairable_prefix()).strip() if isinstance(validation_error, str) else "Model output is not repairable."
-                print(f"[{processing_id}] Skipping repair: {reason}")
-                should_retry = should_retry_after_failure(
-                    empty_attempt,
-                    empty_result_retries,
-                    "Model output is not repairable.",
-                    processing_id=processing_id,
-                )
-                if not should_retry:
-                    return None
-                continue
-
-            repair_prompt = build_repair_prompt_after_invalid_json(
-                repair_prompt_template,
-                validation_error,
-                content,
-                processing_id,
-            )
-
-            repaired_content = await send_with_timeout_retry(
-                client,
-                deployment,
-                repair_prompt,
-                attempt_temperature,
-                attempt_top_p,
-                timeout_seconds,
-                timeout_retries,
-                processing_id,
-            )
-
-            if not repaired_content:
-                should_retry = should_retry_after_failure(
-                    empty_attempt,
-                    empty_result_retries,
-                    "Repair returned empty output or timed out.",
-                    processing_id=processing_id,
-                )
-                if not should_retry:
-                    return None
-                continue
-
-            payload, validation_error, repaired_content = parse_validate_and_apply_text_fixes(
-                repaired_content,
-                transcription,
-                processing_id,
-            )
-            if payload is None:
-                should_retry = handle_invalid_repair_json_result(
-                    empty_attempt,
-                    empty_result_retries,
-                    validation_error,
-                    repaired_content,
-                    processing_id,
-                )
-                if not should_retry:
-                    return None
-                continue
-
-        result_payload, should_retry = resolve_payload_or_retry_on_empty_corrected_text(
-            payload,
-            transcription,
-            empty_attempt,
-            empty_result_retries,
-            processing_id,
-        )
-        if not should_retry:
-            return result_payload
-
-    return None
+    return await get_patch_payload_with_repair(
+        client=client,
+        deployment=deployment,
+        prompt=prompt,
+        transcription=transcription,
+        processing_id=processing_id,
+        repair_prompt_template=repair_prompt_template,
+        patch_schema=PATCH_SCHEMA,
+        timeout_seconds=timeout_seconds,
+        timeout_retries=timeout_retries,
+        empty_result_retries=empty_result_retries,
+        temperature=temperature,
+        top_p=top_p,
+        retry_temperature_jitter=retry_temperature_jitter,
+        retry_top_p_jitter=retry_top_p_jitter,
+    )
 
 
-async def main():
+async def main() -> None:
     args = parse_args()
 
     input_file_value = args.input_file
     output_file_value = args.output_file
 
-    transcriptions: list[str]
     loaded_transcriptions = collect_transcriptions_from_input(input_file_value)
     if loaded_transcriptions is None:
         return
@@ -378,6 +170,7 @@ async def main():
         timeout_retries,
         empty_result_retries,
     )
+
     prompt_template, repair_prompt_template = load_patch_and_repair_templates(
         prompt_template_path,
         repair_prompt_template_path,

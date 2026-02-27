@@ -1,0 +1,58 @@
+PATCH EVALUATION MODE (multilingual, ASR-aware)
+
+Input:
+1) ORIGINAL transcript (raw text)
+2) PATCH output text from deterministic patch mode
+
+Task:
+Evaluate whether the PATCH output complies with the patching requirements. Do NOT rewrite or re-patch. Only judge.
+
+Output exactly ONE JSON object (no markdown/prose) with EXACT keys:
+pass, fail_reasons, checks, diff_summary
+
+Schema:
+- pass: boolean (true only if all hard checks pass)
+- fail_reasons: array of strings (empty if pass=true)
+- checks: object with boolean fields listed below
+- diff_summary: array of strings describing the most important changes (brief)
+
+Hard checks (must pass):
+A) Forbidden edits:
+- No paraphrasing, reordering, style rewriting, semantic-content deletion, or hallucinated lexical additions (flag any meaning change).
+- No em dash introduced.
+B) Line-end invariance:
+- Do NOT change/add/remove punctuation at the end of the line vs ORIGINAL (compare last non-space character).
+C) First-token casing:
+- Do NOT change casing of the first token of the line vs ORIGINAL.
+D) Punctuation adjacency:
+- Do NOT create redundant/stacked punctuation (including adjacent sentence-end marks).
+E) Span constraints:
+- No unpunctuated span exceeds 24 tokens.
+- No no-sentence-end span exceeds 48 tokens.
+F) Compact form spacing:
+- No unnecessary internal spaces in compounds and numeric-marker forms when compared to their standard compact form.
+G) Intra-output consistency:
+- Formatting of entities and numeral expressions must be consistent within the PATCH output text.
+
+Soft checks (warnings, not automatic fail unless severe):
+- Minimality: changes are as small as possible; no gratuitous punctuation insertions.
+- ASR constraint: lexical fixes preserve pronunciation similarity; if uncertain, original should be kept.
+- Numeral normalization only when unambiguous and format-only.
+
+Compute and report these check fields in checks:
+forbidden_ok, line_end_ok, first_token_casing_ok, punct_adjacency_ok, span_ok, compact_spacing_ok, consistency_ok, minimality_ok, asr_pronunciation_ok, numeral_ok
+
+diff_summary:
+List up to 8 high-level edits in “before → after” form (short snippets), prioritizing meaningful edits and any failures.
+
+Decision:
+- pass=true only if all hard checks are true: forbidden_ok, line_end_ok, first_token_casing_ok, punct_adjacency_ok, span_ok, compact_spacing_ok, consistency_ok
+- Otherwise pass=false and fail_reasons must include specific violated rules.
+
+Now evaluate the following:
+
+ORIGINAL:
+{original_transcript}
+
+PATCH:
+{patch_transcript}
