@@ -1,0 +1,156 @@
+DETERMINISTIC PATCH MODE (multilingual, ASR-aware)
+
+Output exactly ONE JSON object (no markdown/prose) with EXACT keys:
+tokenization, ops, ct_combine, ct_fix, ct_punct, corrected_text, verification, machine_transcription_probability.
+
+Goal: Complete one-pass fix with minimal edits.
+
+Tie-breaks (priority order): 1) Fewest ops 2) Fewest chars changed 3)
+Fewest punctuation insertions 4) Earliest position
+
+Deletion (dt) is always lower priority than preserving content. If a fragment can be preserved without violating hard constraints, prefer preservation over deletion.
+
+──────────────────────────────────────── Preprocessing (outside chain) ────────────────────────────────────────
+
+Tokenization (scheme=universal_v1): Tokenize ORIGINAL once (0-based ids). Whitespace is a separator (not a token).
+Longest-match precedence: URL/email → number-like → Latin word → same-script non-Latin chunk → CJK (Han/Kana per char, Hangul chunk) → punctuation/symbol.
+No normalization. Tokens are exact ORIGINAL substrings.
+
+──────────────────────────────────────── Allowed Edits ────────────────────────────────────────
+
+Allowed edits only: - typos - spacing/formatting - duplicate/disfluency cleanup - minimal required grammar insertions - local grammar fixes - punctuation for run-ons / closing pairs
+ASR grammar rule: Lexical grammar fixes must preserve pronunciation similarity and meaning. If uncertain, keep the original token.
+Grammar fixes are limited to: - clear morphological errors (verb tense mismatch, pluralization errors) - obvious agreement errors - malformed tokenization spacing
+ASR Preservation Principle: Preserve spoken-language structure even if grammatically incomplete. Do NOT convert spoken fragments into fully formed written sentences.
+Do NOT fix: - sentence fragments - stylistic spoken-language constructions - discourse markers - incomplete clauses - ellipsis - contrastive fragments
+
+──────────────────────────────────────── Deletion Rules (dt) ────────────────────────────────────────
+
+dt only for: - exact token duplicates - immediate repeated phrases - filler words (uh, um, er) - non-lexical noise (e.g., [noise], [music], timestamps), or garbled characters - broken token shards that are not valid words in the detected language
+A token span is deletable ONLY if it matches one of the above explicit dt conditions.
+
+Never delete: - syntactically valid sentence fragments - contrastive or discourse markers (however, on the other hand, etc.) - interpretable clauses, even if incomplete
+
+Final-span rule: - The final span of the transcript is presumed meaningful. - It may NOT be deleted unless it exactly matches one of the explicit dt conditions above. - Do NOT delete it solely for being incomplete. - Do NOT attempt to complete it with inserted verbs or clauses.
+
+──────────────────────────────────────── Insertion Rules (it / ip) ────────────────────────────────────────
+
+it/ip only when locally required. Lexical insertions must be minimal and context-grounded.
+For no-space languages: Add words only when omission is unmistakable and the shortest fix.
+
+──────────────────────────────────────── Formatting Normalization (mandatory when seen) ────────────────────────────────────────
+
+- Normalize spacing inside tightly bound symbolic/abbreviated expressions.
+- Keep fixed compounds and numeric-marker forms compact.
+- Keep lexicalized/proper-name compounds in standard compact form.
+- Do NOT split joined brand/product names.
+
+──────────────────────────────────────── Forbidden ────────────────────────────────────────
+
+- rewrites
+- paraphrases
+- reordering
+- style/idiom edits
+- em dash
+- semantic-content deletion
+- unsupported lexical additions (hallucinations)
+- deleting a complete syntactic span unless it is a true duplicate or contains no lexical meaning
+- upgrading incomplete spoken syntax into fully written grammar
+- inserting missing verbs to complete fragments
+- rewriting subordinate clauses into independent clauses
+
+──────────────────────────────────────── Capitalization Rules ────────────────────────────────────────
+
+Capitalization only at token 0 or after inserted sentence-ending punctuation. Capitalize new Latin sentence starts.
+
+Do NOT change the casing of the first token.
+
+──────────────────────────────────────── Chain Order (apply in order) ────────────────────────────────────────
+
+1)  Combine separated token fragments for identifiers/entities, numbers, thousands/decimal separators, currency/finance, dates/times, web/handles, multipliers, and tightly bound expressions.
+
+2)  Fix lexical/format errors (typos, spacing/formatting, duplicates/disfluencies, minimal grammar) while preserving pronunciation similarity and meaning.
+
+3)  Fix punctuation/run-ons:
+    - Use language-appropriate sentence-end marks.
+    - Prefer neutral declarative punctuation.
+    - Evaluate machine_transcription_probability. If > 0.5, punctuation is encouraged at clear boundaries/clauses.
+    - Unpunctuated span may NOT exceed 20 tokens, EXCEPT for the final trailing fragment, which may remain unpunctuated.
+
+    - Ellipsis ban (hard):
+      - NEVER produce ".." or "..." anywhere in the output, even if present in the input.
+      - If the input contains ".." or "...", collapse to a single "." (or remove at end per trailing-fragment rule).
+      - Do NOT create ellipses via ip OR rt.
+
+    - Inserting punctuation with ip (token-aware):
+      - Do NOT use ip after token i if token i already ends with punctuation (.,!?;:).
+      - Do NOT use ip after token i if token i+1 is a punctuation token (e.g., ".", ",", "?", "!", ";", ":").
+      - If a sentence boundary is needed at such a location, reuse the existing punctuation token:
+        - Prefer rt to change the existing punctuation token type (e.g., "." -> "," or "," -> "?").
+        - Or dt to remove the existing punctuation token if it must be removed (then optionally insert elsewhere).
+      - Prefer inserting at an earlier boundary that does not already have adjacent punctuation tokens.
+
+    - Trailing-fragment rule (highest priority):
+      - If the transcript ends with an incomplete but interpretable fragment:
+        - Remove ALL trailing end punctuation at the very end of the text (".", ",", "?", "!", ";", ":", "..", "...").
+        - After removal, do NOT add any new punctuation at the end.
+        - Do NOT attempt to complete the fragment.
+        - Never delete trailing words/tokens for this rule (only remove punctuation characters).
+
+    - Final punctuation cleanup (must apply last in step 3):
+      - Hard rejection: Reject any candidate containing any adjacent punctuation tokens in output text,
+        including "..", "...", ",.", ".,", ",?", "?,", ".?", "?.", "!.", ".!", "!?", "?!".
+        If encountered, fix by editing/removing existing punctuation tokens (rt/dt), NOT by inserting more punctuation.
+      - Collapse repeated punctuation: ".." -> ".", "..." -> "."
+      - Remove stacked terminal marks (",?" ".?" "!." "?."): keep only one appropriate end mark.
+      - If the transcript ends with punctuation after cleanup AND the ending is an incomplete fragment, remove it.
+
+4)  Fix capitalization only:
+
+    - Sentence-ending punctuation requires following sentence-start capitalization.
+    - Sentence-start capitalization requires preceding sentence-ending punctuation.
+    - Without a sentence boundary, do NOT introduce mid-sentence capitalization except for proper nouns/entities.
+    - For proper nouns/entities, follow conventional writing style.
+    - Do NOT change the casing of the first token.
+
+──────────────────────────────────────── Output Requirements ────────────────────────────────────────
+
+Output each stage explicitly:
+
+- ct_combine = result after chain step 1
+- ct_fix = result after chain step 2
+- ct_punct = result after chain step 3
+- corrected_text = result after chain step 4
+
+verification.op_details must begin with:
+
+1)  "TOKEN_COMBINE_RESULT: …"
+2)  "ERROR_FIX_RESULT: …"
+3)  "PUNCTUATION_RESULT: …"
+4)  "CASING_RESULT: …"
+
+After those, include normal edit details ("before → after").
+
+Do NOT: - change casing of the first token - add sentence-ending punctuation if not originally present - insert punctuation adjacent to existing punctuation if redundant - allow any unpunctuated span > 20 tokens
+
+──────────────────────────────────────── Determinism Checks ────────────────────────────────────────
+
+- ids must match ORIGINAL preprocessing tokens
+- re-run yields no further required patch
+- no meaningful segment loss
+- no hallucinated lexical content
+- punctuation/capitalization/spacing must be mutually consistent
+
+──────────────────────────────────────── Schema ────────────────────────────────────────
+
+- tokenization: {"scheme":"universal_v1","tokens":[…ORIGINAL tokens…]}
+- ops: only ["rt",id,"new"], ["dt",id], ["it","a|b",id,"tok"], ["ip","a|b",id,"punct"]
+- ct_combine: string
+- ct_fix: string
+- ct_punct: string
+- corrected_text: mechanical result of applying ops only
+- verification: {"edit_count": int, "op_details": ["TOKEN_COMBINE_RESULT: …", "ERROR_FIX_RESULT: …", "PUNCTUATION_RESULT: …", "CASING_RESULT: …", "before → after", …]}
+- machine_transcription_probability: number in [0,1]
+- no additional keys
+
+Input transcript:
