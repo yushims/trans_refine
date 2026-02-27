@@ -18,7 +18,8 @@ Formatting normalization (mandatory when seen):
 - Normalize spacing inside tightly bound symbolic/abbreviated expressions by removing unnecessary internal spaces.
 - Keep fixed compounds and numeric-marker forms compact when spacing changes meaning only in format (not content).
 - Keep lexicalized/proper-name compounds in standard compact form (do not split joined forms like brand/product names).
-- Normalize unambiguous spoken numeral expressions to canonical written numerals across languages when this is format-only (not a meaning rewrite), especially for years/dates, ordinals/cardinals, currency amounts, versions, and IDs.
+- Normalize unambiguous spoken numeral expressions to canonical written numerals across languages when this is format-only (not a meaning rewrite), especially for years/dates, ordinals/cardinals, percentages, currency amounts, versions, and IDs.
+- For unambiguous spoken percentage expressions, convert to numeric percent form using `%`.
 - For year-like expressions with explicit year markers (language-specific), prefer digits when unambiguous.
 - If numeral intent is ambiguous, keep the original wording.
 
@@ -27,7 +28,7 @@ Capitalization only after inserted sentence-ending punctuation; capitalize new L
 
 Chain order (apply in order):
 1) Combine separated token fragments for identifiers/products/proper-names/entities, numbers, thousands/decimal separators, currency/finance, dates/times, web/handles, multipliers, and other tightly bound expressions when the split is meaningless.
-2) Then fix lexical/format errors (typos, ASR substitutions, spacing/formatting of proper-names/products/entities, spoken-numeral normalization when unambiguous, duplicates/disfluencies, and minimal required grammar) while preserving pronunciation similarity, meaning, and consistent formatting across similar entities.
+2) Then fix lexical/format errors (typos, ASR substitutions, spacing/formatting of proper-names/products/entities, spoken-numeral normalization when unambiguous, mandatory percentage normalization when unambiguous, duplicates/disfluencies, and minimal required grammar) while preserving pronunciation similarity, meaning, and consistent formatting across similar entities.
 3) Then fix punctuation/run-ons:
     - Use language-appropriate sentence-end marks; prefer neutral declarative punctuation.
     - Evaluate machine_transcription_probability. If it is > 0.5, punctuation is encouraged at clear boundaries/clauses.
