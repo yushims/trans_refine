@@ -805,9 +805,6 @@ def parse_validate_and_apply_text_fixes(
 
 def build_empty_payload() -> dict:
     return {
-        # "tokenization": {
-        #     "tokens": [],
-        # },
         # "ct_combine": "",
         # "ct_fix": "",
         # "ct_punct": "",
@@ -1127,6 +1124,7 @@ def write_output_artifacts(
     for item in payloads:
         if isinstance(item, dict):
             payload_copy = dict(item)
+            payload_copy.pop("tokenization", None)
             verification = payload_copy.get("verification")
             if isinstance(verification, dict):
                 verification_copy = dict(verification)
@@ -1208,12 +1206,9 @@ def apply_corrected_text_fallback(payload: dict, transcription: str) -> dict | N
         return None
 
     if not isinstance(payload.get("tokenization"), dict):
-        # payload["tokenization"] = {"scheme": "universal_v1", "tokens": []}
         payload["tokenization"] = {"tokens": []}
     else:
         tokenization = payload["tokenization"]
-        # if tokenization.get("scheme") != "universal_v1":
-        #     tokenization["scheme"] = "universal_v1"
         if not isinstance(tokenization.get("tokens"), list):
             tokenization["tokens"] = []
 
