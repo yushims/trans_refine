@@ -18,17 +18,20 @@ Formatting normalization (mandatory when seen):
 - Normalize spacing inside tightly bound symbolic/abbreviated expressions by removing unnecessary internal spaces.
 - Keep fixed compounds and numeric-marker forms compact when spacing changes meaning only in format (not content).
 - Keep lexicalized/proper-name compounds in standard compact form (do not split joined forms like brand/product names).
+- Treat organization/entity legal names as protected spans: do not change internal characters/words based only on phonetic plausibility.
+- For protected entity names, only allow format-only edits (spacing/punctuation/casing/script style); if lexical form is uncertain, keep ORIGINAL.
 - Normalize unambiguous spoken numeral expressions to canonical written numerals across languages when this is format-only (not a meaning rewrite), especially for years/dates, ordinals/cardinals, percentages, currency amounts, versions, and IDs.
 - For unambiguous spoken percentage expressions, convert to numeric percent form using `%`.
 - For year-like expressions with explicit year markers (language-specific), prefer digits when unambiguous.
 - If numeral intent is ambiguous, keep the original wording.
 
 Forbidden: rewrites/paraphrases/reordering/style/idiom edits, em dash, semantic-content deletion, unsupported lexical additions (hallucinations).
+- Forbidden: unsupported lexical substitution inside protected entity/legal-name spans.
 Capitalization only after inserted sentence-ending punctuation; capitalize new Latin sentence starts.
 
 Chain order (apply in order):
 1) Combine separated token fragments for identifiers/products/proper-names/entities, numbers, thousands/decimal separators, currency/finance, dates/times, web/handles, multipliers, and other tightly bound expressions when the split is meaningless.
-2) Then fix lexical/format errors (typos, ASR substitutions, spacing/formatting of proper-names/products/entities, spoken-numeral normalization when unambiguous, mandatory percentage normalization when unambiguous, duplicates/disfluencies, and minimal required grammar) while preserving pronunciation similarity, meaning, and consistent formatting across similar entities.
+2) Then fix lexical/format errors (typos, ASR substitutions, spacing/formatting of proper-names/products/entities, spoken-numeral normalization when unambiguous, mandatory percentage normalization when unambiguous, duplicates/disfluencies, and minimal required grammar) while preserving pronunciation similarity, meaning, and consistent formatting across similar entities. For protected entity/legal-name spans, do not perform lexical substitutions unless directly supported by explicit in-line evidence.
 3) Then fix punctuation/run-ons:
     - Use language-appropriate sentence-end marks; prefer neutral declarative punctuation.
     - Evaluate machine_transcription_probability. If it is > 0.5, punctuation is encouraged at clear boundaries/clauses.

@@ -2,6 +2,7 @@ import asyncio
 import difflib
 import json
 import math
+import random
 import re
 import unicodedata
 from collections.abc import Awaitable, Callable
@@ -482,13 +483,6 @@ def _lexical_tokens_for_terminal_punctuation(text: str) -> list[str]:
     if not isinstance(text, str):
         return []
     return re.findall(r"[^\W_]+(?:['’`.-][^\W_]+)*", text, flags=re.UNICODE)
-
-
-def _last_lexical_token_for_terminal_punctuation(text: str) -> str | None:
-    tokens = _lexical_tokens_for_terminal_punctuation(text)
-    if not tokens:
-        return None
-    return tokens[-1]
 
 
 def validate_terminal_punctuation_preserved(corrected_text: str, source_text: str) -> tuple[bool, str]:
@@ -1159,16 +1153,41 @@ def format_repair_prompt(
     repair_prompt_template: str,
     validation_error: str | None,
     previous_output: str,
+    target_schema: str | None = None,
+    processing_id: str | None = None,
 ) -> str:
-    if "{validation_error}" in repair_prompt_template or "{previous_output}" in repair_prompt_template:
+    supported_placeholders = {"validation_error", "previous_output", "target_schema"}
+    template_placeholders = set(re.findall(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}", repair_prompt_template))
+    unresolved_placeholders = sorted(template_placeholders - supported_placeholders)
+    if unresolved_placeholders:
+        prefix = f"[{processing_id}] " if processing_id else ""
+        print(
+            f"{prefix}WARNING: unresolved repair template placeholders detected: "
+            f"{', '.join(unresolved_placeholders)}"
+        )
+
+    schema_text = target_schema
+    if not isinstance(schema_text, str) or not schema_text.strip():
+        schema_text = (
+            '{"type":"object","required":["ct_casing"],'
+            '"properties":{"ct_casing":{"type":"string"}},'
+            '"additionalProperties":true}'
+        )
+
+    if any(
+        placeholder in repair_prompt_template
+        for placeholder in ("{validation_error}", "{previous_output}", "{target_schema}")
+    ):
         return (
             repair_prompt_template
             .replace("{validation_error}", validation_error or "")
             .replace("{previous_output}", previous_output)
+            .replace("{target_schema}", schema_text)
         )
 
     return (
         f"{repair_prompt_template}\n\n"
+        f"Target schema:\n{schema_text}\n\n"
         f"Validation error:\n{validation_error}\n\n"
         f"Previous output:\n{previous_output}"
     )
@@ -1190,6 +1209,7 @@ def build_repair_prompt_after_invalid_json(
     repair_prompt_template: str,
     validation_error: str | None,
     previous_output: str,
+    target_schema: str | None = None,
     processing_id: str | None = None,
 ) -> str:
     prefix = f"[{processing_id}] " if processing_id else ""
@@ -1198,6 +1218,8 @@ def build_repair_prompt_after_invalid_json(
         repair_prompt_template,
         validation_error,
         previous_output,
+        target_schema,
+        processing_id,
     )
 
 

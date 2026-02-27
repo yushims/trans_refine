@@ -1,38 +1,32 @@
-Return ONLY one strict JSON object (no markdown/prose) that is a corrected version of previous_output.
+Return ONLY one strict JSON value (no markdown/prose) that is a corrected version of previous_output.
 Do NOT change semantic content except as required to make it valid JSON and satisfy the schema below.
 
-Exact top-level keys (no extras, same order):
-tokenization, ct_combine, ct_fix, ct_punct, ct_casing, verification, machine_transcription_probability.
-
-Schema:
-- tokenization = {"tokens": array}
-- ct_combine/ct_fix/ct_punct/ct_casing = string
-- verification = {"op_details": array}
-- machine_transcription_probability = number in [0,1]
-- verification.op_details[0] starts with "TOKEN_COMBINE_RESULT:"
-- verification.op_details[1] starts with "ERROR_FIX_RESULT:"
-- verification.op_details[2] starts with "PUNCTUATION_RESULT:"
-- verification.op_details[3] starts with "CASING_RESULT:"
+Schema (provided by caller; treat as authoritative):
+{target_schema}
 
 Repair rules:
-- Remove any non-JSON text (including markdown/code fences).
-- Quote all keys/strings properly; escape quotes/newlines.
-- Remove trailing commas; use []/{} correctly.
-- If a required field is missing, add it with a safe default:
-  tokens=[], ct_*="",
-  verification.op_details=[
-    "TOKEN_COMBINE_RESULT: no change",
-    "ERROR_FIX_RESULT: no change",
-    "PUNCTUATION_RESULT: no change",
-    "CASING_RESULT: no change"
-  ],
-  machine_transcription_probability=0.0
-- If types are wrong, coerce to the required type.
-- Ensure verification.op_details has at least those 4 required prefixed entries in order; append them if missing.
-- Ensure the final output parses as JSON and matches the schema.
+- Remove any non-JSON text (including markdown/code fences) outside the JSON value.
+- Output MUST be exactly one JSON value (object/array/string/number/boolean/null) matching the schema.
+- Quote keys/strings properly; escape quotes/newlines; use valid UTF-8.
+- Remove trailing commas; fix mismatched brackets/braces; ensure proper separators.
+- If required fields are missing, add them using schema-consistent safe defaults:
+  - object: missing required properties → add with default if given, else empty/zero/false/null as type-appropriate
+  - array: missing → []
+  - string: missing → ""
+  - number: missing → 0
+  - integer: missing → 0
+  - boolean: missing → false
+  - null: missing → null
+- If a field has the wrong type, coerce to the required type when unambiguous; otherwise replace with a safe default.
+- Drop any keys/properties not allowed by the schema (e.g., when additionalProperties=false or when keys must match exactly).
+- If the schema specifies constraints (min/max, enum/const, required, minItems, patterns), modify only as needed to satisfy them.
+- Ensure the final output parses as JSON and conforms to the schema.
 
 Validation error:
 {validation_error}
+
+Target schema:
+{target_schema}
 
 Previous output:
 {previous_output}
