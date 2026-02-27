@@ -1,7 +1,9 @@
 import argparse
 import asyncio
+import json
 import os
 import random
+from pathlib import Path
 
 from dotenv import load_dotenv
 from openai import AzureOpenAI
@@ -13,7 +15,6 @@ from pipeline_common import (
     format_repair_prompt,
     load_prompt_template,
     parse_and_validate_json,
-    parse_transcriptions_from_file,
     resolve_bool_with_override,
     resolve_float_with_fallback,
     resolve_path,
@@ -24,6 +25,119 @@ from pipeline_common import (
 )
 
 load_dotenv()
+
+
+def _initialize_output_paths(
+    output_file_value: str | None,
+    output_plain_file_value: str | None,
+):
+    if not output_file_value:
+        return None, None
+
+    output_path = resolve_path(output_file_value)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text("", encoding="utf-8")
+
+    if output_plain_file_value:
+        output_plain_path = resolve_path(output_plain_file_value)
+    else:
+        output_plain_path = output_path.with_suffix(".txt")
+
+    output_plain_path.parent.mkdir(parents=True, exist_ok=True)
+    output_plain_path.write_text("", encoding="utf-8")
+
+    print(f"Streaming JSON output to: {output_path}")
+    print(f"Streaming plain text output to: {output_plain_path}")
+
+    return output_path, output_plain_path
+
+def _append_output_artifacts(
+    result: dict,
+    output_path,
+    output_plain_path,
+    utt_id: str | None = None,
+) -> None:
+    output_result = result
+    if utt_id is not None:
+        output_result = dict(result)
+        output_result["utt_id"] = utt_id
+
+    output_line = json.dumps(output_result, ensure_ascii=False)
+    with output_path.open("a", encoding="utf-8") as output_file:
+        output_file.write(output_line)
+        output_file.write("\n")
+
+    corrected_text = result.get("corrected_text") if isinstance(result, dict) else ""
+    corrected_text_value = corrected_text if isinstance(corrected_text, str) else ""
+    with output_plain_path.open("a", encoding="utf-8") as output_plain_file:
+        if utt_id is not None:
+            output_plain_file.write(f"{utt_id}\t{corrected_text_value}")
+        else:
+            output_plain_file.write(corrected_text_value)
+        output_plain_file.write("\n")
+
+
+def _append_failed_output_artifacts(
+    transcription: str,
+    output_path,
+    output_plain_path,
+    utt_id: str | None = None,
+) -> None:
+    with output_path.open("a", encoding="utf-8") as output_file:
+        if utt_id is not None:
+            output_file.write(json.dumps({"utt_id": utt_id, "corrected_text": transcription}, ensure_ascii=False))
+        output_file.write("\n")
+
+    with output_plain_path.open("a", encoding="utf-8") as output_plain_file:
+        if utt_id is not None:
+            output_plain_file.write(f"{utt_id}\t{transcription}")
+        else:
+            output_plain_file.write(transcription)
+        output_plain_file.write("\n")
+
+
+def parse_transcription_records_from_file(input_path: Path) -> list[tuple[str | None, str]]:
+    raw_text = input_path.read_text(encoding="utf-8")
+    stripped = raw_text.strip()
+    if not stripped:
+        return []
+
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        parsed = None
+
+    if isinstance(parsed, list):
+        return [(None, item.strip()) for item in parsed if isinstance(item, str) and item.strip()]
+
+    if isinstance(parsed, dict):
+        items = parsed.get("transcriptions")
+        if isinstance(items, list):
+            return [(None, item.strip()) for item in items if isinstance(item, str) and item.strip()]
+
+    records: list[tuple[str | None, str]] = []
+    for raw_line in raw_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        if "\t" in line:
+            utt_id_part, text_part = line.split("\t", 1)
+        else:
+            parts = line.split(maxsplit=1)
+            if len(parts) == 2:
+                utt_id_part, text_part = parts
+            else:
+                utt_id_part, text_part = "", line
+
+        utt_id = utt_id_part.strip()
+        text = text_part.strip()
+        if not text:
+            continue
+
+        records.append((utt_id if utt_id else None, text))
+
+    return records
 
 
 def parse_args() -> argparse.Namespace:
@@ -267,19 +381,19 @@ async def main():
     output_file_value = args.output_file or os.getenv("OUTPUT_FILE")
     output_plain_file_value = args.output_plain_file or os.getenv("OUTPUT_PLAIN_FILE")
 
-    transcriptions: list[str]
+    transcription_records: list[tuple[str | None, str]]
     if input_file_value:
         input_path = resolve_path(input_file_value)
         if not input_path.exists():
             print(f"Input file not found: {input_path}")
             return
-        transcriptions = parse_transcriptions_from_file(input_path)
-        print(f"Read {len(transcriptions)} transcription(s) from: {input_path}")
+        transcription_records = parse_transcription_records_from_file(input_path)
+        print(f"Read {len(transcription_records)} transcription(s) from: {input_path}")
     else:
         transcription = input("Enter transcription: ").strip()
-        transcriptions = [transcription] if transcription else []
+        transcription_records = [(None, transcription)] if transcription else []
 
-    if not transcriptions:
+    if not transcription_records:
         print("No transcription provided.")
         return
 
@@ -309,8 +423,8 @@ async def main():
         top_p_default,
     )
 
-    timeout_seconds = get_env_float("AOAI_TIMEOUT", 180.0)
-    timeout_retries = max(0, get_env_int("AOAI_TIMEOUT_RETRIES", 2))
+    timeout_seconds = get_env_float("AOAI_TIMEOUT", 60.0)
+    timeout_retries = max(0, get_env_int("AOAI_TIMEOUT_RETRIES", 4))
     empty_result_retries = max(0, get_env_int("AOAI_EMPTY_RESULT_RETRIES", 1))
     retry_temperature_jitter = max(0.0, get_env_float("AOAI_RETRY_TEMPERATURE_JITTER", 0.08))
     retry_top_p_jitter = max(0.0, get_env_float("AOAI_RETRY_TOP_P_JITTER", 0.03))
@@ -366,9 +480,16 @@ async def main():
         api_version=api_version,
     )
 
+    output_path, output_plain_path = _initialize_output_paths(
+        output_file_value,
+        output_plain_file_value,
+    )
+
     payloads: list[dict] = []
-    total = len(transcriptions)
-    for index, transcription in enumerate(transcriptions, start=1):
+    failed_count = 0
+    total = len(transcription_records)
+    for index, record in enumerate(transcription_records, start=1):
+        utt_id, transcription = record
         if total > 1:
             print(f"Processing transcription {index}/{total}...")
 
@@ -390,6 +511,15 @@ async def main():
             retry_top_p_jitter,
         )
         if result is None:
+            if output_path is not None and output_plain_path is not None:
+                _append_failed_output_artifacts(transcription, output_path, output_plain_path, utt_id)
+                failed_count += 1
+                print(
+                    f"Failed on transcription {index}/{total} after retries. "
+                    "Wrote fallback outputs and continuing..."
+                )
+                continue
+
             print(f"Failed on transcription {index}/{total}.")
             return
 
@@ -404,11 +534,21 @@ async def main():
 
         payloads.append(result)
 
+        if output_path is not None and output_plain_path is not None:
+            _append_output_artifacts(result, output_path, output_plain_path, utt_id)
+
     if validate_output:
         is_valid, validation_error = validate_output_payloads(payloads)
         if not is_valid:
             print(validation_error)
             return
+
+    if output_path is not None and output_plain_path is not None:
+        print(f"Wrote {len(payloads)} result(s) to: {output_path}")
+        print(f"Wrote {len(payloads)} plain text line(s) to: {output_plain_path}")
+        if failed_count > 0:
+            print(f"Fallback lines written for {failed_count} failed transcription(s).")
+        return
 
     write_output_artifacts(payloads, output_file_value, output_plain_file_value)
 
