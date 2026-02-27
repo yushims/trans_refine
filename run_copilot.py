@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import json
 import os
 import random
 
@@ -27,6 +28,53 @@ except ImportError:
         return False
 
 load_dotenv()
+
+
+def _initialize_output_paths(
+    output_file_value: str | None,
+    output_plain_file_value: str | None,
+):
+    if not output_file_value:
+        return None, None
+
+    output_path = resolve_path(output_file_value)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text("", encoding="utf-8")
+
+    if output_plain_file_value:
+        output_plain_path = resolve_path(output_plain_file_value)
+    else:
+        output_plain_path = output_path.with_suffix(".txt")
+
+    output_plain_path.parent.mkdir(parents=True, exist_ok=True)
+    output_plain_path.write_text("", encoding="utf-8")
+
+    print(f"Streaming JSON output to: {output_path}")
+    print(f"Streaming plain text output to: {output_plain_path}")
+
+    return output_path, output_plain_path
+
+
+def _append_output_artifacts(result: dict, output_path, output_plain_path) -> None:
+    output_line = json.dumps(result, ensure_ascii=False)
+    with output_path.open("a", encoding="utf-8") as output_file:
+        output_file.write(output_line)
+        output_file.write("\n")
+
+    corrected_text = result.get("corrected_text") if isinstance(result, dict) else ""
+    corrected_text_value = corrected_text if isinstance(corrected_text, str) else ""
+    with output_plain_path.open("a", encoding="utf-8") as output_plain_file:
+        output_plain_file.write(corrected_text_value)
+        output_plain_file.write("\n")
+
+
+def _append_failed_output_artifacts(transcription: str, output_path, output_plain_path) -> None:
+    with output_path.open("a", encoding="utf-8") as output_file:
+        output_file.write("\n")
+
+    with output_plain_path.open("a", encoding="utf-8") as output_plain_file:
+        output_plain_file.write(transcription)
+        output_plain_file.write("\n")
 
 
 def parse_args() -> argparse.Namespace:
@@ -314,7 +362,13 @@ async def main():
         prompt_template = load_prompt_template(prompt_template_path)
         repair_prompt_template = load_prompt_template(repair_prompt_template_path)
 
+        output_path, output_plain_path = _initialize_output_paths(
+            output_file_value,
+            output_plain_file_value,
+        )
+
         payloads: list[dict] = []
+        failed_count = 0
         total = len(transcriptions)
         for index, transcription in enumerate(transcriptions, start=1):
             if total > 1:
@@ -356,6 +410,15 @@ async def main():
                 empty_result_retries,
             )
             if payload is None:
+                if output_path is not None and output_plain_path is not None:
+                    _append_failed_output_artifacts(transcription, output_path, output_plain_path)
+                    failed_count += 1
+                    print(
+                        f"Failed on transcription {index}/{total} after retries. "
+                        "Wrote fallback outputs and continuing..."
+                    )
+                    continue
+
                 print(f"Failed on transcription {index}/{total}.")
                 return
 
@@ -370,11 +433,21 @@ async def main():
 
             payloads.append(payload)
 
+            if output_path is not None and output_plain_path is not None:
+                _append_output_artifacts(payload, output_path, output_plain_path)
+
         if validate_output:
             is_valid, validation_error = validate_output_payloads(payloads)
             if not is_valid:
                 print(validation_error)
                 return
+
+        if output_path is not None and output_plain_path is not None:
+            print(f"Wrote {len(payloads)} result(s) to: {output_path}")
+            print(f"Wrote {len(payloads)} plain text line(s) to: {output_plain_path}")
+            if failed_count > 0:
+                print(f"Fallback lines written for {failed_count} failed transcription(s).")
+            return
 
         write_output_artifacts(payloads, output_file_value, output_plain_file_value)
 
