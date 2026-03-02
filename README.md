@@ -64,6 +64,15 @@ python -c "from copilot import CopilotClient; print('Copilot import OK')"
 ./run-aoai.ps1
 ```
 
+`run-aoai.ps1` uses `AZURE_OPENAI_API_KEY` automatically when `-ApiKey` is not provided.
+
+Example (current PowerShell session only):
+
+```powershell
+$env:AZURE_OPENAI_API_KEY = "<your-key>"
+./run-aoai.ps1
+```
+
 Defaults:
 - Deployment: `gpt-5-chat`.
 - Deterministic knobs: `Temperature=0`, `TopP=1` (override with `-Temperature`, `-TopP`).
@@ -99,8 +108,18 @@ Defaults:
 Use the unified retry flag across all evaluated models:
 
 ```powershell
-python .\eval_e2e.py --empty-result-retries 2
-python .\eval_e2e.py --empty-result-retries 2 --timeout 600 --timeout-retries 2
+./eval_e2e.ps1 -HelpOnly
+./eval_e2e.ps1 --empty-result-retries 2
+./eval_e2e.ps1 --empty-result-retries 2 --timeout 600 --timeout-retries 2
+```
+
+`eval_e2e.ps1` uses `AZURE_OPENAI_API_KEY` automatically when `-ApiKey` is not provided.
+
+Example (current PowerShell session only):
+
+```powershell
+$env:AZURE_OPENAI_API_KEY = "<your-key>"
+./eval_e2e.ps1 --empty-result-retries 2
 ```
 
 ## Input / output
