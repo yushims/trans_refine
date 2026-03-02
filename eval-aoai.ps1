@@ -88,6 +88,8 @@ $pythonCommand = $pythonRuntime.Command
 $pythonCommandArgs = $pythonRuntime.Args
 $pythonCommandDisplay = $pythonRuntime.Display
 
+$env:AZURE_OPENAI_API_KEY = $ApiKey
+
 Write-Host "Launching $resolvedScriptPath with $pythonCommandDisplay" -ForegroundColor Cyan
 if (-not $HelpOnly) {
     Write-Host "Input file: $resolvedInputPath" -ForegroundColor Cyan
@@ -112,7 +114,6 @@ else {
         '--deployment', $Deployment,
         '--endpoint', $Endpoint,
         '--api-version', $ApiVersion,
-        '--api-key', $ApiKey,
         '--concurrency', $Concurrency,
         '--timeout', $Timeout,
         '--timeout-retries', $TimeoutRetries,

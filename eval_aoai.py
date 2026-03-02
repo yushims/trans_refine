@@ -1,6 +1,5 @@
 import argparse
 import asyncio
-import os
 import json
 import random
 from pathlib import Path
@@ -55,7 +54,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--deployment", dest="deployment", default="gpt-5-chat")
     parser.add_argument("--endpoint", dest="endpoint", default="https://adaptationdev-resource.openai.azure.com/")
     parser.add_argument("--api-version", dest="api_version", default="2025-01-01-preview")
-    parser.add_argument("--api-key", dest="api_key")
     parser.add_argument("--concurrency", dest="concurrency", type=int, default=10)
     parser.add_argument("--timeout", dest="timeout", type=float, default=600.0)
     parser.add_argument("--timeout-retries", dest="timeout_retries", type=int, default=2)
@@ -134,15 +132,9 @@ async def main() -> None:
     retry_temperature_jitter = max(0.0, float(args.retry_temperature_jitter))
     retry_top_p_jitter = max(0.0, float(args.retry_top_p_jitter))
 
-    api_key = args.api_key or os.getenv("AZURE_OPENAI_API_KEY")
-    if not api_key:
-        print("--api-key is required (or set AZURE_OPENAI_API_KEY).")
-        return
-
     client = AzureOpenAI(
         azure_endpoint=endpoint,
         api_version=api_version,
-        api_key=api_key,
     )
 
     print(f"Using deployment: {deployment}")

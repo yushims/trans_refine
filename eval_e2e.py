@@ -1,14 +1,9 @@
 import argparse
 import json
-import os
 import re
 import subprocess
 import time
 from pathlib import Path
-from dotenv import load_dotenv
-
-
-load_dotenv(dotenv_path=Path(__file__).with_name(".env"), override=False)
 
 
 
@@ -29,7 +24,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--aoai-deployment", default="gpt-5-chat")
     parser.add_argument("--aoai-endpoint", default="https://adaptationdev-resource.openai.azure.com/")
     parser.add_argument("--aoai-api-version", default="2025-01-01-preview")
-    parser.add_argument("--aoai-api-key")
     parser.add_argument("--eval-timeout", type=float, default=600.0)
     parser.add_argument("--eval-timeout-retries", type=int, default=2)
     parser.add_argument("--eval-empty-result-retries", type=int, default=2)
@@ -47,7 +41,10 @@ def non_empty_line_count(file_path: Path) -> int:
     return sum(1 for line in file_path.read_text(encoding="utf-8").splitlines() if line.strip())
 
 
-def run_command(command: list[str], env: dict[str, str], log_path: Path) -> tuple[int, str, float]:
+def run_command(
+    command: list[str],
+    log_path: Path,
+) -> tuple[int, str, float]:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     start_time = time.perf_counter()
     with log_path.open("w", encoding="utf-8", errors="replace") as log_file:
@@ -59,7 +56,6 @@ def run_command(command: list[str], env: dict[str, str], log_path: Path) -> tupl
             text=True,
             encoding="utf-8",
             errors="replace",
-            env=env,
             check=False,
         )
         elapsed_seconds = time.perf_counter() - start_time
@@ -112,10 +108,6 @@ def run_model(
     expected_lines: int,
     extra_args: list[str] | None = None,
 ) -> dict[str, str]:
-    env = os.environ.copy()
-    env["PYTHONIOENCODING"] = "utf-8"
-    env["PYTHONUTF8"] = "1"
-    env["EMPTY_RESULT_RETRIES"] = str(empty_result_retries)
 
     run_error_descriptions: dict[str, str] = {}
     logs_dir = Path(f"{prefix}_results")
@@ -143,12 +135,14 @@ def run_model(
                 str(input_file),
                 "-OutputFile",
                 str(out_json),
+                "-EmptyResultRetries",
+                str(empty_result_retries),
             ]
             if extra_args:
                 command.extend(extra_args)
 
             log_path = logs_dir / f"run{run_index}_{model}_attempt{attempt_index}.log"
-            exit_code, output, attempt_runtime_seconds = run_command(command, env, log_path)
+            exit_code, output, attempt_runtime_seconds = run_command(command, log_path)
             print(f"{model.upper()} log: {log_path}")
             print(
                 f"{model.upper()} run {run_index} attempt {attempt_index} "
@@ -194,9 +188,6 @@ def run_eval(
     prefix: str,
     log_name: str | None = None,
 ) -> None:
-    env = os.environ.copy()
-    env["PYTHONIOENCODING"] = "utf-8"
-    env["PYTHONUTF8"] = "1"
     command = [
         "pwsh",
         "-NoProfile",
@@ -209,7 +200,7 @@ def run_eval(
     logs_dir = Path(f"{prefix}_results")
     log_filename = log_name or f"{Path(script_name).stem}.log"
     log_path = logs_dir / log_filename
-    exit_code, _output, runtime_seconds = run_command(command, env, log_path)
+    exit_code, _output, runtime_seconds = run_command(command, log_path)
     print(f"EVAL script {script_name} log: {log_path}")
     print(f"EVAL script {script_name} summary: exit={exit_code}, runtime={runtime_seconds:.2f}s")
     if exit_code != 0:
@@ -224,8 +215,6 @@ def main() -> None:
     if not input_file.exists():
         raise FileNotFoundError(f"Input file not found: {input_file}")
     expected_lines = non_empty_line_count(input_file)
-
-    eval_api_key = args.aoai_api_key or os.getenv("AZURE_OPENAI_API_KEY")
 
     aoai_errors = run_model(
         model=f"aoai-{args.aoai_deployment}",
@@ -306,7 +295,6 @@ def main() -> None:
         "-Deployment", args.aoai_deployment,
         "-Endpoint", args.aoai_endpoint,
         "-ApiVersion", args.aoai_api_version,
-        "-ApiKey", eval_api_key,
         "-Timeout", str(args.eval_timeout),
         "-TimeoutRetries", str(args.eval_timeout_retries),
         "-EmptyResultRetries", str(args.eval_empty_result_retries),

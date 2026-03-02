@@ -70,7 +70,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--deployment", dest="deployment", default="gpt-5-chat")
     parser.add_argument("--endpoint", dest="endpoint", default="https://adaptationdev-resource.openai.azure.com/")
     parser.add_argument("--api-version", dest="api_version", default="2025-01-01-preview")
-    parser.add_argument("--api-key", dest="api_key")
     parser.add_argument("--concurrency", dest="concurrency", type=int, default=10)
     parser.add_argument("--timeout", dest="timeout", type=float, default=600.0)
     parser.add_argument("--timeout-retries", dest="timeout_retries", type=int, default=2)
@@ -129,10 +128,6 @@ async def main() -> None:
     endpoint = args.endpoint
     deployment = args.deployment
     api_version = args.api_version
-    api_key = args.api_key
-    if not api_key:
-        print("--api-key is required.")
-        return
 
     configured_concurrency = args.concurrency
     concurrency = max(1, configured_concurrency)
@@ -178,7 +173,6 @@ async def main() -> None:
 
     client = AzureOpenAI(
         azure_endpoint=endpoint,
-        api_key=api_key,
         api_version=api_version,
     )
 
