@@ -328,7 +328,7 @@ def main() -> None:
         Path("eval_aoai.py"),
         aoai_eval_args,
         args.prefix,
-        log_name=f"eval-aoai-{args.aoai_deployment}.log",
+        log_name=f"eval_aoai-{args.aoai_deployment}.log",
     )
 
     run_eval(
@@ -343,7 +343,7 @@ def main() -> None:
             "--concurrency", str(max(1, args.eval_concurrency)),
         ],
         args.prefix,
-        log_name=f"eval-copilot-{args.copilot_model}.log",
+        log_name=f"eval_copilot-{args.copilot_model}.log",
     )
 
     run_eval(
@@ -358,7 +358,7 @@ def main() -> None:
             "--concurrency", str(max(1, args.eval_concurrency)),
         ],
         args.prefix,
-        log_name=f"eval-copilot-{args.gemini_model}.log",
+        log_name=f"eval_copilot-{args.gemini_model}.log",
     )
 
     elapsed_seconds = time.perf_counter() - start_time

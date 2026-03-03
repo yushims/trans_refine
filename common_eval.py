@@ -381,7 +381,7 @@ def write_eval_outputs(
         normalized_item.pop("evaluator_model", None)
         normalized_report.append(normalized_item)
 
-    results_path = output_dir / f"{prefix}_results_{evaluator_api}-{evaluator_model}.json"
+    results_path = output_dir / f"{prefix}_{evaluator}_results.json"
     results_path.write_text(json.dumps(normalized_report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     rows: list[dict[str, object]] = []
     total_runs = 0
@@ -411,7 +411,7 @@ def write_eval_outputs(
         total_failed += float(failed_lines)
         total_line_count += float(total_lines)
 
-    scores_path = output_dir / f"{prefix}_scores_{evaluator_api}-{evaluator_model}.csv"
+    scores_path = output_dir / f"{prefix}_{evaluator}_scores.csv"
     with scores_path.open("w", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(
             file,
@@ -431,7 +431,7 @@ def write_eval_outputs(
         }
     ]
 
-    summary_path = output_dir / f"{prefix}_summary_{evaluator_api}-{evaluator_model}.csv"
+    summary_path = output_dir / f"{prefix}_{evaluator}_summary.csv"
     with summary_path.open("w", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(
             file,

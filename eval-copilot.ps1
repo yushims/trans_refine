@@ -96,7 +96,7 @@ else {
     $scriptArgs = @(
         $resolvedScriptPath,
         '--orginal-trans-file', $resolvedInputPath,
-        '--output-file', $resolvedOutputPath,
+        '--prefix', $resolvedOutputPath,
         '--prompt-file', $resolvedPromptFilePath,
         '--model', $Model,
         '--concurrency', $Concurrency,
