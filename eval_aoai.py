@@ -164,6 +164,7 @@ async def main() -> None:
 
     report: list[dict] = []
     for file_name in patch_result_files:
+        print(f"Evaluating patch result file: {file_name}")
         path = Path(file_name)
         if not path.exists():
             reason = "Missing output file"

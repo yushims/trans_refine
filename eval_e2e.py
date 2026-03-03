@@ -6,8 +6,6 @@ import sys
 import time
 from pathlib import Path
 
-from common_eval import write_eval_outputs
-
 
 
 def parse_args() -> argparse.Namespace:
@@ -219,38 +217,6 @@ def run_eval(
         raise RuntimeError(f"Evaluation script failed: {script_path}. See {log_path}")
 
 
-def apply_patch_model_to_eval_outputs(
-    prefix: str,
-    evaluator_api: str,
-    evaluator_model: str,
-    patch_model_by_file: dict[str, str],
-) -> None:
-    output_dir = Path(f"{prefix}_results")
-    results_path = output_dir / f"{prefix}_results_{evaluator_api}-{evaluator_model}.json"
-    if not results_path.exists():
-        return
-
-    payload = json.loads(results_path.read_text(encoding="utf-8"))
-    if not isinstance(payload, list):
-        return
-
-    normalized_report: list[dict] = []
-    for item in payload:
-        if not isinstance(item, dict):
-            continue
-        file_name = str(item.get("result_file", item.get("file", "")))
-        patch_model = patch_model_by_file.get(file_name)
-        if not patch_model and file_name:
-            patch_model = patch_model_by_file.get(Path(file_name).name)
-        normalized_item = dict(item)
-        if "result_file" not in normalized_item and file_name:
-            normalized_item["result_file"] = file_name
-        normalized_item["patch_model"] = patch_model or "unknown"
-        normalized_report.append(normalized_item)
-
-    write_eval_outputs(prefix, evaluator_api, evaluator_model, normalized_report)
-
-
 def main() -> None:
     start_time = time.perf_counter()
     args = parse_args()
@@ -324,29 +290,16 @@ def main() -> None:
         f"copilot-{args.copilot_model}",
         f"copilot-{args.gemini_model}",
     ]
-    generated_patch_models = ["aoai", "copilot", "copilot"]
     patch_result_files: list[str] = []
-    patch_models: list[str] = []
-    for model_name, patch_model in zip(generated_output_models, generated_patch_models):
+    for model_name in generated_output_models:
         patch_result_files.extend(
             [
                 str(patch_result_dir / f"run{i}_{model_name}.txt")
                 for i in range(1, args.runs + 1)
             ]
         )
-        patch_models.extend([patch_model] * args.runs)
     patch_result_file_value = ",".join(patch_result_files)
     eval_output_prefix = Path(str(args.prefix)).stem or args.prefix
-    patch_model_by_file: dict[str, str] = {
-        file_name: patch_model
-        for file_name, patch_model in zip(patch_result_files, patch_models)
-    }
-    patch_model_by_file.update(
-        {
-            Path(file_name).name: patch_model
-            for file_name, patch_model in zip(patch_result_files, patch_models)
-        }
-    )
 
     common_eval_args = [
         "--orginal-trans-file", str(input_file),
@@ -377,12 +330,6 @@ def main() -> None:
         args.prefix,
         log_name=f"eval-aoai-{args.aoai_deployment}.log",
     )
-    apply_patch_model_to_eval_outputs(
-        eval_output_prefix,
-        "aoai",
-        args.aoai_deployment,
-        patch_model_by_file,
-    )
 
     run_eval(
         Path("eval_copilot.py"),
@@ -398,12 +345,6 @@ def main() -> None:
         args.prefix,
         log_name=f"eval-copilot-{args.copilot_model}.log",
     )
-    apply_patch_model_to_eval_outputs(
-        eval_output_prefix,
-        "copilot",
-        args.copilot_model,
-        patch_model_by_file,
-    )
 
     run_eval(
         Path("eval_copilot.py"),
@@ -418,12 +359,6 @@ def main() -> None:
         ],
         args.prefix,
         log_name=f"eval-copilot-{args.gemini_model}.log",
-    )
-    apply_patch_model_to_eval_outputs(
-        eval_output_prefix,
-        "copilot",
-        args.gemini_model,
-        patch_model_by_file,
     )
 
     elapsed_seconds = time.perf_counter() - start_time
