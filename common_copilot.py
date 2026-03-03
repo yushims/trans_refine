@@ -6,6 +6,7 @@ from typing import Any
 
 from common import (
     build_repair_prompt_after_invalid_json,
+    extract_retry_after_seconds,
     extract_text_content,
     handle_invalid_repair_json_result,
     is_non_repairable_validation_error,
@@ -93,6 +94,23 @@ class ModelMismatchError(RuntimeError):
         super().__init__(
             f"MODEL_MISMATCH requested={requested_model} actual={actual_model}"
         )
+
+
+def is_copilot_retryable_error(error: Exception) -> bool:
+    if isinstance(error, ModelMismatchError):
+        return False
+
+    status_code = getattr(error, "status_code", None)
+    if status_code == 429:
+        return True
+
+    message = str(error).lower()
+    return (
+        "rate limit" in message
+        or "too many requests" in message
+        or "throttl" in message
+        or "error code: 429" in message
+    )
 
 
 async def send_copilot_once(
@@ -194,7 +212,13 @@ async def send_copilot_with_timeout_retry(
             requested_model,
         )
 
-    return await run_with_timeout_retry(operation, timeout_retries, processing_id)
+    return await run_with_timeout_retry(
+        operation,
+        timeout_retries,
+        processing_id,
+        is_retryable_error=is_copilot_retryable_error,
+        resolve_backoff_seconds=lambda error, _attempt: extract_retry_after_seconds(error),
+    )
 
 
 async def handle_copilot_model_mismatch_retry(

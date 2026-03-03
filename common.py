@@ -150,6 +150,31 @@ async def run_with_timeout_retry(
     return None
 
 
+def extract_retry_after_seconds(error: Exception) -> float | None:
+    response = getattr(error, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers is not None:
+        retry_after_header = headers.get("retry-after") or headers.get("Retry-After")
+        if retry_after_header is not None:
+            try:
+                retry_after_seconds = float(str(retry_after_header).strip())
+                if retry_after_seconds > 0:
+                    return retry_after_seconds
+            except ValueError:
+                pass
+
+    message = str(error)
+    match = re.search(r"retry after\s+(\d+(?:\.\d+)?)\s+second", message, flags=re.IGNORECASE)
+    if not match:
+        return None
+
+    try:
+        retry_after_seconds = float(match.group(1))
+        return retry_after_seconds if retry_after_seconds > 0 else None
+    except ValueError:
+        return None
+
+
 def should_retry_after_failure(
     empty_attempt: int,
     empty_result_retries: int,
@@ -710,12 +735,50 @@ def _mark_non_repairable_validation_error(validation_error: str) -> str:
     return f"{non_repairable_prefix()} {validation_error}"
 
 
+def strip_markdown_code_fence(text: str) -> str:
+    if not isinstance(text, str):
+        return ""
+
+    trimmed = text.strip()
+    if not trimmed:
+        return trimmed
+
+    html_block = re.match(
+        r"^\s*<pre>\s*<code[^>]*>(.*?)</code>\s*</pre>\s*$",
+        trimmed,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if html_block:
+        return html_block.group(1).strip()
+
+    full_fence_match = re.match(
+        r"^\s*(```|~~~)[^\n]*\n(.*?)\n\1\s*$",
+        trimmed,
+        flags=re.DOTALL,
+    )
+    if full_fence_match:
+        return full_fence_match.group(2).strip()
+
+    embedded_fence_match = re.search(
+        r"(```|~~~)[^\n]*\n(.*?)\n\1",
+        trimmed,
+        flags=re.DOTALL,
+    )
+    if embedded_fence_match:
+        return embedded_fence_match.group(2).strip()
+
+    lines = trimmed.splitlines()
+    non_empty_lines = [line for line in lines if line.strip()]
+    if non_empty_lines and all(line.lstrip().startswith(">") for line in non_empty_lines):
+        unquoted = "\n".join(re.sub(r"^\s*>\s?", "", line) for line in lines).strip()
+        if unquoted and unquoted != trimmed:
+            return strip_markdown_code_fence(unquoted)
+
+    return trimmed
+
+
 def parse_and_validate_json(content: str) -> tuple[dict | None, str | None]:
-    trimmed = content.strip()
-    if trimmed.startswith("```"):
-        lines = trimmed.splitlines()
-        if len(lines) >= 3 and lines[0].startswith("```") and lines[-1].startswith("```"):
-            trimmed = "\n".join(lines[1:-1]).strip()
+    trimmed = strip_markdown_code_fence(content)
 
     extracted = extract_first_json_object(trimmed)
     candidate = extracted if extracted is not None else trimmed
@@ -825,7 +888,7 @@ def describe_top_level_key_error(
     if not validation_error or "Top-level keys must be exactly:" not in validation_error:
         return None
 
-    trimmed = raw_output.strip()
+    trimmed = strip_markdown_code_fence(raw_output)
     candidate = extract_first_json_object(trimmed) or trimmed
 
     try:

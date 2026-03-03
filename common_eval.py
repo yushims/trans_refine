@@ -10,10 +10,13 @@ from common_copilot import (
     ModelMismatchError,
     build_copilot_session_parameters,
     handle_copilot_model_mismatch_retry,
+    is_copilot_retryable_error,
     send_copilot_once,
 )
 from common import (
     build_repair_prompt_after_invalid_json,
+    extract_retry_after_seconds,
+    strip_markdown_code_fence,
     run_with_timeout_retry,
     should_retry_after_failure,
 )
@@ -75,7 +78,7 @@ async def get_copilot_eval_payload_with_retries(
                 if not content:
                     raise ValueError("evaluation model returned empty content")
 
-                payload = json.loads(content)
+                payload = json.loads(strip_markdown_code_fence(content))
                 is_valid, validation_error = validate_eval_payload(payload)
                 if not is_valid:
                     raise ValueError(f"invalid evaluator payload: {validation_error}")
@@ -86,6 +89,8 @@ async def get_copilot_eval_payload_with_retries(
                     operation,
                     timeout_retries,
                     processing_id=processing_id,
+                    is_retryable_error=is_copilot_retryable_error,
+                    resolve_backoff_seconds=lambda error, _attempt: extract_retry_after_seconds(error),
                 )
 
                 if result is None:
@@ -249,7 +254,7 @@ async def get_aoai_eval_payload_with_repair(
                 return build_failed_payload("Prompt-eval failure: empty content after retries")
 
             try:
-                payload = json.loads(content)
+                payload = json.loads(strip_markdown_code_fence(content))
                 is_valid, validation_error = validate_payload(payload)
                 if not is_valid:
                     raise ValueError(f"invalid evaluator payload: {validation_error}")
@@ -286,7 +291,7 @@ async def get_aoai_eval_payload_with_repair(
                     return build_failed_payload("Prompt-eval failure: repair returned empty output or timed out")
 
                 try:
-                    payload = json.loads(repaired_content)
+                    payload = json.loads(strip_markdown_code_fence(repaired_content))
                     is_valid, validation_error = validate_payload(payload)
                     if not is_valid:
                         raise ValueError(f"invalid evaluator payload: {validation_error}")
