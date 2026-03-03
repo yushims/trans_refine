@@ -30,32 +30,146 @@ PATCH_SCHEMA = {
                 },
                 "required": ["tokens"]
             },
-            "ct_combine": {"type": "string"},
-            "ct_fix": {"type": "string"},
-            "ct_punct": {"type": "string"},
-            "ct_casing": {"type": "string"},
-            "verification": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "op_details": {"type": "array", "items": {"type": "string"}}
-                },
-                "required": ["op_details"]
-            },
             "machine_transcription_probability": {
                 "type": "number",
                 "minimum": 0,
                 "maximum": 1
+            },
+            "ct_combine": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "edits": {
+                        "type": "array",
+                        "items": {
+                            "type": "array",
+                            "minItems": 2,
+                            "maxItems": 2,
+                            "items": {"type": "string"},
+                        },
+                    },
+                    "result": {"type": "string"},
+                },
+                "required": ["edits", "result"],
+            },
+            "no_touch_tokens": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "ct_lexical": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "edits": {
+                        "type": "array",
+                        "items": {
+                            "type": "array",
+                            "minItems": 2,
+                            "maxItems": 2,
+                            "items": {"type": "string"},
+                        },
+                    },
+                    "result": {"type": "string"},
+                },
+                "required": ["edits", "result"],
+            },
+            "ct_disfluency": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "edits": {
+                        "type": "array",
+                        "items": {
+                            "type": "array",
+                            "minItems": 2,
+                            "maxItems": 2,
+                            "items": {"type": "string"},
+                        },
+                    },
+                    "result": {"type": "string"},
+                },
+                "required": ["edits", "result"],
+            },
+            "ct_format": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "edits": {
+                        "type": "array",
+                        "items": {
+                            "type": "array",
+                            "minItems": 2,
+                            "maxItems": 2,
+                            "items": {"type": "string"},
+                        },
+                    },
+                    "result": {"type": "string"},
+                },
+                "required": ["edits", "result"],
+            },
+            "ct_numeral": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "edits": {
+                        "type": "array",
+                        "items": {
+                            "type": "array",
+                            "minItems": 2,
+                            "maxItems": 2,
+                            "items": {"type": "string"},
+                        },
+                    },
+                    "result": {"type": "string"},
+                },
+                "required": ["edits", "result"],
+            },
+            "ct_punct": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "edits": {
+                        "type": "array",
+                        "items": {
+                            "type": "array",
+                            "minItems": 2,
+                            "maxItems": 2,
+                            "items": {"type": "string"},
+                        },
+                    },
+                    "result": {"type": "string"},
+                },
+                "required": ["edits", "result"],
+            },
+            "ct_casing": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "edits": {
+                        "type": "array",
+                        "items": {
+                            "type": "array",
+                            "minItems": 2,
+                            "maxItems": 2,
+                            "items": {"type": "string"},
+                        },
+                    },
+                    "result": {"type": "string"},
+                },
+                "required": ["edits", "result"],
             }
         },
         "required": [
             "tokenization",
+            "machine_transcription_probability",
             "ct_combine",
-            "ct_fix",
+            "no_touch_tokens",
+            "ct_lexical",
+            "ct_disfluency",
+            "ct_format",
+            "ct_numeral",
             "ct_punct",
-            "ct_casing",
-            "verification",
-            "machine_transcription_probability"
+            "ct_casing"
         ]
     }
 }

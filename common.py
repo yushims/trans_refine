@@ -10,16 +10,19 @@ from pathlib import Path
 
 
 _REQUIRED_TOP_LEVEL_KEYS = {
+    "tokenization",
+    "machine_transcription_probability",
+    "ct_combine",
+    "no_touch_tokens",
+    "ct_lexical",
+    "ct_disfluency",
+    "ct_format",
+    "ct_numeral",
+    "ct_punct",
     "ct_casing",
 }
 
 _OPTIONAL_TOP_LEVEL_KEYS = {
-    "tokenization",
-    "ct_combine",
-    "ct_fix",
-    "ct_punct",
-    "verification",
-    "machine_transcription_probability",
     "corrected_text",
 }
 
@@ -614,11 +617,21 @@ def _materialize_corrected_text(payload: dict) -> dict:
     if isinstance(corrected_text, str) and corrected_text.strip():
         return payload
 
-    for key in ("ct_casing", "ct_punct", "ct_fix", "ct_combine"):
+    for key in (
+        "ct_casing",
+        "ct_punct",
+        "ct_numeral",
+        "ct_format",
+        "ct_disfluency",
+        "ct_lexical",
+        "ct_combine",
+    ):
         value = payload.get(key)
-        if isinstance(value, str):
-            payload["corrected_text"] = value
-            return payload
+        if isinstance(value, dict):
+            result = value.get("result")
+            if isinstance(result, str):
+                payload["corrected_text"] = result
+                return payload
 
     payload["corrected_text"] = ""
     return payload
@@ -632,14 +645,67 @@ def validate_patch_payload(payload: dict) -> tuple[bool, str]:
     if missing_required or unexpected_keys:
         return False, (
             "Top-level keys must be exactly: "
-            "ct_casing "
-            "(optional: tokenization, ct_combine, ct_fix, "
-            "ct_punct, verification, "
-            "machine_transcription_probability, corrected_text)"
+            "tokenization, machine_transcription_probability, ct_combine, no_touch_tokens, ct_lexical, "
+            "ct_disfluency, ct_format, ct_numeral, ct_punct, ct_casing "
+            "(optional internal key: corrected_text)"
         )
 
-    if not isinstance(payload.get("ct_casing"), str):
-        return False, "ct_casing must be a string"
+    tokenization_value = payload.get("tokenization")
+    if not isinstance(tokenization_value, dict):
+        return False, "tokenization must be an object"
+    if set(tokenization_value.keys()) != {"tokens"}:
+        return False, "tokenization must contain exactly key tokens"
+    tokens = tokenization_value.get("tokens")
+    if not isinstance(tokens, list) or not all(isinstance(token, str) for token in tokens):
+        return False, "tokenization.tokens must be an array of strings"
+
+    no_touch_tokens = payload.get("no_touch_tokens")
+    if not isinstance(no_touch_tokens, list) or not all(isinstance(token, str) for token in no_touch_tokens):
+        return False, "no_touch_tokens must be an array of strings"
+
+    def _validate_step_field(step_name: str) -> tuple[bool, str]:
+        value = payload.get(step_name)
+        if value is None:
+            return True, ""
+        if not isinstance(value, dict):
+            return False, f"{step_name} value must be dict with keys edits/result"
+
+        if set(value.keys()) != {"edits", "result"}:
+            return False, f"{step_name} must contain exactly keys edits/result"
+
+        edits = value.get("edits")
+        if not isinstance(edits, list):
+            return False, f"{step_name}.edits must be an array"
+
+        for index, pair in enumerate(edits, start=1):
+            if not isinstance(pair, list) or len(pair) != 2 or not all(isinstance(part, str) for part in pair):
+                return False, f"{step_name}.edits[{index}] must be [before, after] strings"
+
+        result = value.get("result")
+        if not isinstance(result, str):
+            return False, f"{step_name}.result must be a string"
+
+        return True, ""
+
+    for step_key in (
+        "ct_combine",
+        "ct_lexical",
+        "ct_disfluency",
+        "ct_format",
+        "ct_numeral",
+        "ct_punct",
+        "ct_casing",
+    ):
+        is_step_valid, step_error = _validate_step_field(step_key)
+        if not is_step_valid:
+            return False, step_error
+
+    machine_probability = payload.get("machine_transcription_probability")
+    if not isinstance(machine_probability, (int, float)):
+        return False, "machine_transcription_probability must be a number in [0, 1]"
+    if machine_probability < 0 or machine_probability > 1:
+        return False, "machine_transcription_probability must be in [0, 1]"
+
     if not isinstance(payload.get("corrected_text", ""), str):
         return False, "corrected_text must be a string"
 
@@ -708,10 +774,13 @@ def is_json_like_repairable_response(content: str) -> tuple[bool, str]:
     if any(key in lowered for key in (
         '"tokenization"',
         '"ct_combine"',
-        '"ct_fix"',
+        '"no_touch_tokens"',
+        '"ct_lexical"',
+        '"ct_disfluency"',
+        '"ct_format"',
+        '"ct_numeral"',
         '"ct_punct"',
         '"ct_casing"',
-        '"verification"',
         '"machine_transcription_probability"',
     )):
         return True, "contains expected JSON schema keys"
@@ -862,20 +931,16 @@ def parse_validate_and_apply_text_fixes(
 
 def build_empty_payload() -> dict:
     return {
-        # "ct_combine": "",
-        # "ct_fix": "",
-        # "ct_punct": "",
-        "ct_casing": "",
-        # "corrected_text": "",
-        # "verification": {
-        #     "op_details": [
-        #         "TOKEN_COMBINE_RESULT:",
-        #         "ERROR_FIX_RESULT:",
-        #         "PUNCTUATION_RESULT:",
-        #         "CASING_RESULT:",
-        #     ],
-        # },
-        # "machine_transcription_probability": 0.0,
+        "tokenization": {"tokens": []},
+        "machine_transcription_probability": 0.0,
+        "ct_combine": {"edits": [], "result": ""},
+        "no_touch_tokens": [],
+        "ct_lexical": {"edits": [], "result": ""},
+        "ct_disfluency": {"edits": [], "result": ""},
+        "ct_format": {"edits": [], "result": ""},
+        "ct_numeral": {"edits": [], "result": ""},
+        "ct_punct": {"edits": [], "result": ""},
+        "ct_casing": {"edits": [], "result": ""},
     }
 
 
@@ -1182,10 +1247,6 @@ def write_output_artifacts(
         if isinstance(item, dict):
             payload_copy = dict(item)
             payload_copy.pop("tokenization", None)
-            verification = payload_copy.get("verification")
-            if isinstance(verification, dict):
-                verification_copy = dict(verification)
-                payload_copy["verification"] = verification_copy
             sanitized_payloads.append(payload_copy)
 
     output_payload = sanitized_payloads[0] if len(sanitized_payloads) == 1 else sanitized_payloads
@@ -1232,9 +1293,9 @@ def format_repair_prompt(
     schema_text = target_schema
     if not isinstance(schema_text, str) or not schema_text.strip():
         schema_text = (
-            '{"type":"object","required":["ct_casing"],'
-            '"properties":{"ct_casing":{"type":"string"}},'
-            '"additionalProperties":true}'
+            '{"type":"object","required":["tokenization","machine_transcription_probability",'
+            '"ct_combine","no_touch_tokens","ct_lexical","ct_disfluency","ct_format","ct_numeral","ct_punct","ct_casing"],'
+            '"additionalProperties":false}'
         )
 
     if any(
@@ -1297,25 +1358,23 @@ def apply_corrected_text_fallback(payload: dict, transcription: str) -> dict | N
         if not isinstance(tokenization.get("tokens"), list):
             tokenization["tokens"] = []
 
-    if not isinstance(payload.get("ct_combine"), str):
-        payload["ct_combine"] = ""
-    if not isinstance(payload.get("ct_fix"), str):
-        payload["ct_fix"] = ""
-    if not isinstance(payload.get("ct_punct"), str):
-        payload["ct_punct"] = ""
-    if not isinstance(payload.get("ct_casing"), str):
-        payload["ct_casing"] = ""
-
-    verification = payload.get("verification")
-    if not isinstance(verification, dict):
-        verification = {}
-        payload["verification"] = verification
-    verification["op_details"] = [
-        "TOKEN_COMBINE_RESULT:",
-        "ERROR_FIX_RESULT:",
-        "PUNCTUATION_RESULT:",
-        "CASING_RESULT:",
-    ]
+    if not isinstance(payload.get("ct_combine"), dict):
+        payload["ct_combine"] = {"edits": [], "result": ""}
+    no_touch_tokens = payload.get("no_touch_tokens")
+    if not isinstance(no_touch_tokens, list) or not all(isinstance(token, str) for token in no_touch_tokens):
+        payload["no_touch_tokens"] = []
+    if not isinstance(payload.get("ct_lexical"), dict):
+        payload["ct_lexical"] = {"edits": [], "result": ""}
+    if not isinstance(payload.get("ct_disfluency"), dict):
+        payload["ct_disfluency"] = {"edits": [], "result": ""}
+    if not isinstance(payload.get("ct_format"), dict):
+        payload["ct_format"] = {"edits": [], "result": ""}
+    if not isinstance(payload.get("ct_numeral"), dict):
+        payload["ct_numeral"] = {"edits": [], "result": ""}
+    if not isinstance(payload.get("ct_punct"), dict):
+        payload["ct_punct"] = {"edits": [], "result": ""}
+    if not isinstance(payload.get("ct_casing"), dict):
+        payload["ct_casing"] = {"edits": [], "result": ""}
 
     machine_probability = payload.get("machine_transcription_probability")
     if not isinstance(machine_probability, (int, float)):

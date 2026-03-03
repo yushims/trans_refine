@@ -279,16 +279,158 @@ async def _get_copilot_patch_payload_with_repair_on_session(
     patch_target_schema = json.dumps(
         {
             "type": "object",
-            "required": ["ct_casing"],
+            "required": [
+                "tokenization",
+                "machine_transcription_probability",
+                "ct_combine",
+                "no_touch_tokens",
+                "ct_lexical",
+                "ct_disfluency",
+                "ct_format",
+                "ct_numeral",
+                "ct_punct",
+                "ct_casing",
+            ],
             "properties": {
-                "tokenization": {"type": "object"},
-                "ct_combine": {"type": "string"},
-                "ct_fix": {"type": "string"},
-                "ct_punct": {"type": "string"},
-                "ct_casing": {"type": "string"},
-                "verification": {"type": "object"},
-                "machine_transcription_probability": {"type": "number"},
-                "corrected_text": {"type": "string"},
+                "tokenization": {
+                    "type": "object",
+                    "properties": {
+                        "tokens": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                    },
+                    "required": ["tokens"],
+                    "additionalProperties": False,
+                },
+                "machine_transcription_probability": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1,
+                },
+                "ct_combine": {
+                    "type": "object",
+                    "properties": {
+                        "edits": {
+                            "type": "array",
+                            "items": {
+                                "type": "array",
+                                "minItems": 2,
+                                "maxItems": 2,
+                                "items": {"type": "string"},
+                            },
+                        },
+                        "result": {"type": "string"},
+                    },
+                    "required": ["edits", "result"],
+                    "additionalProperties": False,
+                },
+                "no_touch_tokens": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "ct_lexical": {
+                    "type": "object",
+                    "properties": {
+                        "edits": {
+                            "type": "array",
+                            "items": {
+                                "type": "array",
+                                "minItems": 2,
+                                "maxItems": 2,
+                                "items": {"type": "string"},
+                            },
+                        },
+                        "result": {"type": "string"},
+                    },
+                    "required": ["edits", "result"],
+                    "additionalProperties": False,
+                },
+                "ct_disfluency": {
+                    "type": "object",
+                    "properties": {
+                        "edits": {
+                            "type": "array",
+                            "items": {
+                                "type": "array",
+                                "minItems": 2,
+                                "maxItems": 2,
+                                "items": {"type": "string"},
+                            },
+                        },
+                        "result": {"type": "string"},
+                    },
+                    "required": ["edits", "result"],
+                    "additionalProperties": False,
+                },
+                "ct_format": {
+                    "type": "object",
+                    "properties": {
+                        "edits": {
+                            "type": "array",
+                            "items": {
+                                "type": "array",
+                                "minItems": 2,
+                                "maxItems": 2,
+                                "items": {"type": "string"},
+                            },
+                        },
+                        "result": {"type": "string"},
+                    },
+                    "required": ["edits", "result"],
+                    "additionalProperties": False,
+                },
+                "ct_numeral": {
+                    "type": "object",
+                    "properties": {
+                        "edits": {
+                            "type": "array",
+                            "items": {
+                                "type": "array",
+                                "minItems": 2,
+                                "maxItems": 2,
+                                "items": {"type": "string"},
+                            },
+                        },
+                        "result": {"type": "string"},
+                    },
+                    "required": ["edits", "result"],
+                    "additionalProperties": False,
+                },
+                "ct_punct": {
+                    "type": "object",
+                    "properties": {
+                        "edits": {
+                            "type": "array",
+                            "items": {
+                                "type": "array",
+                                "minItems": 2,
+                                "maxItems": 2,
+                                "items": {"type": "string"},
+                            },
+                        },
+                        "result": {"type": "string"},
+                    },
+                    "required": ["edits", "result"],
+                    "additionalProperties": False,
+                },
+                "ct_casing": {
+                    "type": "object",
+                    "properties": {
+                        "edits": {
+                            "type": "array",
+                            "items": {
+                                "type": "array",
+                                "minItems": 2,
+                                "maxItems": 2,
+                                "items": {"type": "string"},
+                            },
+                        },
+                        "result": {"type": "string"},
+                    },
+                    "required": ["edits", "result"],
+                    "additionalProperties": False,
+                },
             },
             "additionalProperties": False,
         },

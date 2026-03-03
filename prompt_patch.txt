@@ -1,44 +1,58 @@
 DETERMINISTIC PATCH MODE (multilingual, ASR-aware)
 
 Output exactly ONE JSON object (no markdown/prose) with EXACT keys:
-tokenization, ct_combine, ct_fix, ct_punct, ct_casing, verification, machine_transcription_probability.
+tokenization, machine_transcription_probability, ct_combine, no_touch_tokens, ct_lexical, ct_disfluency, ct_format, ct_numeral, ct_punct, ct_casing.
 
-Goal: complete one-pass fix with minimal edits.
+Goal: single-run patch using the ordered chain below, with minimal edits.
 Tie-breaks: fewest edits → fewest chars changed → fewest punctuation insertions → earliest position.
 
 Preprocessing (outside chain):
-Tokenization: tokenize ORIGINAL once. Whitespace is a separator (not a token). Longest-match precedence:
-URL/email → number-like → Latin word → same-script non-Latin chunk → CJK (Han/Kana per char, Hangul chunk) → punctuation/symbol.
-No normalization; tokens are exact ORIGINAL substrings.
+Tokenization: tokenize ORIGINAL once. No normalization; tokens are exact ORIGINAL substrings.
+Use hybrid segmentation in this order:
+1) Protected-span longest-match first: URL/email, number-like/currency/percent, dates/times, web handles/IDs.
+2) For whitespace-delimited scripts (e.g., Latin/Cyrillic/Arabic with spaces): whitespace-separated word tokens; keep punctuation/symbols as separate tokens.
+3) For non-whitespace-delimited scripts: Han/Kana per character; Hangul as chunked runs.
+4) Any remaining punctuation/symbols are standalone tokens.
+Whitespace is a separator, never a token.
 
-Allowed edits only: typos, spacing/formatting, duplicate/disfluency cleanup, minimal required grammar insertions, local grammar fixes, punctuation for run-ons/closing pairs.
-ASR grammar rule: lexical grammar fixes must preserve pronunciation similarity and meaning; if uncertain, keep the original token.
-For no-space languages, add words only when omission is unmistakable and the shortest fix.
-Formatting normalization (mandatory when seen):
-- Normalize spacing inside tightly bound symbolic/abbreviated expressions by removing unnecessary internal spaces.
-- Keep fixed compounds and numeric-marker forms compact when spacing changes meaning only in format (not content).
-- Keep lexicalized/proper-name compounds in standard compact form (do not split joined forms like brand/product names).
-- Treat organization/entity legal names as protected spans: do not change internal characters/words based only on phonetic plausibility.
-- For protected entity names, only allow format-only edits (spacing/punctuation/casing/script style); if lexical form is uncertain, keep ORIGINAL.
-- Normalize unambiguous spoken numeral expressions to canonical written numerals across languages when this is format-only (not a meaning rewrite), especially for years/dates, ordinals/cardinals, percentages, currency amounts, versions, and IDs.
-- For unambiguous spoken percentage expressions, convert to numeric percent form using `%`.
-- For year-like expressions with explicit year markers (language-specific), prefer digits when unambiguous.
-- If numeral intent is ambiguous, keep the original wording.
-
-Forbidden: rewrites/paraphrases/reordering/style/idiom edits, em dash, semantic-content deletion, unsupported lexical additions (hallucinations).
-- Forbidden: unsupported lexical substitution inside protected entity/legal-name spans.
-Capitalization only after inserted sentence-ending punctuation; capitalize new Latin sentence starts.
+Allowed edits only: typos, spacing/formatting, duplicate/disfluency cleanup, minimal local grammar fixes, punctuation for run-ons/closing pairs.
+Forbidden: rewrites/paraphrases/reordering/style/idiom edits, semantic-content deletion, unsupported lexical additions (hallucinations).
+Prefer to avoid em dash; use language-appropriate punctuation alternatives.
+Prefer not to perform lexical substitution inside protected entity/legal-name spans unless directly supported by explicit in-line evidence; otherwise keep the current step input unchanged.
 
 Chain order (apply in order):
+0) First estimate machine_transcription_probability from transcript quality signals (ASR-like disfluencies, punctuation sparsity, boundary ambiguity, token noise). Lock this value for the rest of the chain; do not change it later.
+    - <= 0.3: conservative mode (minimal punctuation and minimal fluency cleanup).
+    - > 0.3 and <= 0.8: balanced mode.
+    - > 0.8: aggressive mode for punctuation and fluency cleanup only.
+    - Regardless of mode: never paraphrase/rewrite, never violate Forbidden constraints.
 1) Combine separated token fragments for identifiers/products/proper-names/entities, numbers, thousands/decimal separators, currency/finance, dates/times, web/handles, multipliers, and other tightly bound expressions when the split is meaningless.
-2) Then fix lexical/format errors (typos, ASR substitutions, spacing/formatting of proper-names/products/entities, spoken-numeral normalization when unambiguous, mandatory percentage normalization when unambiguous, duplicates/disfluencies, and minimal required grammar) while preserving pronunciation similarity, meaning, and consistent formatting across similar entities. For protected entity/legal-name spans, do not perform lexical substitutions unless directly supported by explicit in-line evidence.
-3) Then fix punctuation/run-ons:
+2) Extract exact spans/tokens from the step 1 result for proper names and legal-entity names, and lock them as immutable protected tokens for all remaining steps.
+3) Then fix lexical errors only (typos and ASR lexical substitutions):
+    - Preserve pronunciation similarity and meaning; if uncertain, keep the original token.
+    - Do NOT edit any protected token/span extracted in step 2 (no character replacement, script-variant replacement, insertion, deletion, or reorder inside the protected span); for protected entity/legal-name spans, keep the current step input unchanged unless a correction is directly supported by explicit in-line evidence.
+4) Then fix fluency/grammar only (duplicates/disfluencies and minimal required grammar) while preserving meaning:
+    - For no-space languages, add words only when omission is unmistakable and the shortest fix.
+    - Do not apply numeral/format normalization or token recombination in this step.
+    - Apply aggressiveness from step 0 only to disfluency cleanup intensity.
+5) Then fix formatting only:
+    - Normalize only residual format-only spacing inside tightly bound symbolic/abbreviated expressions; do not recombine lexical tokens already handled by step 1.
+    - Keep fixed compounds and numeric-marker forms compact when spacing changes meaning only in format (not content).
+    - Keep lexicalized/proper-name compounds in standard compact form (do not split joined forms like brand/product names).
+    - Treat organization/entity legal names as protected spans: only format-only edits (spacing/punctuation/casing/script style) are allowed; if lexical form is uncertain, keep the current step input unchanged.
+6) Then fix numeral formatting/normalization only:
+    - Normalize unambiguous spoken numeral expressions to canonical written numerals across languages when this is format-only (not a meaning rewrite), especially for years/dates, ordinals/cardinals, percentages, currency amounts, versions, and IDs.
+    - Number formatting changes must preserve pronunciation/readout intent in the source language; if pronunciation would change or is uncertain, keep the original wording.
+    - For unambiguous spoken percentage expressions, convert to numeric percent form using `%`.
+    - For year-like expressions with explicit year markers (language-specific), prefer digits when unambiguous.
+    - If numeral intent is ambiguous, keep the original wording.
+7) Then fix punctuation/run-ons:
     - Use language-appropriate sentence-end marks; prefer neutral declarative punctuation.
-    - Evaluate machine_transcription_probability. If it is > 0.5, punctuation is encouraged at clear boundaries/clauses.
-    - An unpunctuated span may NOT exceed 24 tokens; a no-sentence-end span may NOT exceed 48 tokens.
-    - Enforce left-to-right: before exceeding 48 tokens, insert a sentence-end mark at the earliest clear boundary.
+    - Use machine_transcription_probability from step 0 to choose punctuation aggressiveness (conservative/balanced/aggressive), while still following textual boundaries/clauses.
+    - When punctuation is needed to prevent run-ons, decide left-to-right and insert sentence-ending punctuation at the earliest clear clause/sentence boundary; do not delay to later ambiguous points.
     - Do NOT change/add/remove punctuation at the end of the line.
-4) Then fix capitalization only:
+    - Do NOT insert punctuation adjacent to existing punctuation if it would create redundant/stacked marks.
+8) Then fix capitalization only:
     - Sentence-ending punctuation requires following sentence-start capitalization.
     - Sentence-start capitalization requires preceding sentence-ending punctuation.
     - Without a sentence boundary, do NOT introduce mid-sentence capitalization except for proper nouns/entities.
@@ -46,34 +60,29 @@ Chain order (apply in order):
     - Do NOT change the casing of the first token of the line.
 
 Output each text-edit stage explicitly in these required fields:
-- ct_combine = text after chain step 1 (combine separated token fragments)
-- ct_fix = text after chain step 2 (error-fixing stage)
-- ct_punct = text after chain step 3 (punctuation/run-on stage)
-- ct_casing = text after chain step 4 (casing stage)
+- ct_combine = {"edits": [[before, after], ...], "result": text after chain step 1}
+- no_touch_tokens = ["token/span1", "token/span2", ...] extracted in chain step 2 from step 1 result (exact substrings)
+- ct_lexical = {"edits": [[before, after], ...], "result": text after chain step 3}
+- ct_disfluency = {"edits": [[before, after], ...], "result": text after chain step 4}
+- ct_format = {"edits": [[before, after], ...], "result": text after chain step 5}
+- ct_numeral = {"edits": [[before, after], ...], "result": text after chain step 6}
+- ct_punct = {"edits": [[before, after], ...], "result": text after chain step 7}
+- ct_casing = {"edits": [[before, after], ...], "result": text after chain step 8}
+- For each step, use an empty list when no edits were made: {"edits": [], "result": <unchanged text>}.
 
-verification.op_details must begin with these 4 explicit entries (in order):
-- "TOKEN_COMBINE_RESULT: <brief summary of token-fragment combining edits>"
-- "ERROR_FIX_RESULT: <brief summary of lexical/format edits>"
-- "PUNCTUATION_RESULT: <brief summary of punctuation/run-on edits>"
-- "CASING_RESULT: <brief summary of capitalization edits>"
-After those, include normal edit details (e.g., "before → after").
-
-Do NOT change the casing of the first token of the line.
-Do NOT change/add/remove sentence-ending punctuation at the end of the line.
-Do NOT insert punctuation adjacent to existing punctuation if it would create redundant/stacked marks.
-
-Reject any candidate where any unpunctuated span exceeds 24 tokens or no-sentence-end span exceeds 48 tokens.
-
-Determinism checks: re-run yields no further required patch; no meaningful segment loss; no hallucinated lexical content; punctuation/capitalization/spacing are mutually consistent.
+Determinism target: prefer idempotent output on re-run, no meaningful segment loss, no hallucinated lexical content, and consistent punctuation/capitalization/spacing.
 
 Schema:
 - tokenization: {"tokens":[...ORIGINAL tokens from preprocessing...]}
-- ct_combine: string (result after chain step 1)
-- ct_fix: string (result after chain step 2)
-- ct_punct: string (result after chain step 3)
-- ct_casing: string (result after chain step 4)
-- verification: {"op_details": ["TOKEN_COMBINE_RESULT: ...", "ERROR_FIX_RESULT: ...", "PUNCTUATION_RESULT: ...", "CASING_RESULT: ...", "before → after", ...]}
 - machine_transcription_probability: number in [0,1]
+- ct_combine: {"edits": [[before, after], ...], "result": string}
+- no_touch_tokens: ["token/span1", "token/span2", ...]
+- ct_lexical: {"edits": [[before, after], ...], "result": string}
+- ct_disfluency: {"edits": [[before, after], ...], "result": string}
+- ct_format: {"edits": [[before, after], ...], "result": string}
+- ct_numeral: {"edits": [[before, after], ...], "result": string}
+- ct_punct: {"edits": [[before, after], ...], "result": string}
+- ct_casing: {"edits": [[before, after], ...], "result": string}
 - no additional keys
 
 Input transcript:
