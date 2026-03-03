@@ -1,10 +1,10 @@
 import asyncio
 import json
 import random
-import re
 
 from common import (
     build_repair_prompt_after_invalid_json,
+    extract_retry_after_seconds,
     extract_text_content,
     handle_invalid_repair_json_result,
     is_non_repairable_validation_error,
@@ -56,31 +56,6 @@ async def aoai_send_once(
     return extract_text_content(content).strip()
 
 
-def aoai_extract_retry_after_seconds(error: Exception) -> float | None:
-    response = getattr(error, "response", None)
-    headers = getattr(response, "headers", None)
-    if headers is not None:
-        retry_after_header = headers.get("retry-after") or headers.get("Retry-After")
-        if retry_after_header is not None:
-            try:
-                retry_after_seconds = float(str(retry_after_header).strip())
-                if retry_after_seconds > 0:
-                    return retry_after_seconds
-            except ValueError:
-                pass
-
-    message = str(error)
-    match = re.search(r"retry after\s+(\d+(?:\.\d+)?)\s+second", message, flags=re.IGNORECASE)
-    if not match:
-        return None
-
-    try:
-        retry_after_seconds = float(match.group(1))
-        return retry_after_seconds if retry_after_seconds > 0 else None
-    except ValueError:
-        return None
-
-
 def is_aoai_rate_limited_error(error: Exception) -> bool:
     status_code = getattr(error, "status_code", None)
     if status_code == 429:
@@ -121,7 +96,7 @@ async def aoai_send_with_timeout_retry(
         timeout_retries,
         processing_id,
         is_retryable_error=is_aoai_rate_limited_error,
-        resolve_backoff_seconds=lambda error, _attempt: aoai_extract_retry_after_seconds(error),
+        resolve_backoff_seconds=lambda error, _attempt: extract_retry_after_seconds(error),
     )
 
 
