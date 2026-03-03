@@ -1,7 +1,6 @@
 import csv
 import json
 import random
-import re
 from pathlib import Path
 from collections.abc import Callable
 from typing import Any
@@ -343,17 +342,6 @@ def build_failed_eval_payload(reason: str) -> dict:
     }
 
 
-def target_model_from_file(file_name: str) -> str:
-    lowered = Path(file_name).name.lower()
-    if "_aoai_run" in lowered or re.search(r"(^|[_\-.])aoai($|[_\-.])", lowered):
-        return "aoai"
-    if "_copilot_run" in lowered or re.search(r"(^|[_\-.])copilot($|[_\-.])", lowered):
-        return "copilot"
-    if "_gemini_run" in lowered or re.search(r"(^|[_\-.])gemini($|[_\-.])", lowered):
-        return "gemini"
-    return "unknown"
-
-
 def load_run_errors(path_value: str | None) -> dict[str, str]:
     if not path_value:
         return {}
@@ -378,11 +366,20 @@ def write_eval_outputs(
     output_dir = Path(f"{prefix}_results")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    results_path = output_dir / f"{prefix}_results_{evaluator_api}-{evaluator_model}.json"
-    results_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
-    rows: list[dict[str, object]] = []
+    evaluator = f"{evaluator_api}-{evaluator_model}"
+    normalized_report: list[dict] = []
     for item in report:
+        if not isinstance(item, dict):
+            continue
+        normalized_item = dict(item)
+        normalized_item["evaluator"] = evaluator
+        normalized_item.pop("evaluator_model", None)
+        normalized_report.append(normalized_item)
+
+    results_path = output_dir / f"{prefix}_results_{evaluator_api}-{evaluator_model}.json"
+    results_path.write_text(json.dumps(normalized_report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    rows: list[dict[str, object]] = []
+    for item in normalized_report:
         line_results = item.get("line_results", [])
         total_lines = len(line_results)
         passed_lines = sum(1 for line_result in line_results if line_result.get("pass") is True)
@@ -391,9 +388,9 @@ def write_eval_outputs(
 
         rows.append(
             {
-                "evaluator_api": evaluator_api,
-                "evaluator_model": evaluator_model,
-                "file": item.get("file", ""),
+                "evaluator": evaluator,
+                "patch_model": item.get("patch_model", "unknown"),
+                "result_file": item.get("result_file", item.get("file", "")),
                 "line_count": total_lines,
                 "passed_lines": passed_lines,
                 "failed_lines": failed_lines,
@@ -405,29 +402,27 @@ def write_eval_outputs(
     with scores_path.open("w", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(
             file,
-            fieldnames=["evaluator_api", "evaluator_model", "file", "line_count", "passed_lines", "failed_lines", "pass_rate_percent"],
+            fieldnames=["evaluator", "patch_model", "result_file", "line_count", "passed_lines", "failed_lines", "pass_rate_percent"],
         )
         writer.writeheader()
         writer.writerows(rows)
 
     aggregate: dict[str, dict[str, float]] = {}
     for row in rows:
-        file_name = str(row["file"])
-        target_model = target_model_from_file(file_name)
-        aggregate.setdefault(target_model, {"n": 0, "score": 0.0, "failed": 0.0, "lines": 0.0})
-        aggregate[target_model]["n"] += 1
-        aggregate[target_model]["score"] += float(row["pass_rate_percent"])
-        aggregate[target_model]["failed"] += float(row["failed_lines"])
-        aggregate[target_model]["lines"] += float(row["line_count"])
+        patch_model = str(row.get("patch_model", "unknown"))
+        aggregate.setdefault(patch_model, {"n": 0, "score": 0.0, "failed": 0.0, "lines": 0.0})
+        aggregate[patch_model]["n"] += 1
+        aggregate[patch_model]["score"] += float(row["pass_rate_percent"])
+        aggregate[patch_model]["failed"] += float(row["failed_lines"])
+        aggregate[patch_model]["lines"] += float(row["line_count"])
 
     summary_rows: list[dict[str, object]] = []
-    for target_model, stats in aggregate.items():
+    for patch_model, stats in aggregate.items():
         overall_pass = round((1.0 - (stats["failed"] / stats["lines"])) * 100.0, 2) if stats["lines"] > 0 else 0.0
         summary_rows.append(
             {
-                "evaluator_api": evaluator_api,
-                "evaluator_model": evaluator_model,
-                "target_model": target_model,
+                "evaluator": evaluator,
+                "patch_model": patch_model,
                 "runs": int(stats["n"]),
                 "avg_file_pass_rate_percent": round(stats["score"] / stats["n"], 2),
                 "overall_line_pass_rate_percent": overall_pass,
@@ -438,9 +433,9 @@ def write_eval_outputs(
     with summary_path.open("w", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(
             file,
-            fieldnames=["evaluator_api", "evaluator_model", "target_model", "runs", "avg_file_pass_rate_percent", "overall_line_pass_rate_percent"],
+            fieldnames=["evaluator", "patch_model", "runs", "avg_file_pass_rate_percent", "overall_line_pass_rate_percent"],
         )
         writer.writeheader()
-        writer.writerows(sorted(summary_rows, key=lambda row: row["target_model"]))
+        writer.writerows(sorted(summary_rows, key=lambda row: row["patch_model"]))
 
     return results_path, scores_path, summary_path

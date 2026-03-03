@@ -18,7 +18,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Prompt-evaluate outputs with Copilot API evaluator model")
     parser.add_argument("--orginal-trans-file", default="sample_multi_input.txt")
     parser.add_argument("--patch-result-file", required=True)
-    parser.add_argument("--output-file")
+    parser.add_argument("--prefix", default="eval")
     parser.add_argument("--prompt-file", default="prompt_eval.txt")
     parser.add_argument("--model", default="gpt-5.2")
     parser.add_argument("--timeout", type=float, default=120.0)
@@ -52,28 +52,10 @@ async def main_async() -> None:
     if not patch_result_files:
         raise ValueError("Missing patch result file(s). Provide --patch-result-file.")
 
-    first_name = Path(patch_result_files[0]).name
-    prefix = "eval"
-    for marker in ("_aoai_run", "_copilot_run", "_gemini_run"):
-        if marker in first_name:
-            prefix = first_name.split(marker, 1)[0]
-            break
-    if prefix == "eval" and first_name.startswith("run"):
-        for model in ("aoai", "copilot", "gemini"):
-            model_marker = f"_{model}"
-            if model_marker in first_name:
-                left = first_name.split(model_marker, 1)[0]
-                if "_" in left:
-                    prefix = left.split("_", 1)[1]
-                break
+    prefix = Path(str(args.prefix)).stem or "eval"
 
     run_errors_path = Path(f"{prefix}_results") / f"{prefix}_run_errors.json"
     error_descriptions = load_run_errors(str(run_errors_path))
-    files = patch_result_files
-    evaluator_name = args.model
-    output_prefix = Path(str(args.output_file)).stem if args.output_file else prefix
-    if not output_prefix:
-        output_prefix = prefix
 
     print(f"Using model: {args.model}")
     print(f"Using eval prompt file: {prompt_file}")
@@ -87,7 +69,7 @@ async def main_async() -> None:
     client = CopilotClient()
     await client.start()
     try:
-        for file_name in files:
+        for file_name in patch_result_files:
             path = Path(file_name)
             if not path.exists():
                 reason = "Missing output file"
@@ -96,9 +78,9 @@ async def main_async() -> None:
                     reason = f"Missing output file. Last JSON format error: {json_error}"
                 report.append(
                     {
-                        "evaluator": evaluator_name,
+                        "evaluator": args.model,
                         "evaluator_model": args.model,
-                        "file": file_name,
+                        "result_file": file_name,
                         "missing": True,
                         "line_results": [
                             {
@@ -165,9 +147,9 @@ async def main_async() -> None:
 
             report.append(
                 {
-                    "evaluator": evaluator_name,
+                    "evaluator": args.model,
                     "evaluator_model": args.model,
-                    "file": file_name,
+                    "result_file": file_name,
                     "missing": False,
                     "line_results": line_results,
                 }
@@ -176,7 +158,7 @@ async def main_async() -> None:
         await client.stop()
 
     results_path, scores_path, summary_path = write_eval_outputs(
-        output_prefix,
+        prefix,
         "copilot",
         args.model,
         report,

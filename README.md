@@ -111,6 +111,7 @@ Use the unified retry flag across all evaluated models:
 ./eval_e2e.ps1 -HelpOnly
 ./eval_e2e.ps1 --empty-result-retries 2
 ./eval_e2e.ps1 --empty-result-retries 2 --timeout 600 --timeout-retries 2
+./eval_e2e.ps1 --skip-existing-results
 ```
 
 `eval_e2e.ps1` uses `AZURE_OPENAI_API_KEY` automatically when `-ApiKey` is not provided.

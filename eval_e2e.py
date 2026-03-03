@@ -2,8 +2,11 @@ import argparse
 import json
 import re
 import subprocess
+import sys
 import time
 from pathlib import Path
+
+from common_eval import write_eval_outputs
 
 
 
@@ -18,6 +21,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=int, default=600)
     parser.add_argument("--timeout-retries", type=int, default=2)
     parser.add_argument("--empty-result-retries", type=int, default=2)
+    parser.add_argument("--skip-existing-results", action="store_true")
     parser.add_argument("--copilot-model", default="gpt-5.2")
     parser.add_argument("--gemini-model", default="gemini-3-pro-preview")
     parser.add_argument("--prompt-file", default="prompt_eval.txt")
@@ -106,6 +110,7 @@ def run_model(
     timeout_retries: int,
     empty_result_retries: int,
     expected_lines: int,
+    skip_existing_results: bool,
     extra_args: list[str] | None = None,
 ) -> dict[str, str]:
 
@@ -113,29 +118,40 @@ def run_model(
     logs_dir = Path(f"{prefix}_results")
 
     for run_index in range(1, runs + 1):
+        out_txt = logs_dir / f"run{run_index}_{model}.txt"
+        out_json = logs_dir / f"run{run_index}_{model}.json"
+
+        if skip_existing_results and out_txt.exists() and out_json.exists():
+            lines = out_txt.read_text(encoding="utf-8").splitlines()
+            non_empty = sum(1 for line in lines if line.strip())
+            if len(lines) >= expected_lines and non_empty >= expected_lines:
+                print(
+                    f"{model.upper()} run {run_index} existing result detected; "
+                    "skipping run_model execution"
+                )
+                continue
+
         ok = False
         last_json_error = ""
         for attempt_index in range(1, attempts + 1):
-            out_txt = logs_dir / f"run{run_index}_{model}.txt"
-            out_json = logs_dir / f"run{run_index}_{model}.json"
             print(f"{model.upper()} run {run_index} attempt {attempt_index}")
 
             command = [
-                "pwsh",
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
+                sys.executable,
                 str(script_path),
-                "-Timeout",
-                str(timeout),
-                "-TimeoutRetries",
-                str(timeout_retries),
-                "-InputFile",
+                "--input-file",
                 str(input_file),
-                "-OutputFile",
+                "--output-file",
                 str(out_json),
-                "-EmptyResultRetries",
+                "--patch-prompt-file",
+                "prompt_patch.txt",
+                "--repair-prompt-file",
+                "prompt_repair.txt",
+                "--timeout",
+                str(timeout),
+                "--timeout-retries",
+                str(timeout_retries),
+                "--empty-result-retries",
                 str(empty_result_retries),
             ]
             if extra_args:
@@ -183,28 +199,56 @@ def run_model(
 
 
 def run_eval(
-    script_name: str,
+    script_path: Path,
     script_args: list[str],
     prefix: str,
     log_name: str | None = None,
 ) -> None:
     command = [
-        "pwsh",
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-File",
-        script_name,
+        sys.executable,
+        str(script_path),
         *script_args,
     ]
     logs_dir = Path(f"{prefix}_results")
-    log_filename = log_name or f"{Path(script_name).stem}.log"
+    log_filename = log_name or f"{script_path.stem}.log"
     log_path = logs_dir / log_filename
     exit_code, _output, runtime_seconds = run_command(command, log_path)
-    print(f"EVAL script {script_name} log: {log_path}")
-    print(f"EVAL script {script_name} summary: exit={exit_code}, runtime={runtime_seconds:.2f}s")
+    print(f"EVAL script {script_path} log: {log_path}")
+    print(f"EVAL script {script_path} summary: exit={exit_code}, runtime={runtime_seconds:.2f}s")
     if exit_code != 0:
-        raise RuntimeError(f"Evaluation script failed: {script_name}. See {log_path}")
+        raise RuntimeError(f"Evaluation script failed: {script_path}. See {log_path}")
+
+
+def apply_patch_model_to_eval_outputs(
+    prefix: str,
+    evaluator_api: str,
+    evaluator_model: str,
+    patch_model_by_file: dict[str, str],
+) -> None:
+    output_dir = Path(f"{prefix}_results")
+    results_path = output_dir / f"{prefix}_results_{evaluator_api}-{evaluator_model}.json"
+    if not results_path.exists():
+        return
+
+    payload = json.loads(results_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, list):
+        return
+
+    normalized_report: list[dict] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        file_name = str(item.get("result_file", item.get("file", "")))
+        patch_model = patch_model_by_file.get(file_name)
+        if not patch_model and file_name:
+            patch_model = patch_model_by_file.get(Path(file_name).name)
+        normalized_item = dict(item)
+        if "result_file" not in normalized_item and file_name:
+            normalized_item["result_file"] = file_name
+        normalized_item["patch_model"] = patch_model or "unknown"
+        normalized_report.append(normalized_item)
+
+    write_eval_outputs(prefix, evaluator_api, evaluator_model, normalized_report)
 
 
 def main() -> None:
@@ -218,7 +262,7 @@ def main() -> None:
 
     aoai_errors = run_model(
         model=f"aoai-{args.aoai_deployment}",
-        script_path=Path("run-aoai.ps1"),
+        script_path=Path("run_aoai.py"),
         input_file=input_file,
         prefix=args.prefix,
         runs=args.runs,
@@ -227,11 +271,17 @@ def main() -> None:
         timeout_retries=args.timeout_retries,
         empty_result_retries=args.empty_result_retries,
         expected_lines=expected_lines,
+        skip_existing_results=args.skip_existing_results,
+        extra_args=[
+            "--deployment", args.aoai_deployment,
+            "--endpoint", args.aoai_endpoint,
+            "--api-version", args.aoai_api_version,
+        ],
     )
 
     copilot_errors = run_model(
         model=f"copilot-{args.copilot_model}",
-        script_path=Path("run-copilot.ps1"),
+        script_path=Path("run_copilot.py"),
         input_file=input_file,
         prefix=args.prefix,
         runs=args.runs,
@@ -240,12 +290,13 @@ def main() -> None:
         timeout_retries=args.timeout_retries,
         empty_result_retries=args.empty_result_retries,
         expected_lines=expected_lines,
-        extra_args=["-Model", args.copilot_model],
+        skip_existing_results=args.skip_existing_results,
+        extra_args=["--model", args.copilot_model],
     )
 
     gemini_errors = run_model(
-        model=f"gemini-{args.gemini_model}",
-        script_path=Path("run-copilot.ps1"),
+        model=f"copilot-{args.gemini_model}",
+        script_path=Path("run_copilot.py"),
         input_file=input_file,
         prefix=args.prefix,
         runs=args.runs,
@@ -254,7 +305,8 @@ def main() -> None:
         timeout_retries=args.timeout_retries,
         empty_result_retries=args.empty_result_retries,
         expected_lines=expected_lines,
-        extra_args=["-Model", args.gemini_model],
+        skip_existing_results=args.skip_existing_results,
+        extra_args=["--model", args.gemini_model],
     )
 
     all_errors = {}
@@ -272,74 +324,106 @@ def main() -> None:
         f"copilot-{args.copilot_model}",
         f"copilot-{args.gemini_model}",
     ]
+    generated_patch_models = ["aoai", "copilot", "copilot"]
     patch_result_files: list[str] = []
-    for model_name in generated_output_models:
+    patch_models: list[str] = []
+    for model_name, patch_model in zip(generated_output_models, generated_patch_models):
         patch_result_files.extend(
             [
                 str(patch_result_dir / f"run{i}_{model_name}.txt")
                 for i in range(1, args.runs + 1)
             ]
         )
+        patch_models.extend([patch_model] * args.runs)
     patch_result_file_value = ",".join(patch_result_files)
+    eval_output_prefix = Path(str(args.prefix)).stem or args.prefix
+    patch_model_by_file: dict[str, str] = {
+        file_name: patch_model
+        for file_name, patch_model in zip(patch_result_files, patch_models)
+    }
+    patch_model_by_file.update(
+        {
+            Path(file_name).name: patch_model
+            for file_name, patch_model in zip(patch_result_files, patch_models)
+        }
+    )
 
     common_eval_args = [
-        "-OrginalTransFile", str(input_file),
-        "-OutputFile", args.prefix,
-        "-PatchResultFile", patch_result_file_value,
-        "-PromptFile", args.prompt_file,
+        "--orginal-trans-file", str(input_file),
+        "--prefix", eval_output_prefix,
+        "--patch-result-file", patch_result_file_value,
+        "--prompt-file", args.prompt_file,
     ]
 
     aoai_eval_args = [
         *common_eval_args,
-        "-RepairPromptFile", args.eval_repair_prompt_file,
-        "-Deployment", args.aoai_deployment,
-        "-Endpoint", args.aoai_endpoint,
-        "-ApiVersion", args.aoai_api_version,
-        "-Timeout", str(args.eval_timeout),
-        "-TimeoutRetries", str(args.eval_timeout_retries),
-        "-EmptyResultRetries", str(args.eval_empty_result_retries),
-        "-Temperature", str(args.eval_temperature),
-        "-TopP", str(args.eval_top_p),
-        "-RetryTemperatureJitter", str(args.eval_retry_temperature_jitter),
-        "-RetryTopPJitter", str(args.eval_retry_top_p_jitter),
-        "-Concurrency", str(max(1, args.eval_concurrency)),
+        "--repair-prompt-file", args.eval_repair_prompt_file,
+        "--deployment", args.aoai_deployment,
+        "--endpoint", args.aoai_endpoint,
+        "--api-version", args.aoai_api_version,
+        "--timeout", str(args.eval_timeout),
+        "--timeout-retries", str(args.eval_timeout_retries),
+        "--empty-result-retries", str(args.eval_empty_result_retries),
+        "--temperature", str(args.eval_temperature),
+        "--top-p", str(args.eval_top_p),
+        "--retry-temperature-jitter", str(args.eval_retry_temperature_jitter),
+        "--retry-top-p-jitter", str(args.eval_retry_top_p_jitter),
+        "--concurrency", str(max(1, args.eval_concurrency)),
     ]
 
     run_eval(
-        "eval-aoai.ps1",
+        Path("eval_aoai.py"),
         aoai_eval_args,
         args.prefix,
         log_name=f"eval-aoai-{args.aoai_deployment}.log",
     )
+    apply_patch_model_to_eval_outputs(
+        eval_output_prefix,
+        "aoai",
+        args.aoai_deployment,
+        patch_model_by_file,
+    )
 
     run_eval(
-        "eval-copilot.ps1",
+        Path("eval_copilot.py"),
         [
             *common_eval_args,
-            "-Model", args.copilot_model,
-            "-Timeout", str(args.eval_timeout),
-            "-TimeoutRetries", str(args.eval_timeout_retries),
-            "-EmptyResultRetries", str(args.eval_empty_result_retries),
-            "-ModelMismatchRetries", str(args.eval_model_mismatch_retries),
-            "-Concurrency", str(max(1, args.eval_concurrency)),
+            "--model", args.copilot_model,
+            "--timeout", str(args.eval_timeout),
+            "--timeout-retries", str(args.eval_timeout_retries),
+            "--empty-result-retries", str(args.eval_empty_result_retries),
+            "--model-mismatch-retries", str(args.eval_model_mismatch_retries),
+            "--concurrency", str(max(1, args.eval_concurrency)),
         ],
         args.prefix,
         log_name=f"eval-copilot-{args.copilot_model}.log",
     )
+    apply_patch_model_to_eval_outputs(
+        eval_output_prefix,
+        "copilot",
+        args.copilot_model,
+        patch_model_by_file,
+    )
 
     run_eval(
-        "eval-copilot.ps1",
+        Path("eval_copilot.py"),
         [
             *common_eval_args,
-            "-Model", args.gemini_model,
-            "-Timeout", str(args.eval_timeout),
-            "-TimeoutRetries", str(args.eval_timeout_retries),
-            "-EmptyResultRetries", str(args.eval_empty_result_retries),
-            "-ModelMismatchRetries", str(args.eval_model_mismatch_retries),
-            "-Concurrency", str(max(1, args.eval_concurrency)),
+            "--model", args.gemini_model,
+            "--timeout", str(args.eval_timeout),
+            "--timeout-retries", str(args.eval_timeout_retries),
+            "--empty-result-retries", str(args.eval_empty_result_retries),
+            "--model-mismatch-retries", str(args.eval_model_mismatch_retries),
+            "--concurrency", str(max(1, args.eval_concurrency)),
         ],
         args.prefix,
         log_name=f"eval-copilot-{args.gemini_model}.log",
+    )
+    apply_patch_model_to_eval_outputs(
+        eval_output_prefix,
+        "copilot",
+        args.gemini_model,
+        patch_model_by_file,
     )
 
     elapsed_seconds = time.perf_counter() - start_time
