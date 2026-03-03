@@ -25,8 +25,5 @@ Repair rules:
 Validation error:
 {validation_error}
 
-Target schema:
-{target_schema}
-
 Previous output:
 {previous_output}
