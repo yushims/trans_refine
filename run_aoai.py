@@ -5,9 +5,11 @@ from openai import AzureOpenAI
 from common import (
     assign_payload_or_emit_empty,
     build_patch_prompt,
+    build_patch_response_format_schema,
     build_empty_payload,
     collect_transcriptions_from_input,
     finalize_payloads_and_write,
+    is_input_comment_line,
     load_patch_and_repair_templates,
     print_common_runtime_settings,
     resolve_patch_and_repair_template_paths,
@@ -15,164 +17,7 @@ from common import (
 )
 from common_aoai import get_patch_payload_with_repair
 
-
-PATCH_SCHEMA = {
-    "name": "deterministic_patch_output",
-    "strict": True,
-    "schema": {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "tokenization": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "tokens": {"type": "array", "items": {"type": "string"}}
-                },
-                "required": ["tokens"]
-            },
-            "aggressiveness_level": {
-                "type": "string",
-                "enum": ["low", "medium", "high"]
-            },
-            "ct_combine": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "edits": {
-                        "type": "array",
-                        "items": {
-                            "type": "array",
-                            "minItems": 2,
-                            "maxItems": 2,
-                            "items": {"type": "string"},
-                        },
-                    },
-                    "result": {"type": "string"},
-                },
-                "required": ["edits", "result"],
-            },
-            "no_touch_tokens": {
-                "type": "array",
-                "items": {"type": "string"},
-            },
-            "ct_lexical": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "edits": {
-                        "type": "array",
-                        "items": {
-                            "type": "array",
-                            "minItems": 2,
-                            "maxItems": 2,
-                            "items": {"type": "string"},
-                        },
-                    },
-                    "result": {"type": "string"},
-                },
-                "required": ["edits", "result"],
-            },
-            "ct_disfluency": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "edits": {
-                        "type": "array",
-                        "items": {
-                            "type": "array",
-                            "minItems": 2,
-                            "maxItems": 2,
-                            "items": {"type": "string"},
-                        },
-                    },
-                    "result": {"type": "string"},
-                },
-                "required": ["edits", "result"],
-            },
-            "ct_format": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "edits": {
-                        "type": "array",
-                        "items": {
-                            "type": "array",
-                            "minItems": 2,
-                            "maxItems": 2,
-                            "items": {"type": "string"},
-                        },
-                    },
-                    "result": {"type": "string"},
-                },
-                "required": ["edits", "result"],
-            },
-            "ct_numeral": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "edits": {
-                        "type": "array",
-                        "items": {
-                            "type": "array",
-                            "minItems": 2,
-                            "maxItems": 2,
-                            "items": {"type": "string"},
-                        },
-                    },
-                    "result": {"type": "string"},
-                },
-                "required": ["edits", "result"],
-            },
-            "ct_punct": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "edits": {
-                        "type": "array",
-                        "items": {
-                            "type": "array",
-                            "minItems": 2,
-                            "maxItems": 2,
-                            "items": {"type": "string"},
-                        },
-                    },
-                    "result": {"type": "string"},
-                },
-                "required": ["edits", "result"],
-            },
-            "ct_casing": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "edits": {
-                        "type": "array",
-                        "items": {
-                            "type": "array",
-                            "minItems": 2,
-                            "maxItems": 2,
-                            "items": {"type": "string"},
-                        },
-                    },
-                    "result": {"type": "string"},
-                },
-                "required": ["edits", "result"],
-            }
-        },
-        "required": [
-            "tokenization",
-            "aggressiveness_level",
-            "ct_combine",
-            "no_touch_tokens",
-            "ct_lexical",
-            "ct_disfluency",
-            "ct_format",
-            "ct_numeral",
-            "ct_punct",
-            "ct_casing"
-        ]
-    }
-}
+PATCH_SCHEMA = build_patch_response_format_schema()
 
 
 def parse_args() -> argparse.Namespace:
@@ -196,42 +41,9 @@ def parse_args() -> argparse.Namespace:
         "--chain-steps",
         dest="chain_steps",
         action="append",
-        help="Repeatable active-chain selector (ids 0-8 or step names like COMBINE, NO_TOUCH).",
+        help="Repeatable active-chain selector (ids 1-8 or step names like COMBINE, NO_TOUCH).",
     )
     return parser.parse_args()
-
-
-async def get_payload_with_repair(
-    client: AzureOpenAI,
-    deployment: str,
-    prompt: str,
-    transcription: str,
-    processing_id: str,
-    repair_prompt_template: str,
-    temperature: float,
-    top_p: float,
-    timeout_seconds: float,
-    timeout_retries: int,
-    empty_result_retries: int,
-    retry_temperature_jitter: float,
-    retry_top_p_jitter: float,
-):
-    return await get_patch_payload_with_repair(
-        client=client,
-        deployment=deployment,
-        prompt=prompt,
-        transcription=transcription,
-        processing_id=processing_id,
-        repair_prompt_template=repair_prompt_template,
-        patch_schema=PATCH_SCHEMA,
-        timeout_seconds=timeout_seconds,
-        timeout_retries=timeout_retries,
-        empty_result_retries=empty_result_retries,
-        temperature=temperature,
-        top_p=top_p,
-        retry_temperature_jitter=retry_temperature_jitter,
-        retry_top_p_jitter=retry_top_p_jitter,
-    )
 
 
 async def main() -> None:
@@ -298,10 +110,15 @@ async def main() -> None:
     )
 
     payloads: list[dict | None] = [None] * len(transcriptions)
+    text_output_lines: list[str] = [""] * len(transcriptions)
 
     async def process_item(index: int, transcription: str, total: int) -> None:
         slot = index - 1
         processing_id = f"{index}/{total}"
+        if is_input_comment_line(transcription):
+            text_output_lines[slot] = transcription
+            return
+
         if not transcription.strip():
             payloads[slot] = build_empty_payload()
             print(
@@ -316,25 +133,31 @@ async def main() -> None:
             chain_steps,
         )
         try:
-            payload = await get_payload_with_repair(
-                client,
-                deployment,
-                prompt,
-                transcription,
-                processing_id,
-                repair_prompt_template,
-                temperature,
-                top_p,
-                timeout_seconds,
-                timeout_retries,
-                empty_result_retries,
-                retry_temperature_jitter,
-                retry_top_p_jitter,
+            payload = await get_patch_payload_with_repair(
+                client=client,
+                deployment=deployment,
+                prompt=prompt,
+                transcription=transcription,
+                processing_id=processing_id,
+                repair_prompt_template=repair_prompt_template,
+                patch_schema=PATCH_SCHEMA,
+                timeout_seconds=timeout_seconds,
+                timeout_retries=timeout_retries,
+                empty_result_retries=empty_result_retries,
+                temperature=temperature,
+                top_p=top_p,
+                retry_temperature_jitter=retry_temperature_jitter,
+                retry_top_p_jitter=retry_top_p_jitter,
             )
 
             assign_payload_or_emit_empty(payload, payloads, slot, index, total)
+            resolved_payload = payloads[slot]
+            if isinstance(resolved_payload, dict):
+                corrected_text = resolved_payload.get("corrected_text")
+                text_output_lines[slot] = corrected_text if isinstance(corrected_text, str) else ""
         except asyncio.CancelledError:
             payloads[slot] = build_empty_payload()
+            text_output_lines[slot] = ""
             print(
                 f"Cancelled while processing transcription {index}/{total}; "
                 "emitting empty payload."
@@ -342,6 +165,7 @@ async def main() -> None:
             return
         except Exception as error:
             payloads[slot] = build_empty_payload()
+            text_output_lines[slot] = ""
             print(
                 f"Unexpected error on transcription {index}/{total}: {error}; "
                 "emitting empty payload."
@@ -350,7 +174,7 @@ async def main() -> None:
 
     await run_transcriptions_with_concurrency(transcriptions, concurrency, process_item)
 
-    if not finalize_payloads_and_write(payloads, output_file_value):
+    if not finalize_payloads_and_write(payloads, output_file_value, text_output_lines):
         return
 
 
