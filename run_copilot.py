@@ -5,6 +5,7 @@ from typing import Any
 from copilot import CopilotClient  # pyright: ignore[reportMissingImports]
 from common import (
     assign_payload_or_emit_empty,
+    build_patch_prompt,
     build_empty_payload,
     collect_transcriptions_from_input,
     finalize_payloads_and_write,
@@ -34,6 +35,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-mismatch-retries", dest="model_mismatch_retries", type=int, default=2)
     parser.add_argument("--list-models-only", dest="list_models_only", action="store_true")
     parser.add_argument("--print-models", dest="print_models", action="store_true")
+    parser.add_argument(
+        "--chain-steps",
+        dest="chain_steps",
+        action="append",
+        help="Repeatable active-chain selector (ids 0-8 or step names like COMBINE, NO_TOUCH).",
+    )
     return parser.parse_args()
 
 
@@ -47,10 +54,9 @@ async def main():
     if args.list_models_only:
         transcriptions = []
     else:
-        loaded_transcriptions = collect_transcriptions_from_input(input_file_value)
-        if loaded_transcriptions is None:
+        transcriptions = collect_transcriptions_from_input(input_file_value)
+        if transcriptions is None:
             return
-        transcriptions = loaded_transcriptions
 
     model = args.model
     configured_concurrency = args.concurrency
@@ -60,6 +66,7 @@ async def main():
     timeout_retries = max(0, args.timeout_retries)
     empty_result_retries = max(0, args.empty_result_retries)
     model_mismatch_retries = max(0, args.model_mismatch_retries)
+    chain_steps = [step for step in (args.chain_steps or []) if isinstance(step, str) and step.strip()]
 
     prompt_template_path, repair_prompt_template_path, template_error = resolve_patch_and_repair_template_paths(
         args.patch_prompt_file,
@@ -72,6 +79,8 @@ async def main():
         return
 
     print(f"Using model: {model}")
+    if chain_steps:
+        print(f"Chain step selector count: {len(chain_steps)}")
     print_common_runtime_settings(
         prompt_template_path,
         repair_prompt_template_path,
@@ -113,7 +122,11 @@ async def main():
                 )
                 return
 
-            prompt = prompt_template + transcription
+            prompt = build_patch_prompt(
+                prompt_template,
+                transcription,
+                chain_steps,
+            )
             try:
                 session_parameters = build_copilot_session_parameters(model)
 

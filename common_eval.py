@@ -141,27 +141,6 @@ async def get_copilot_eval_payload_with_retries(
     return build_failed_eval_payload("Prompt-eval failure: exhausted retries")
 
 
-async def get_copilot_eval_payload_with_repair_on_session(
-    client: Any,
-    model_name: str,
-    prompt: str,
-    processing_id: str,
-    timeout_seconds: float,
-    timeout_retries: int,
-    empty_result_retries: int,
-) -> dict:
-    return await get_copilot_eval_payload_with_retries(
-        client=client,
-        model_name=model_name,
-        prompt=prompt,
-        processing_id=processing_id,
-        timeout_seconds=timeout_seconds,
-        timeout_retries=timeout_retries,
-        empty_result_retries=empty_result_retries,
-        model_mismatch_retries=0,
-    )
-
-
 async def get_copilot_eval_payload_with_repair(
     client: Any,
     model_name: str,

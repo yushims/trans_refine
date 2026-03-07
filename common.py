@@ -1,30 +1,111 @@
 import asyncio
+import ast
 import difflib
 import json
 import math
-import random
 import re
 import unicodedata
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 
-_REQUIRED_TOP_LEVEL_KEYS = {
-    "tokenization",
-    "machine_transcription_probability",
+_STEP_CHAIN_KEYS = (
     "ct_combine",
-    "no_touch_tokens",
     "ct_lexical",
     "ct_disfluency",
     "ct_format",
     "ct_numeral",
     "ct_punct",
     "ct_casing",
-}
+)
+
+_REQUIRED_TOP_LEVEL_KEY_ORDER = (
+    "tokenization",
+    "translation",
+    "aggressiveness_level",
+    "ct_combine",
+    "no_touch_tokens",
+    *(step_key for step_key in _STEP_CHAIN_KEYS if step_key != "ct_combine"),
+)
+
+_REQUIRED_TOP_LEVEL_KEYS = set(_REQUIRED_TOP_LEVEL_KEY_ORDER)
 
 _OPTIONAL_TOP_LEVEL_KEYS = {
     "corrected_text",
 }
+
+
+def _new_empty_step_payload() -> dict:
+    return {"edits": [], "result": ""}
+
+
+def _step_field_schema() -> dict:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "edits": {
+                "type": "array",
+                "items": {
+                    "type": "array",
+                    "minItems": 2,
+                    "maxItems": 2,
+                    "items": {"type": "string"},
+                },
+            },
+            "result": {"type": "string"},
+        },
+        "required": ["edits", "result"],
+    }
+
+
+def build_patch_payload_schema() -> dict:
+    properties: dict[str, dict] = {
+        "tokenization": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "tokens": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+            },
+            "required": ["tokens"],
+        },
+        "translation": {
+            "type": "string",
+        },
+        "aggressiveness_level": {
+            "type": "string",
+            "enum": ["low", "medium", "high"],
+        },
+    }
+
+    # Keep field order stable for readability/debugging: ct_combine, no_touch_tokens, then remaining steps.
+    properties["ct_combine"] = _step_field_schema()
+    properties["no_touch_tokens"] = {
+        "type": "array",
+        "items": {"type": "string"},
+    }
+    for step_key in _STEP_CHAIN_KEYS:
+        if step_key == "ct_combine":
+            continue
+        properties[step_key] = _step_field_schema()
+
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": properties,
+        "required": list(_REQUIRED_TOP_LEVEL_KEY_ORDER),
+    }
+
+
+def build_patch_response_format_schema() -> dict:
+    return {
+        "name": "deterministic_patch_output",
+        "strict": True,
+        "schema": build_patch_payload_schema(),
+    }
 
 
 _ALLOWED_INSERTION_FUNCTION_WORDS = {
@@ -41,14 +122,26 @@ _URL_EMAIL_PATTERN = re.compile(
 )
 _COMBINING_MARK_RANGES = "\u0300-\u036f\u1ab0-\u1aff\u1dc0-\u1dff\u20d0-\u20ff\ufe20-\ufe2f"
 _WORD_SEGMENT_PATTERN = rf"[^\W\d_](?:[^\W\d_]|[{_COMBINING_MARK_RANGES}])*"
+# Common in-word connectors across multilingual text:
+# apostrophe variants, dot, middle dots, and dash variants.
+_WORD_CONNECTOR_CHARS = "'’`.·・ʻʼ‐‑‒–—―-"
+_WORD_CONNECTOR_CHAR_CLASS = re.escape(_WORD_CONNECTOR_CHARS)
+_WORD_CONNECTOR_SET = set(_WORD_CONNECTOR_CHARS)
 _NUMBER_LIKE_PATTERN = re.compile(
     rf"\d+(?:[.,:٫٬]\d+)*(?:%|{_WORD_SEGMENT_PATTERN})?",
     flags=re.UNICODE,
 )
 _LATIN_WORD_PATTERN = re.compile(
-    rf"{_WORD_SEGMENT_PATTERN}(?:['’`.-]{_WORD_SEGMENT_PATTERN})*",
+    rf"{_WORD_SEGMENT_PATTERN}(?:[{_WORD_CONNECTOR_CHAR_CLASS}]{_WORD_SEGMENT_PATTERN})*",
     flags=re.UNICODE,
 )
+
+
+def _is_inner_word_connector(char: str) -> bool:
+    if not isinstance(char, str) or len(char) != 1:
+        return False
+    # Include explicit connector set plus all Unicode dash punctuation.
+    return char in _WORD_CONNECTOR_SET or unicodedata.category(char) == "Pd"
 
 
 def extract_text_content(content: object) -> str:
@@ -202,7 +295,6 @@ def should_retry_after_failure(
 
 def resolve_payload_or_retry_on_empty_corrected_text(
     payload: dict | None,
-    transcription: str,
     empty_attempt: int,
     empty_result_retries: int,
     processing_id: str | None = None,
@@ -218,7 +310,7 @@ def resolve_payload_or_retry_on_empty_corrected_text(
             f"{prefix}Model returned empty corrected_text after retries. "
             "Applying fallback to original transcription text."
         )
-        return apply_corrected_text_fallback(payload, transcription), False
+        return apply_corrected_text_fallback(payload), False
 
     print(
         f"{prefix}Model returned empty corrected_text. "
@@ -445,7 +537,7 @@ def _leading_cased_word_span(text: str) -> tuple[str, int, int] | None:
             index += 1
             continue
 
-        if char in "'’`.-":
+        if _is_inner_word_connector(char):
             has_prev = index - 1 >= 0 and _is_unicode_cased_letter(stripped[index - 1])
             has_next = index + 1 < len(stripped) and _is_unicode_cased_letter(stripped[index + 1])
             if has_prev and has_next:
@@ -510,7 +602,11 @@ def _terminal_punctuation_char(text: str) -> str:
 def _lexical_tokens_for_terminal_punctuation(text: str) -> list[str]:
     if not isinstance(text, str):
         return []
-    return re.findall(r"[^\W_]+(?:['’`.-][^\W_]+)*", text, flags=re.UNICODE)
+    return re.findall(
+        rf"[^\W_]+(?:[{_WORD_CONNECTOR_CHAR_CLASS}][^\W_]+)*",
+        text,
+        flags=re.UNICODE,
+    )
 
 
 def validate_terminal_punctuation_preserved(corrected_text: str, source_text: str) -> tuple[bool, str]:
@@ -609,6 +705,262 @@ def preserve_first_token_casing(corrected_text: str, source_text: str) -> tuple[
     return corrected_text, False
 
 
+_SENTENCE_END_PUNCTUATION = {
+    ".",
+    "!",
+    "?",
+    "。",
+    "！",
+    "？",
+    "؟",
+    "۔",
+    "।",
+    "॥",
+    "։",
+    "።",
+}
+_SENTENCE_CLOSERS = {
+    '"',
+    "'",
+    "”",
+    "’",
+    "»",
+    "›",
+    "」",
+    "』",
+    "》",
+    "】",
+    "〉",
+    "）",
+    "］",
+    "｝",
+    ")",
+    "]",
+    "}",
+}
+
+
+def _normalize_string_edits(edits: object) -> list[list[str]]:
+    if not isinstance(edits, list):
+        return []
+
+    normalized_edits: list[list[str]] = []
+    for item in edits:
+        if (
+            isinstance(item, list)
+            and len(item) == 2
+            and isinstance(item[0], str)
+            and isinstance(item[1], str)
+        ):
+            normalized_edits.append(item)
+    return normalized_edits
+
+
+def _has_explicit_first_token_casing_edit(
+    ct_casing_edits: object,
+    source_token: str,
+    corrected_token: str,
+) -> bool:
+    if not source_token or not corrected_token:
+        return False
+
+    # Respect explicit model-provided casing patches for the first token.
+    for before_text, after_text in _normalize_string_edits(ct_casing_edits):
+        before_span = _leading_cased_word_span(before_text)
+        after_span = _leading_cased_word_span(after_text)
+        if before_span is None or after_span is None:
+            continue
+
+        before_token, _, _ = before_span
+        after_token, _, _ = after_span
+
+        if before_token.casefold() != after_token.casefold():
+            continue
+
+        if (
+            after_token == corrected_token
+            and before_token.casefold() == source_token.casefold()
+        ):
+            return True
+
+    return False
+
+
+def preserve_sentence_start_casing(corrected_text: str) -> tuple[str, bool]:
+    """Uppercase cased sentence starts after explicit sentence-ending punctuation."""
+    if not isinstance(corrected_text, str) or not corrected_text:
+        return corrected_text, False
+
+    chars = list(corrected_text)
+    changed = False
+    index = 0
+
+    while index < len(chars):
+        if chars[index] not in _SENTENCE_END_PUNCTUATION:
+            index += 1
+            continue
+
+        cursor = index + 1
+
+        # Skip closing quotes/brackets immediately after sentence-ending punctuation.
+        while cursor < len(chars) and chars[cursor] in _SENTENCE_CLOSERS:
+            cursor += 1
+
+        while cursor < len(chars) and chars[cursor].isspace():
+            cursor += 1
+
+        if cursor >= len(chars):
+            break
+
+        current = chars[cursor]
+        if not _is_unicode_cased_letter(current):
+            index = cursor + 1
+            continue
+
+        upper = current.upper()
+        if isinstance(upper, str) and len(upper) == 1 and upper != current:
+            chars[cursor] = upper
+            changed = True
+
+        index = cursor + 1
+
+    if not changed:
+        return corrected_text, False
+
+    return "".join(chars), True
+
+
+def _build_text_edits(before_text: str, after_text: str) -> list[list[str]]:
+    if not isinstance(before_text, str) or not isinstance(after_text, str):
+        return []
+    if before_text == after_text:
+        return []
+
+    edits: list[list[str]] = []
+    matcher = difflib.SequenceMatcher(a=before_text, b=after_text, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        edits.append([before_text[i1:i2], after_text[j1:j2]])
+    return edits
+
+
+def _sync_step_output(
+    payload: dict,
+    step_key: str,
+    target_result: str,
+    append_generated_edits: bool,
+) -> None:
+    if not isinstance(payload, dict) or not isinstance(target_result, str):
+        return
+
+    step_value = payload.get(step_key)
+    if not isinstance(step_value, dict):
+        step_value = {"edits": [], "result": ""}
+        payload[step_key] = step_value
+
+    edits_value = step_value.get("edits")
+    if not isinstance(edits_value, list):
+        edits_value = []
+
+    normalized_existing_edits: list[list[str]] = []
+    for item in edits_value:
+        if (
+            isinstance(item, list)
+            and len(item) == 2
+            and isinstance(item[0], str)
+            and isinstance(item[1], str)
+        ):
+            normalized_existing_edits.append(item)
+
+    previous_result = step_value.get("result")
+    if not isinstance(previous_result, str):
+        previous_result = ""
+
+    if append_generated_edits and previous_result != target_result:
+        normalized_existing_edits.extend(_build_text_edits(previous_result, target_result))
+
+    step_value["edits"] = normalized_existing_edits
+    step_value["result"] = target_result
+
+
+def _repair_casing_step_edits(payload: dict) -> None:
+    if not isinstance(payload, dict):
+        return
+
+    casing_step = payload.get("ct_casing")
+    punct_step = payload.get("ct_punct")
+    if not isinstance(casing_step, dict) or not isinstance(punct_step, dict):
+        return
+
+    casing_result = casing_step.get("result")
+    punct_result = punct_step.get("result")
+    if not isinstance(casing_result, str) or not isinstance(punct_result, str):
+        return
+
+    edits_value = casing_step.get("edits")
+    if not isinstance(edits_value, list):
+        edits_value = []
+
+    normalized_edits: list[list[str]] = []
+    for item in edits_value:
+        if (
+            isinstance(item, list)
+            and len(item) == 2
+            and isinstance(item[0], str)
+            and isinstance(item[1], str)
+        ):
+            normalized_edits.append(item)
+
+    rebuilt_text, _ = _apply_edits_left_to_right(punct_result, normalized_edits)
+    if rebuilt_text == casing_result:
+        casing_step["edits"] = normalized_edits
+        return
+
+    # Rebuild edits deterministically when model-provided casing patches are stale/invalid.
+    casing_step["edits"] = _build_text_edits(punct_result, casing_result)
+
+
+def _apply_edits_left_to_right(base_text: str, edits: list[object]) -> tuple[str, bool]:
+    if not isinstance(base_text, str):
+        return "", False
+    if not isinstance(edits, list):
+        return base_text, False
+
+    text = base_text
+    changed = False
+    search_start = 0
+
+    for item in edits:
+        if (
+            not isinstance(item, list)
+            or len(item) != 2
+            or not isinstance(item[0], str)
+            or not isinstance(item[1], str)
+        ):
+            continue
+
+        before, after = item
+        if before == after:
+            continue
+
+        # Empty-before insertions are ambiguous without offsets; skip deterministically.
+        if before == "":
+            continue
+
+        index = text.find(before, search_start)
+        if index == -1:
+            index = text.find(before)
+        if index == -1:
+            continue
+
+        text = text[:index] + after + text[index + len(before):]
+        search_start = index + len(after)
+        changed = True
+
+    return text, changed
+
+
 def _materialize_corrected_text(payload: dict) -> dict:
     if not isinstance(payload, dict):
         return payload
@@ -617,15 +969,7 @@ def _materialize_corrected_text(payload: dict) -> dict:
     if isinstance(corrected_text, str) and corrected_text.strip():
         return payload
 
-    for key in (
-        "ct_casing",
-        "ct_punct",
-        "ct_numeral",
-        "ct_format",
-        "ct_disfluency",
-        "ct_lexical",
-        "ct_combine",
-    ):
+    for key in reversed(_STEP_CHAIN_KEYS):
         value = payload.get(key)
         if isinstance(value, dict):
             result = value.get("result")
@@ -645,8 +989,7 @@ def validate_patch_payload(payload: dict) -> tuple[bool, str]:
     if missing_required or unexpected_keys:
         return False, (
             "Top-level keys must be exactly: "
-            "tokenization, machine_transcription_probability, ct_combine, no_touch_tokens, ct_lexical, "
-            "ct_disfluency, ct_format, ct_numeral, ct_punct, ct_casing "
+            f"{', '.join(_REQUIRED_TOP_LEVEL_KEY_ORDER)} "
             "(optional internal key: corrected_text)"
         )
 
@@ -658,6 +1001,16 @@ def validate_patch_payload(payload: dict) -> tuple[bool, str]:
     tokens = tokenization_value.get("tokens")
     if not isinstance(tokens, list) or not all(isinstance(token, str) for token in tokens):
         return False, "tokenization.tokens must be an array of strings"
+
+    translation = payload.get("translation")
+    if not isinstance(translation, str):
+        return False, "translation must be a string"
+
+    aggressiveness_level = payload.get("aggressiveness_level")
+    if not isinstance(aggressiveness_level, str):
+        return False, 'aggressiveness_level must be one of "low", "medium", "high"'
+    if aggressiveness_level not in {"low", "medium", "high"}:
+        return False, 'aggressiveness_level must be one of "low", "medium", "high"'
 
     no_touch_tokens = payload.get("no_touch_tokens")
     if not isinstance(no_touch_tokens, list) or not all(isinstance(token, str) for token in no_touch_tokens):
@@ -687,24 +1040,10 @@ def validate_patch_payload(payload: dict) -> tuple[bool, str]:
 
         return True, ""
 
-    for step_key in (
-        "ct_combine",
-        "ct_lexical",
-        "ct_disfluency",
-        "ct_format",
-        "ct_numeral",
-        "ct_punct",
-        "ct_casing",
-    ):
+    for step_key in _STEP_CHAIN_KEYS:
         is_step_valid, step_error = _validate_step_field(step_key)
         if not is_step_valid:
             return False, step_error
-
-    machine_probability = payload.get("machine_transcription_probability")
-    if not isinstance(machine_probability, (int, float)):
-        return False, "machine_transcription_probability must be a number in [0, 1]"
-    if machine_probability < 0 or machine_probability > 1:
-        return False, "machine_transcription_probability must be in [0, 1]"
 
     if not isinstance(payload.get("corrected_text", ""), str):
         return False, "corrected_text must be a string"
@@ -771,18 +1110,7 @@ def is_json_like_repairable_response(content: str) -> tuple[bool, str]:
         return False, "content is empty after trim"
 
     lowered = trimmed.lower()
-    if any(key in lowered for key in (
-        '"tokenization"',
-        '"ct_combine"',
-        '"no_touch_tokens"',
-        '"ct_lexical"',
-        '"ct_disfluency"',
-        '"ct_format"',
-        '"ct_numeral"',
-        '"ct_punct"',
-        '"ct_casing"',
-        '"machine_transcription_probability"',
-    )):
+    if any(f'"{key}"' in lowered for key in _REQUIRED_TOP_LEVEL_KEYS):
         return True, "contains expected JSON schema keys"
 
     return False, (
@@ -884,7 +1212,19 @@ def parse_validate_and_apply_text_fixes(
     if payload is None:
         return None, validation_error, content
 
-    corrected_text = payload.get("corrected_text", "") if isinstance(payload, dict) else ""
+    corrected_text = ""
+    ct_casing_edits = None
+    if isinstance(payload, dict):
+        ct_casing = payload.get("ct_casing")
+        ct_casing_result = ct_casing.get("result") if isinstance(ct_casing, dict) else None
+        ct_casing_edits = ct_casing.get("edits") if isinstance(ct_casing, dict) else None
+        if isinstance(ct_casing_result, str):
+            corrected_text = ct_casing_result
+        else:
+            existing_corrected_text = payload.get("corrected_text")
+            corrected_text = existing_corrected_text if isinstance(existing_corrected_text, str) else ""
+        payload["corrected_text"] = corrected_text
+
     corrected_text, casing_normalized = preserve_first_token_casing(
         corrected_text,
         source_text,
@@ -893,9 +1233,20 @@ def parse_validate_and_apply_text_fixes(
         corrected_text,
         source_text,
     )
+    corrected_text, sentence_casing_normalized = preserve_sentence_start_casing(
+        corrected_text,
+        ct_casing_edits,
+    )
 
-    if (casing_normalized or punctuation_normalized) and isinstance(payload, dict):
+    if (
+        casing_normalized
+        or punctuation_normalized
+        or sentence_casing_normalized
+    ) and isinstance(payload, dict):
         payload["corrected_text"] = corrected_text
+
+    if isinstance(payload, dict):
+        _repair_casing_step_edits(payload)
 
     hallucination_ok, hallucination_error = validate_corrected_text_hallucination(
         corrected_text,
@@ -930,31 +1281,27 @@ def parse_validate_and_apply_text_fixes(
 
 
 def build_empty_payload() -> dict:
-    return {
+    payload = {
         "tokenization": {"tokens": []},
-        "machine_transcription_probability": 0.0,
-        "ct_combine": {"edits": [], "result": ""},
+        "translation": "",
+        "aggressiveness_level": "low",
         "no_touch_tokens": [],
-        "ct_lexical": {"edits": [], "result": ""},
-        "ct_disfluency": {"edits": [], "result": ""},
-        "ct_format": {"edits": [], "result": ""},
-        "ct_numeral": {"edits": [], "result": ""},
-        "ct_punct": {"edits": [], "result": ""},
-        "ct_casing": {"edits": [], "result": ""},
     }
+
+    for step_key in _STEP_CHAIN_KEYS:
+        payload[step_key] = _new_empty_step_payload()
+
+    return payload
 
 
 def describe_top_level_key_error(
-    validation_error: str | None,
     raw_output: str,
     processing_id: str | None = None,
 ) -> str | None:
     prefix = f"[{processing_id}] " if processing_id else ""
-    if not validation_error or "Top-level keys must be exactly:" not in validation_error:
-        return None
-
     trimmed = strip_markdown_code_fence(raw_output)
-    candidate = extract_first_json_object(trimmed) or trimmed
+    extracted = extract_first_json_object(trimmed)
+    candidate = extracted if extracted is not None else trimmed
 
     try:
         payload = json.loads(candidate)
@@ -984,7 +1331,6 @@ def log_json_validation_with_key_error(
         print(f"{prefix}JSON_FORMAT_ERROR: {validation_error}")
 
     key_error_detail = describe_top_level_key_error(
-        validation_error,
         raw_output,
         processing_id,
     )
@@ -1148,7 +1494,19 @@ def parse_transcriptions_from_file(input_path: Path) -> list[str]:
             transcriptions = [item.strip() for item in items if isinstance(item, str)]
             return transcriptions
 
-    return [line.strip() for line in raw_text.rstrip().split("\n")]
+    transcriptions: list[str] = []
+    for line in raw_text.splitlines():
+        if line.lstrip().startswith("#"):
+            # Preserve comment lines verbatim so they can be emitted unchanged.
+            transcriptions.append(line)
+            continue
+        transcriptions.append(line.strip())
+    return transcriptions
+
+
+def is_input_comment_line(transcription: str) -> bool:
+    return isinstance(transcription, str) and transcription.lstrip().startswith("#")
+
 
 def collect_transcriptions_from_input(input_file_value: str | None) -> list[str] | None:
     transcriptions: list[str]
@@ -1199,19 +1557,30 @@ def assign_payload_or_emit_empty(
 def finalize_payloads_and_write(
     payloads: list[dict | None],
     output_file_value: str | None,
+    text_output_lines: list[str] | None = None,
 ) -> bool:
-    if any(payload is None for payload in payloads):
+    if text_output_lines is not None and len(text_output_lines) != len(payloads):
+        print("Internal error: text output line count does not match payload count.")
+        return False
+
+    if text_output_lines is None and any(payload is None for payload in payloads):
         print("Failed to produce output for one or more transcriptions.")
         return False
 
-    final_payloads = [payload for payload in payloads if payload is not None]
+    if text_output_lines is not None:
+        for index, payload in enumerate(payloads):
+            if payload is None and not isinstance(text_output_lines[index], str):
+                print(f"Failed to produce output for transcription {index + 1}.")
+                return False
+
+    final_payloads = [payload for payload in payloads if isinstance(payload, dict)]
 
     is_valid, validation_error = validate_output_payloads(final_payloads)
     if not is_valid:
         print(validation_error)
         return False
 
-    write_output_artifacts(final_payloads, output_file_value)
+    write_output_artifacts(final_payloads, output_file_value, text_output_lines)
     return True
 
 
@@ -1238,16 +1607,173 @@ def load_patch_and_repair_templates(
     )
 
 
+_CHAIN_ID_TO_NAME = {
+    "1": "COMBINE",
+    "2": "NO_TOUCH",
+    "3": "LEXICAL",
+    "4": "DISFLUENCY",
+    "5": "FORMAT",
+    "6": "NUMERAL",
+    "7": "PUNCT",
+    "8": "CASING",
+}
+
+_CHAIN_NAME_TO_ID = {value: key for key, value in _CHAIN_ID_TO_NAME.items()}
+_DEFAULT_CHAIN_IDS = list(_CHAIN_ID_TO_NAME.keys())
+_NO_TOUCH_CHAIN_ID = "2"
+_LEXICAL_CHAIN_ID = "3"
+_DISFLUENCY_CHAIN_ID = "4"
+
+
+def _expand_chain_step_values(chain_steps: list[str] | None) -> list[str]:
+    expanded_steps: list[str] = []
+    for raw_step in chain_steps or []:
+        if not isinstance(raw_step, str):
+            continue
+
+        step_value = raw_step.strip()
+        if not step_value:
+            continue
+
+        parsed_list: list[str] | None = None
+        if step_value.startswith("[") and step_value.endswith("]"):
+            parsed: object
+            try:
+                parsed = json.loads(step_value)
+            except Exception:
+                try:
+                    parsed = ast.literal_eval(step_value)
+                except Exception:
+                    parsed = None
+
+            if isinstance(parsed, (list, tuple)):
+                parsed_list = [str(item).strip() for item in parsed if str(item).strip()]
+
+        if parsed_list is not None:
+            expanded_steps.extend(parsed_list)
+            continue
+
+        if "," in step_value:
+            split_values = [item.strip() for item in step_value.split(",") if item.strip()]
+            expanded_steps.extend(split_values)
+            continue
+
+        expanded_steps.append(step_value)
+
+    return expanded_steps
+
+
+def _normalize_chain_step_token(token: str) -> str | None:
+    if not isinstance(token, str):
+        return None
+    normalized = token.strip()
+    if not normalized:
+        return None
+
+    bracket_match = re.match(r"^\[\s*([A-Za-z_]+)\s*\]$", normalized)
+    if bracket_match:
+        normalized = bracket_match.group(1)
+
+    upper = normalized.upper()
+    if upper in _CHAIN_NAME_TO_ID:
+        return _CHAIN_NAME_TO_ID[upper]
+
+    if normalized in _CHAIN_ID_TO_NAME:
+        return normalized
+
+    return None
+
+
+def _resolve_active_chain_ids(chain_steps: list[str] | None) -> list[str]:
+    expanded = _expand_chain_step_values(chain_steps)
+    if not expanded:
+        return _DEFAULT_CHAIN_IDS
+
+    resolved_ids: list[str] = []
+    seen_ids: set[str] = set()
+
+    for token in expanded:
+        chain_id = _normalize_chain_step_token(token)
+        if chain_id is None:
+            # If any selector token is invalid, fall back to full default chain.
+            return _DEFAULT_CHAIN_IDS
+        if chain_id in seen_ids:
+            continue
+        seen_ids.add(chain_id)
+        resolved_ids.append(chain_id)
+
+    if resolved_ids:
+        requires_no_touch = (
+            _LEXICAL_CHAIN_ID in resolved_ids
+            or _DISFLUENCY_CHAIN_ID in resolved_ids
+        )
+        if requires_no_touch and _NO_TOUCH_CHAIN_ID not in resolved_ids:
+            insert_before = len(resolved_ids)
+            for index, chain_id in enumerate(resolved_ids):
+                if chain_id in {_LEXICAL_CHAIN_ID, _DISFLUENCY_CHAIN_ID}:
+                    insert_before = index
+                    break
+            resolved_ids.insert(insert_before, _NO_TOUCH_CHAIN_ID)
+
+        return resolved_ids
+
+    return _DEFAULT_CHAIN_IDS
+
+
+def build_patch_prompt(
+    prompt_template: str,
+    transcription: str,
+    chain_steps: list[str] | None = None,
+) -> str:
+    active_chain_ids = _resolve_active_chain_ids(chain_steps)
+    active_chain_names = [_CHAIN_ID_TO_NAME[chain_id] for chain_id in active_chain_ids]
+
+    chain_steps_text = "\n".join(
+        f"{chain_id}) {chain_name}"
+        for chain_id, chain_name in zip(active_chain_ids, active_chain_names)
+    )
+
+    prompt = prompt_template
+    if "{chain_steps}" in prompt:
+        prompt = prompt.replace("{chain_steps}", chain_steps_text)
+    if "{input_transcript}" in prompt:
+        prompt = prompt.replace("{input_transcript}", transcription)
+        return prompt
+
+    return prompt + transcription
+
+
 def write_output_artifacts(
     payloads: list[dict],
     output_file_value: str | None,
+    text_output_lines: list[str] | None = None,
 ) -> None:
+    def _order_top_level_payload_keys(payload: dict) -> dict:
+        ordered_payload: dict = {}
+
+        # Keep canonical required key order for deterministic JSON diffs.
+        for key in _REQUIRED_TOP_LEVEL_KEY_ORDER:
+            if key in payload:
+                ordered_payload[key] = payload[key]
+
+        # Keep known optional keys next.
+        for key in _OPTIONAL_TOP_LEVEL_KEYS:
+            if key in payload:
+                ordered_payload[key] = payload[key]
+
+        # Preserve any unexpected keys at the end in original insertion order.
+        for key, value in payload.items():
+            if key not in ordered_payload:
+                ordered_payload[key] = value
+
+        return ordered_payload
+
     sanitized_payloads: list[dict] = []
     for item in payloads:
         if isinstance(item, dict):
             payload_copy = dict(item)
             payload_copy.pop("tokenization", None)
-            sanitized_payloads.append(payload_copy)
+            sanitized_payloads.append(_order_top_level_payload_keys(payload_copy))
 
     output_payload = sanitized_payloads[0] if len(sanitized_payloads) == 1 else sanitized_payloads
 
@@ -1255,7 +1781,12 @@ def write_output_artifacts(
     for item in sanitized_payloads:
         corrected_text = item.get("corrected_text") if isinstance(item, dict) else ""
         corrected_text_lines.append(corrected_text if isinstance(corrected_text, str) else "")
-    text_output_content = "\n".join(corrected_text_lines)
+
+    if text_output_lines is None:
+        text_output_content = "\n".join(corrected_text_lines)
+    else:
+        normalized_text_lines = [line if isinstance(line, str) else "" for line in text_output_lines]
+        text_output_content = "\n".join(normalized_text_lines)
 
     output_content = json.dumps(output_payload, ensure_ascii=False, indent=2)
     if output_file_value:
@@ -1292,10 +1823,14 @@ def format_repair_prompt(
 
     schema_text = target_schema
     if not isinstance(schema_text, str) or not schema_text.strip():
-        schema_text = (
-            '{"type":"object","required":["tokenization","machine_transcription_probability",'
-            '"ct_combine","no_touch_tokens","ct_lexical","ct_disfluency","ct_format","ct_numeral","ct_punct","ct_casing"],'
-            '"additionalProperties":false}'
+        schema_text = json.dumps(
+            {
+                "type": "object",
+                "required": list(_REQUIRED_TOP_LEVEL_KEY_ORDER),
+                "additionalProperties": False,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
         )
 
     if any(
@@ -1347,7 +1882,7 @@ def build_repair_prompt_after_invalid_json(
     )
 
 
-def apply_corrected_text_fallback(payload: dict, transcription: str) -> dict | None:
+def apply_corrected_text_fallback(payload: dict) -> dict | None:
     if not isinstance(payload, dict):
         return None
 
@@ -1358,29 +1893,21 @@ def apply_corrected_text_fallback(payload: dict, transcription: str) -> dict | N
         if not isinstance(tokenization.get("tokens"), list):
             tokenization["tokens"] = []
 
-    if not isinstance(payload.get("ct_combine"), dict):
-        payload["ct_combine"] = {"edits": [], "result": ""}
+    for step_key in _STEP_CHAIN_KEYS:
+        if not isinstance(payload.get(step_key), dict):
+            payload[step_key] = _new_empty_step_payload()
+
     no_touch_tokens = payload.get("no_touch_tokens")
     if not isinstance(no_touch_tokens, list) or not all(isinstance(token, str) for token in no_touch_tokens):
         payload["no_touch_tokens"] = []
-    if not isinstance(payload.get("ct_lexical"), dict):
-        payload["ct_lexical"] = {"edits": [], "result": ""}
-    if not isinstance(payload.get("ct_disfluency"), dict):
-        payload["ct_disfluency"] = {"edits": [], "result": ""}
-    if not isinstance(payload.get("ct_format"), dict):
-        payload["ct_format"] = {"edits": [], "result": ""}
-    if not isinstance(payload.get("ct_numeral"), dict):
-        payload["ct_numeral"] = {"edits": [], "result": ""}
-    if not isinstance(payload.get("ct_punct"), dict):
-        payload["ct_punct"] = {"edits": [], "result": ""}
-    if not isinstance(payload.get("ct_casing"), dict):
-        payload["ct_casing"] = {"edits": [], "result": ""}
 
-    machine_probability = payload.get("machine_transcription_probability")
-    if not isinstance(machine_probability, (int, float)):
-        payload["machine_transcription_probability"] = 0.0
-    elif machine_probability < 0 or machine_probability > 1:
-        payload["machine_transcription_probability"] = 0.0
+    translation = payload.get("translation")
+    if not isinstance(translation, str):
+        payload["translation"] = ""
+
+    aggressiveness_level = payload.get("aggressiveness_level")
+    if not isinstance(aggressiveness_level, str) or aggressiveness_level not in {"low", "medium", "high"}:
+        payload["aggressiveness_level"] = "low"
 
     payload["corrected_text"] = ""
     return payload

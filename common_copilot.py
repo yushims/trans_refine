@@ -5,6 +5,7 @@ from collections.abc import Callable
 from typing import Any
 
 from common import (
+    build_patch_payload_schema,
     build_repair_prompt_after_invalid_json,
     extract_retry_after_seconds,
     extract_text_content,
@@ -249,22 +250,6 @@ async def handle_copilot_model_mismatch_retry(
     return True
 
 
-async def handle_model_mismatch_retry(
-    mismatch_error: ModelMismatchError,
-    mismatch_attempt: int,
-    model_mismatch_retries: int,
-    processing_id: str,
-    failure_action: str,
-) -> bool:
-    return await handle_copilot_model_mismatch_retry(
-        mismatch_error,
-        mismatch_attempt,
-        model_mismatch_retries,
-        processing_id,
-        failure_action,
-    )
-
-
 async def _get_copilot_patch_payload_with_repair_on_session(
     session: Any,
     prompt: str,
@@ -277,163 +262,7 @@ async def _get_copilot_patch_payload_with_repair_on_session(
     empty_result_retries: int,
 ) -> dict | None:
     patch_target_schema = json.dumps(
-        {
-            "type": "object",
-            "required": [
-                "tokenization",
-                "machine_transcription_probability",
-                "ct_combine",
-                "no_touch_tokens",
-                "ct_lexical",
-                "ct_disfluency",
-                "ct_format",
-                "ct_numeral",
-                "ct_punct",
-                "ct_casing",
-            ],
-            "properties": {
-                "tokenization": {
-                    "type": "object",
-                    "properties": {
-                        "tokens": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                        },
-                    },
-                    "required": ["tokens"],
-                    "additionalProperties": False,
-                },
-                "machine_transcription_probability": {
-                    "type": "number",
-                    "minimum": 0,
-                    "maximum": 1,
-                },
-                "ct_combine": {
-                    "type": "object",
-                    "properties": {
-                        "edits": {
-                            "type": "array",
-                            "items": {
-                                "type": "array",
-                                "minItems": 2,
-                                "maxItems": 2,
-                                "items": {"type": "string"},
-                            },
-                        },
-                        "result": {"type": "string"},
-                    },
-                    "required": ["edits", "result"],
-                    "additionalProperties": False,
-                },
-                "no_touch_tokens": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                },
-                "ct_lexical": {
-                    "type": "object",
-                    "properties": {
-                        "edits": {
-                            "type": "array",
-                            "items": {
-                                "type": "array",
-                                "minItems": 2,
-                                "maxItems": 2,
-                                "items": {"type": "string"},
-                            },
-                        },
-                        "result": {"type": "string"},
-                    },
-                    "required": ["edits", "result"],
-                    "additionalProperties": False,
-                },
-                "ct_disfluency": {
-                    "type": "object",
-                    "properties": {
-                        "edits": {
-                            "type": "array",
-                            "items": {
-                                "type": "array",
-                                "minItems": 2,
-                                "maxItems": 2,
-                                "items": {"type": "string"},
-                            },
-                        },
-                        "result": {"type": "string"},
-                    },
-                    "required": ["edits", "result"],
-                    "additionalProperties": False,
-                },
-                "ct_format": {
-                    "type": "object",
-                    "properties": {
-                        "edits": {
-                            "type": "array",
-                            "items": {
-                                "type": "array",
-                                "minItems": 2,
-                                "maxItems": 2,
-                                "items": {"type": "string"},
-                            },
-                        },
-                        "result": {"type": "string"},
-                    },
-                    "required": ["edits", "result"],
-                    "additionalProperties": False,
-                },
-                "ct_numeral": {
-                    "type": "object",
-                    "properties": {
-                        "edits": {
-                            "type": "array",
-                            "items": {
-                                "type": "array",
-                                "minItems": 2,
-                                "maxItems": 2,
-                                "items": {"type": "string"},
-                            },
-                        },
-                        "result": {"type": "string"},
-                    },
-                    "required": ["edits", "result"],
-                    "additionalProperties": False,
-                },
-                "ct_punct": {
-                    "type": "object",
-                    "properties": {
-                        "edits": {
-                            "type": "array",
-                            "items": {
-                                "type": "array",
-                                "minItems": 2,
-                                "maxItems": 2,
-                                "items": {"type": "string"},
-                            },
-                        },
-                        "result": {"type": "string"},
-                    },
-                    "required": ["edits", "result"],
-                    "additionalProperties": False,
-                },
-                "ct_casing": {
-                    "type": "object",
-                    "properties": {
-                        "edits": {
-                            "type": "array",
-                            "items": {
-                                "type": "array",
-                                "minItems": 2,
-                                "maxItems": 2,
-                                "items": {"type": "string"},
-                            },
-                        },
-                        "result": {"type": "string"},
-                    },
-                    "required": ["edits", "result"],
-                    "additionalProperties": False,
-                },
-            },
-            "additionalProperties": False,
-        },
+        build_patch_payload_schema(),
         ensure_ascii=False,
         indent=2,
     )
@@ -539,7 +368,6 @@ async def _get_copilot_patch_payload_with_repair_on_session(
 
         result_payload, should_retry = resolve_payload_or_retry_on_empty_corrected_text(
             payload,
-            transcription,
             empty_attempt,
             empty_result_retries,
             processing_id,
