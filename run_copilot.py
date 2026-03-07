@@ -9,6 +9,7 @@ from common import (
     build_empty_payload,
     collect_transcriptions_from_input,
     finalize_payloads_and_write,
+    is_input_comment_line,
     load_patch_and_repair_templates,
     print_common_runtime_settings,
     resolve_patch_and_repair_template_paths,
@@ -39,7 +40,7 @@ def parse_args() -> argparse.Namespace:
         "--chain-steps",
         dest="chain_steps",
         action="append",
-        help="Repeatable active-chain selector (ids 0-8 or step names like COMBINE, NO_TOUCH).",
+        help="Repeatable active-chain selector (ids 1-8 or step names like COMBINE, NO_TOUCH).",
     )
     return parser.parse_args()
 
@@ -109,11 +110,16 @@ async def main():
             return
 
         payloads: list[dict | None] = [None] * len(transcriptions)
+        text_output_lines: list[str] = [""] * len(transcriptions)
 
         async def process_item(index: int, transcription: str, total: int) -> None:
             requested_model = model
             slot = index - 1
             processing_id = f"{index}/{total}"
+            if is_input_comment_line(transcription):
+                text_output_lines[slot] = transcription
+                return
+
             if not transcription.strip():
                 payloads[slot] = build_empty_payload()
                 print(
@@ -147,9 +153,14 @@ async def main():
                 )
 
                 assign_payload_or_emit_empty(payload, payloads, slot, index, total)
+                resolved_payload = payloads[slot]
+                if isinstance(resolved_payload, dict):
+                    corrected_text = resolved_payload.get("corrected_text")
+                    text_output_lines[slot] = corrected_text if isinstance(corrected_text, str) else ""
                 return
             except asyncio.CancelledError:
                 payloads[slot] = build_empty_payload()
+                text_output_lines[slot] = ""
                 print(
                     f"Cancelled while processing transcription {index}/{total}; "
                     "emitting empty payload."
@@ -157,6 +168,7 @@ async def main():
                 return
             except Exception as error:
                 payloads[slot] = build_empty_payload()
+                text_output_lines[slot] = ""
                 print(
                     f"Unexpected error on transcription {index}/{total}: {error}; "
                     "emitting empty payload."
@@ -165,7 +177,7 @@ async def main():
 
         await run_transcriptions_with_concurrency(transcriptions, concurrency, process_item)
 
-        if not finalize_payloads_and_write(payloads, output_file_value):
+        if not finalize_payloads_and_write(payloads, output_file_value, text_output_lines):
             return
 
     finally:
