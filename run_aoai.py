@@ -4,6 +4,7 @@ import asyncio
 from openai import AzureOpenAI
 from common import (
     assign_payload_or_emit_empty,
+    build_patch_prompt,
     build_empty_payload,
     collect_transcriptions_from_input,
     finalize_payloads_and_write,
@@ -30,10 +31,9 @@ PATCH_SCHEMA = {
                 },
                 "required": ["tokens"]
             },
-            "machine_transcription_probability": {
-                "type": "number",
-                "minimum": 0,
-                "maximum": 1
+            "aggressiveness_level": {
+                "type": "string",
+                "enum": ["low", "medium", "high"]
             },
             "ct_combine": {
                 "type": "object",
@@ -161,7 +161,7 @@ PATCH_SCHEMA = {
         },
         "required": [
             "tokenization",
-            "machine_transcription_probability",
+            "aggressiveness_level",
             "ct_combine",
             "no_touch_tokens",
             "ct_lexical",
@@ -192,6 +192,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-p", dest="top_p", type=float, default=1.0)
     parser.add_argument("--retry-temperature-jitter", dest="retry_temperature_jitter", type=float, default=0.08)
     parser.add_argument("--retry-top-p-jitter", dest="retry_top_p_jitter", type=float, default=0.03)
+    parser.add_argument(
+        "--chain-steps",
+        dest="chain_steps",
+        action="append",
+        help="Repeatable active-chain selector (ids 0-8 or step names like COMBINE, NO_TOUCH).",
+    )
     return parser.parse_args()
 
 
@@ -234,17 +240,15 @@ async def main() -> None:
     input_file_value = args.input_file
     output_file_value = args.output_file
 
-    loaded_transcriptions = collect_transcriptions_from_input(input_file_value)
-    if loaded_transcriptions is None:
+    transcriptions = collect_transcriptions_from_input(input_file_value)
+    if transcriptions is None:
         return
-    transcriptions = loaded_transcriptions
 
     endpoint = args.endpoint
     deployment = args.deployment
     api_version = args.api_version
 
-    configured_concurrency = args.concurrency
-    concurrency = max(1, configured_concurrency)
+    concurrency = max(1, args.concurrency)
 
     timeout_seconds = args.timeout
     timeout_retries = max(0, args.timeout_retries)
@@ -254,6 +258,7 @@ async def main() -> None:
     top_p = args.top_p
     retry_temperature_jitter = max(0.0, args.retry_temperature_jitter)
     retry_top_p_jitter = max(0.0, args.retry_top_p_jitter)
+    chain_steps = [step for step in (args.chain_steps or []) if isinstance(step, str) and step.strip()]
 
     prompt_template_path, repair_prompt_template_path, template_error = resolve_patch_and_repair_template_paths(
         args.patch_prompt_file,
@@ -271,6 +276,8 @@ async def main() -> None:
     print(f"Temperature: {temperature}")
     print(f"Top p: {top_p}")
     print(f"Retry jitter: temperature<=+{retry_temperature_jitter}, top_p±{retry_top_p_jitter}")
+    if chain_steps:
+        print(f"Chain step selector count: {len(chain_steps)}")
     print_common_runtime_settings(
         prompt_template_path,
         repair_prompt_template_path,
@@ -303,7 +310,11 @@ async def main() -> None:
             )
             return
 
-        prompt = prompt_template + transcription
+        prompt = build_patch_prompt(
+            prompt_template,
+            transcription,
+            chain_steps,
+        )
         try:
             payload = await get_payload_with_repair(
                 client,

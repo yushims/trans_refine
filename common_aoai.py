@@ -221,7 +221,6 @@ async def get_patch_payload_with_repair(
 
         result_payload, should_retry = resolve_payload_or_retry_on_empty_corrected_text(
             payload,
-            transcription,
             empty_attempt,
             empty_result_retries,
             processing_id,
