@@ -135,6 +135,47 @@ _LATIN_WORD_PATTERN = re.compile(
     rf"{_WORD_SEGMENT_PATTERN}(?:[{_WORD_CONNECTOR_CHAR_CLASS}]{_WORD_SEGMENT_PATTERN})*",
     flags=re.UNICODE,
 )
+_SENTENCE_END_PUNCTUATION = {
+    ".",
+    "!",
+    "?",
+    "。",
+    "！",
+    "？",
+    "؟",
+    "۔",
+    "।",
+    "॥",
+    "։",
+    "።",
+}
+_SENTENCE_CLOSERS = {
+    '"',
+    "'",
+    "”",
+    "’",
+    "»",
+    "›",
+    "」",
+    "』",
+    "》",
+    "】",
+    "〉",
+    "）",
+    "］",
+    "｝",
+    ")",
+    "]",
+    "}",
+}
+_DOT_ABBREVIATION_WORD_PATTERN = re.compile(
+    r"\b(?:mr|mrs|ms|dr|prof|sr|jr|st|etc|vs|fig|no)\.$",
+    flags=re.IGNORECASE,
+)
+_DOT_ABBREVIATION_COMPOUND_PATTERN = re.compile(
+    r"\b(?:e\.g|i\.e|a\.k\.a|u\.s|u\.k)\.$",
+    flags=re.IGNORECASE,
+)
 
 
 def _is_inner_word_connector(char: str) -> bool:
@@ -473,7 +514,7 @@ def validate_corrected_text_hallucination(corrected_text: str, source_text: str)
     if not isinstance(source_text, str):
         return False, "source_text must be a string"
     if not source_text.strip():
-        return True, ""
+        return False, ""
 
     source_tokens = [
         token
@@ -559,36 +600,6 @@ def _has_case_distinction(token: str) -> bool:
     return has_letter and token.lower() != token.upper()
 
 
-def validate_first_token_casing_preserved(corrected_text: str, source_text: str) -> tuple[bool, str]:
-    if not isinstance(corrected_text, str):
-        return False, "corrected_text must be a string"
-    if not isinstance(source_text, str):
-        return False, "source_text must be a string"
-
-    source_span = _leading_cased_word_span(source_text)
-    corrected_span = _leading_cased_word_span(corrected_text)
-    if source_span is None or corrected_span is None:
-        return True, ""
-
-    source_token, _, _ = source_span
-    corrected_token, _, _ = corrected_span
-
-    if source_token == corrected_token:
-        return True, ""
-
-    if (
-        _has_case_distinction(source_token)
-        and _has_case_distinction(corrected_token)
-        and source_token.casefold() == corrected_token.casefold()
-    ):
-        return False, (
-            "first token casing changed: "
-            f"source='{source_token}' corrected='{corrected_token}'"
-        )
-
-    return True, ""
-
-
 def _terminal_punctuation_char(text: str) -> str:
     if not isinstance(text, str):
         return ""
@@ -597,47 +608,6 @@ def _terminal_punctuation_char(text: str) -> str:
         return ""
     tail = trimmed[-1]
     return tail if unicodedata.category(tail).startswith("P") else ""
-
-
-def _lexical_tokens_for_terminal_punctuation(text: str) -> list[str]:
-    if not isinstance(text, str):
-        return []
-    return re.findall(
-        rf"[^\W_]+(?:[{_WORD_CONNECTOR_CHAR_CLASS}][^\W_]+)*",
-        text,
-        flags=re.UNICODE,
-    )
-
-
-def validate_terminal_punctuation_preserved(corrected_text: str, source_text: str) -> tuple[bool, str]:
-    if not isinstance(corrected_text, str):
-        return False, "corrected_text must be a string"
-    if not isinstance(source_text, str):
-        return False, "source_text must be a string"
-
-    source_terminal = _terminal_punctuation_char(source_text)
-    corrected_terminal = _terminal_punctuation_char(corrected_text)
-    source_has_terminal = bool(source_terminal)
-    corrected_has_terminal = bool(corrected_terminal)
-
-    if not source_has_terminal and corrected_has_terminal:
-        return False, (
-            "terminal punctuation added: "
-            f"source_terminal='{source_terminal}' corrected_terminal='{corrected_terminal}'"
-        )
-    if source_has_terminal and not corrected_has_terminal:
-        return False, (
-            "terminal punctuation removed: "
-            f"source_terminal='{source_terminal}' corrected_terminal='{corrected_terminal}'"
-        )
-
-    if source_has_terminal and corrected_has_terminal and source_terminal != corrected_terminal:
-        return False, (
-            "terminal punctuation changed: "
-            f"source_terminal='{source_terminal}' corrected_terminal='{corrected_terminal}'"
-        )
-
-    return True, ""
 
 
 def preserve_terminal_punctuation(corrected_text: str, source_text: str) -> tuple[str, bool]:
@@ -705,41 +675,6 @@ def preserve_first_token_casing(corrected_text: str, source_text: str) -> tuple[
     return corrected_text, False
 
 
-_SENTENCE_END_PUNCTUATION = {
-    ".",
-    "!",
-    "?",
-    "。",
-    "！",
-    "？",
-    "؟",
-    "۔",
-    "।",
-    "॥",
-    "։",
-    "።",
-}
-_SENTENCE_CLOSERS = {
-    '"',
-    "'",
-    "”",
-    "’",
-    "»",
-    "›",
-    "」",
-    "』",
-    "》",
-    "】",
-    "〉",
-    "）",
-    "］",
-    "｝",
-    ")",
-    "]",
-    "}",
-}
-
-
 def _normalize_string_edits(edits: object) -> list[list[str]]:
     if not isinstance(edits, list):
         return []
@@ -756,47 +691,119 @@ def _normalize_string_edits(edits: object) -> list[list[str]]:
     return normalized_edits
 
 
-def _has_explicit_first_token_casing_edit(
+def _is_case_only_casing_edit(before_text: str, after_text: str) -> bool:
+    if not isinstance(before_text, str) or not isinstance(after_text, str):
+        return False
+    if not before_text or not after_text or before_text == after_text:
+        return False
+    if before_text.casefold() != after_text.casefold():
+        return False
+    return _has_case_distinction(before_text) and _has_case_distinction(after_text)
+
+
+def _collect_explicit_casing_edit_spans(
+    corrected_text: str,
     ct_casing_edits: object,
-    source_token: str,
-    corrected_token: str,
-) -> bool:
-    if not source_token or not corrected_token:
+) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    if not isinstance(corrected_text, str) or not corrected_text:
+        return spans
+
+    for before_text, after_text in _normalize_string_edits(ct_casing_edits):
+        # Only protect ranges where the model explicitly changed casing (same lexical text).
+        if not _is_case_only_casing_edit(before_text, after_text):
+            continue
+
+        start = 0
+        while True:
+            index = corrected_text.find(after_text, start)
+            if index == -1:
+                break
+            spans.append((index, index + len(after_text)))
+            start = index + max(1, len(after_text))
+
+    return spans
+
+
+def _is_index_inside_url_or_email(text: str, index: int) -> bool:
+    if not isinstance(text, str) or index < 0 or index >= len(text):
         return False
 
-    # Respect explicit model-provided casing patches for the first token.
-    for before_text, after_text in _normalize_string_edits(ct_casing_edits):
-        before_span = _leading_cased_word_span(before_text)
-        after_span = _leading_cased_word_span(after_text)
-        if before_span is None or after_span is None:
-            continue
-
-        before_token, _, _ = before_span
-        after_token, _, _ = after_span
-
-        if before_token.casefold() != after_token.casefold():
-            continue
-
-        if (
-            after_token == corrected_token
-            and before_token.casefold() == source_token.casefold()
-        ):
+    for match in _URL_EMAIL_PATTERN.finditer(text):
+        if match.start() <= index < match.end():
             return True
+    return False
+
+
+def _looks_like_dot_abbreviation_at(text: str, index: int) -> bool:
+    if not isinstance(text, str) or index < 0 or index >= len(text):
+        return False
+
+    left = text[:index + 1]
+    # Keep the inspected context short for deterministic performance.
+    window = left[-24:]
+
+    if _DOT_ABBREVIATION_COMPOUND_PATTERN.search(window):
+        return True
+    if _DOT_ABBREVIATION_WORD_PATTERN.search(window):
+        return True
+
+    # Detect initial chains like U.S. or J. K. at their terminal dots.
+    if index >= 2 and text[index - 2] == "." and text[index - 1].isalpha():
+        return True
 
     return False
 
 
-def preserve_sentence_start_casing(corrected_text: str) -> tuple[str, bool]:
-    """Uppercase cased sentence starts after explicit sentence-ending punctuation."""
+def _is_sentence_boundary_punctuation_at(text: str, index: int) -> bool:
+    if not isinstance(text, str) or index < 0 or index >= len(text):
+        return False
+
+    punctuation = text[index]
+    if punctuation not in _SENTENCE_END_PUNCTUATION:
+        return False
+
+    # Treat decimal points like 0.1 as non-terminal punctuation.
+    if punctuation == ".":
+        if _is_index_inside_url_or_email(text, index):
+            return False
+
+        prev_char = text[index - 1] if index > 0 else ""
+        next_char = text[index + 1] if index + 1 < len(text) else ""
+
+        # Keep in-token dots (domains, versions, abbreviations) non-terminal.
+        if prev_char.isalnum() and next_char.isalnum():
+            return False
+
+        # Keep ellipsis non-terminal.
+        if prev_char == "." or next_char == ".":
+            return False
+
+        if prev_char.isdigit() and next_char.isdigit():
+            return False
+
+        if _looks_like_dot_abbreviation_at(text, index):
+            return False
+
+    return True
+
+
+def preserve_sentence_start_casing(
+    corrected_text: str,
+    ct_casing_edits: object = None,
+) -> tuple[str, bool]:
+    """Uppercase cased sentence starts after sentence-ending punctuation unless explicitly edited in ct_casing.edits."""
     if not isinstance(corrected_text, str) or not corrected_text:
         return corrected_text, False
+
+    protected_spans = _collect_explicit_casing_edit_spans(corrected_text, ct_casing_edits)
 
     chars = list(corrected_text)
     changed = False
     index = 0
 
     while index < len(chars):
-        if chars[index] not in _SENTENCE_END_PUNCTUATION:
+        if not _is_sentence_boundary_punctuation_at(corrected_text, index):
             index += 1
             continue
 
@@ -814,6 +821,10 @@ def preserve_sentence_start_casing(corrected_text: str) -> tuple[str, bool]:
 
         current = chars[cursor]
         if not _is_unicode_cased_letter(current):
+            index = cursor + 1
+            continue
+
+        if any(start <= cursor < end for start, end in protected_spans):
             index = cursor + 1
             continue
 
@@ -843,122 +854,6 @@ def _build_text_edits(before_text: str, after_text: str) -> list[list[str]]:
             continue
         edits.append([before_text[i1:i2], after_text[j1:j2]])
     return edits
-
-
-def _sync_step_output(
-    payload: dict,
-    step_key: str,
-    target_result: str,
-    append_generated_edits: bool,
-) -> None:
-    if not isinstance(payload, dict) or not isinstance(target_result, str):
-        return
-
-    step_value = payload.get(step_key)
-    if not isinstance(step_value, dict):
-        step_value = {"edits": [], "result": ""}
-        payload[step_key] = step_value
-
-    edits_value = step_value.get("edits")
-    if not isinstance(edits_value, list):
-        edits_value = []
-
-    normalized_existing_edits: list[list[str]] = []
-    for item in edits_value:
-        if (
-            isinstance(item, list)
-            and len(item) == 2
-            and isinstance(item[0], str)
-            and isinstance(item[1], str)
-        ):
-            normalized_existing_edits.append(item)
-
-    previous_result = step_value.get("result")
-    if not isinstance(previous_result, str):
-        previous_result = ""
-
-    if append_generated_edits and previous_result != target_result:
-        normalized_existing_edits.extend(_build_text_edits(previous_result, target_result))
-
-    step_value["edits"] = normalized_existing_edits
-    step_value["result"] = target_result
-
-
-def _repair_casing_step_edits(payload: dict) -> None:
-    if not isinstance(payload, dict):
-        return
-
-    casing_step = payload.get("ct_casing")
-    punct_step = payload.get("ct_punct")
-    if not isinstance(casing_step, dict) or not isinstance(punct_step, dict):
-        return
-
-    casing_result = casing_step.get("result")
-    punct_result = punct_step.get("result")
-    if not isinstance(casing_result, str) or not isinstance(punct_result, str):
-        return
-
-    edits_value = casing_step.get("edits")
-    if not isinstance(edits_value, list):
-        edits_value = []
-
-    normalized_edits: list[list[str]] = []
-    for item in edits_value:
-        if (
-            isinstance(item, list)
-            and len(item) == 2
-            and isinstance(item[0], str)
-            and isinstance(item[1], str)
-        ):
-            normalized_edits.append(item)
-
-    rebuilt_text, _ = _apply_edits_left_to_right(punct_result, normalized_edits)
-    if rebuilt_text == casing_result:
-        casing_step["edits"] = normalized_edits
-        return
-
-    # Rebuild edits deterministically when model-provided casing patches are stale/invalid.
-    casing_step["edits"] = _build_text_edits(punct_result, casing_result)
-
-
-def _apply_edits_left_to_right(base_text: str, edits: list[object]) -> tuple[str, bool]:
-    if not isinstance(base_text, str):
-        return "", False
-    if not isinstance(edits, list):
-        return base_text, False
-
-    text = base_text
-    changed = False
-    search_start = 0
-
-    for item in edits:
-        if (
-            not isinstance(item, list)
-            or len(item) != 2
-            or not isinstance(item[0], str)
-            or not isinstance(item[1], str)
-        ):
-            continue
-
-        before, after = item
-        if before == after:
-            continue
-
-        # Empty-before insertions are ambiguous without offsets; skip deterministically.
-        if before == "":
-            continue
-
-        index = text.find(before, search_start)
-        if index == -1:
-            index = text.find(before)
-        if index == -1:
-            continue
-
-        text = text[:index] + after + text[index + len(before):]
-        search_start = index + len(after)
-        changed = True
-
-    return text, changed
 
 
 def _materialize_corrected_text(payload: dict) -> dict:
@@ -1245,9 +1140,6 @@ def parse_validate_and_apply_text_fixes(
     ) and isinstance(payload, dict):
         payload["corrected_text"] = corrected_text
 
-    if isinstance(payload, dict):
-        _repair_casing_step_edits(payload)
-
     hallucination_ok, hallucination_error = validate_corrected_text_hallucination(
         corrected_text,
         source_text,
@@ -1256,26 +1148,6 @@ def parse_validate_and_apply_text_fixes(
         return None, _mark_non_repairable_validation_error(
             f"Hallucination check failed: {hallucination_error}"
         ), content
-
-    punctuation_ok, punctuation_error = validate_terminal_punctuation_preserved(
-        corrected_text,
-        source_text,
-    )
-    if not punctuation_ok:
-        print(
-            "⚠️⚠️⚠️ WARNING [PUNCTUATION_VALIDATION]: "
-            f"[{processing_id}] {punctuation_error}"
-        )
-
-    casing_ok, casing_error = validate_first_token_casing_preserved(
-        corrected_text,
-        source_text,
-    )
-    if not casing_ok:
-        print(
-            "⚠️⚠️⚠️ WARNING [CASING_VALIDATION]: "
-            f"[{processing_id}] {casing_error}"
-        )
 
     return payload, None, content
 
