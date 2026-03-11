@@ -593,11 +593,108 @@ def _leading_cased_word_span(text: str) -> tuple[str, int, int] | None:
     return token, start, end
 
 
+def _cased_word_span_at(text: str, start: int) -> tuple[str, int, int] | None:
+    if not isinstance(text, str):
+        return None
+    if not isinstance(start, int) or start < 0 or start >= len(text):
+        return None
+    if not _is_unicode_cased_letter(text[start]):
+        return None
+
+    index = start + 1
+    while index < len(text):
+        char = text[index]
+        if _is_unicode_cased_letter(char):
+            index += 1
+            continue
+
+        if _is_inner_word_connector(char):
+            has_prev = index - 1 >= start and _is_unicode_cased_letter(text[index - 1])
+            has_next = index + 1 < len(text) and _is_unicode_cased_letter(text[index + 1])
+            if has_prev and has_next:
+                index += 1
+                continue
+
+        break
+
+    return text[start:index], start, index
+
+
 def _has_case_distinction(token: str) -> bool:
     if not isinstance(token, str):
         return False
     has_letter = any(char.isalpha() for char in token)
     return has_letter and token.lower() != token.upper()
+
+
+def _is_first_token_in_no_touch_entities(
+    source_token: str,
+    corrected_token: str,
+    no_touch_tokens: object,
+) -> bool:
+    if not isinstance(no_touch_tokens, list):
+        return False
+
+    token_candidates = [token for token in (source_token, corrected_token) if isinstance(token, str) and token]
+    if not token_candidates:
+        return False
+
+    for entity_span in no_touch_tokens:
+        if not isinstance(entity_span, str):
+            continue
+        span = entity_span.strip()
+        if not span:
+            continue
+
+        for token in token_candidates:
+            if span.casefold() == token.casefold():
+                return True
+
+            # Also treat multi-token protected spans that start with this first token as protected.
+            if re.match(rf"^{re.escape(token)}(?:\b|\s|$)", span, flags=re.IGNORECASE):
+                return True
+
+    return False
+
+
+def is_all_uppercase_cased_input(text: str) -> bool:
+    if not isinstance(text, str):
+        return False
+
+    stripped = text.strip()
+    if not stripped:
+        return False
+
+    cased_letter_count = 0
+    uppercase_cased_letter_count = 0
+    for char in stripped:
+        if not _is_unicode_cased_letter(char):
+            continue
+        cased_letter_count += 1
+        if char == char.upper() and char != char.lower():
+            uppercase_cased_letter_count += 1
+
+    return cased_letter_count > 0 and uppercase_cased_letter_count == cased_letter_count
+
+
+def is_all_lowercase_cased_input(text: str) -> bool:
+    if not isinstance(text, str):
+        return False
+
+    stripped = text.strip()
+    if not stripped:
+        return False
+
+    cased_letter_count = 0
+    lowercase_cased_letter_count = 0
+    for char in stripped:
+        if not _is_unicode_cased_letter(char):
+            continue
+        cased_letter_count += 1
+        if char == char.lower() and char != char.upper():
+            lowercase_cased_letter_count += 1
+
+    return cased_letter_count > 0 and lowercase_cased_letter_count == cased_letter_count
 
 
 def _terminal_punctuation_char(text: str) -> str:
@@ -651,18 +748,28 @@ def preserve_terminal_punctuation(corrected_text: str, source_text: str) -> tupl
     return replacement + corrected_trailing, True
 
 
-def preserve_first_token_casing(corrected_text: str, source_text: str) -> tuple[str, bool]:
+def preserve_first_token_casing(
+    corrected_text: str,
+    source_text: str,
+    no_touch_tokens: object = None,
+) -> tuple[str, bool]:
     if not isinstance(corrected_text, str) or not isinstance(source_text, str):
         return corrected_text, False
 
     source_span = _leading_cased_word_span(source_text)
-    corrected_span = _leading_cased_word_span(corrected_text)
-    if source_span is None or corrected_span is None:
+    if source_span is None:
         return corrected_text, False
 
-    source_token, _, _ = source_span
+    source_token, source_start, _ = source_span
+    corrected_span = _cased_word_span_at(corrected_text, source_start)
+    if corrected_span is None:
+        return corrected_text, False
+
     corrected_token, corrected_start, corrected_end = corrected_span
     if source_token == corrected_token:
+        return corrected_text, False
+
+    if _is_first_token_in_no_touch_entities(source_token, corrected_token, no_touch_tokens):
         return corrected_text, False
 
     if (
@@ -673,6 +780,52 @@ def preserve_first_token_casing(corrected_text: str, source_text: str) -> tuple[
         return corrected_text[:corrected_start] + source_token + corrected_text[corrected_end:], True
 
     return corrected_text, False
+
+
+def validate_terminal_punctuation_preserved(
+    corrected_text: str,
+    source_text: str,
+) -> tuple[bool, str]:
+    if not isinstance(corrected_text, str) or not isinstance(source_text, str):
+        return True, ""
+
+    source_terminal = _terminal_punctuation_char(source_text)
+    corrected_terminal = _terminal_punctuation_char(corrected_text)
+    if source_terminal == corrected_terminal:
+        return True, ""
+
+    return (
+        False,
+        "terminal punctuation changed "
+        f"(source='{source_terminal or '<none>'}', corrected='{corrected_terminal or '<none>'}')",
+    )
+
+
+def validate_first_token_casing_preserved(
+    corrected_text: str,
+    source_text: str,
+) -> tuple[bool, str]:
+    if not isinstance(corrected_text, str) or not isinstance(source_text, str):
+        return True, ""
+
+    source_span = _leading_cased_word_span(source_text)
+    corrected_span = _leading_cased_word_span(corrected_text)
+    if source_span is None or corrected_span is None:
+        return True, ""
+
+    source_token, _, _ = source_span
+    corrected_token, _, _ = corrected_span
+    if source_token == corrected_token:
+        return True, ""
+
+    if (
+        _has_case_distinction(source_token)
+        and _has_case_distinction(corrected_token)
+        and source_token.casefold() == corrected_token.casefold()
+    ):
+        return False, f"first token casing changed (source='{source_token}', corrected='{corrected_token}')"
+
+    return True, ""
 
 
 def _normalize_string_edits(edits: object) -> list[list[str]]:
@@ -791,6 +944,7 @@ def _is_sentence_boundary_punctuation_at(text: str, index: int) -> bool:
 def preserve_sentence_start_casing(
     corrected_text: str,
     ct_casing_edits: object = None,
+    no_touch_tokens: object = None,
 ) -> tuple[str, bool]:
     """Uppercase cased sentence starts after sentence-ending punctuation unless explicitly edited in ct_casing.edits."""
     if not isinstance(corrected_text, str) or not corrected_text:
@@ -819,18 +973,25 @@ def preserve_sentence_start_casing(
         if cursor >= len(chars):
             break
 
-        current = chars[cursor]
-        if not _is_unicode_cased_letter(current):
+        token_span = _cased_word_span_at(corrected_text, cursor)
+        if token_span is None:
             index = cursor + 1
             continue
+
+        current_token, token_start, _token_end = token_span
+        current = chars[token_start]
 
         if any(start <= cursor < end for start, end in protected_spans):
             index = cursor + 1
             continue
 
+        if _is_first_token_in_no_touch_entities(current_token, current_token, no_touch_tokens):
+            index = cursor + 1
+            continue
+
         upper = current.upper()
         if isinstance(upper, str) and len(upper) == 1 and upper != current:
-            chars[cursor] = upper
+            chars[token_start] = upper
             changed = True
 
         index = cursor + 1
@@ -1098,6 +1259,7 @@ def parse_validate_and_apply_text_fixes(
     raw_content: str,
     source_text: str,
     processing_id: str,
+    skip_first_token_casing_preservation: bool = False,
 ) -> tuple[dict | None, str | None, str]:
     content = raw_content.strip()
     if not content:
@@ -1109,10 +1271,12 @@ def parse_validate_and_apply_text_fixes(
 
     corrected_text = ""
     ct_casing_edits = None
+    no_touch_tokens = None
     if isinstance(payload, dict):
         ct_casing = payload.get("ct_casing")
         ct_casing_result = ct_casing.get("result") if isinstance(ct_casing, dict) else None
         ct_casing_edits = ct_casing.get("edits") if isinstance(ct_casing, dict) else None
+        no_touch_tokens = payload.get("no_touch_tokens")
         if isinstance(ct_casing_result, str):
             corrected_text = ct_casing_result
         else:
@@ -1120,10 +1284,13 @@ def parse_validate_and_apply_text_fixes(
             corrected_text = existing_corrected_text if isinstance(existing_corrected_text, str) else ""
         payload["corrected_text"] = corrected_text
 
-    corrected_text, casing_normalized = preserve_first_token_casing(
-        corrected_text,
-        source_text,
-    )
+    casing_normalized = False
+    if not skip_first_token_casing_preservation:
+        corrected_text, casing_normalized = preserve_first_token_casing(
+            corrected_text,
+            source_text,
+            no_touch_tokens,
+        )
     corrected_text, punctuation_normalized = preserve_terminal_punctuation(
         corrected_text,
         source_text,
@@ -1131,6 +1298,7 @@ def parse_validate_and_apply_text_fixes(
     corrected_text, sentence_casing_normalized = preserve_sentence_start_casing(
         corrected_text,
         ct_casing_edits,
+        no_touch_tokens,
     )
 
     if (
@@ -1378,6 +1546,45 @@ def parse_transcriptions_from_file(input_path: Path) -> list[str]:
 
 def is_input_comment_line(transcription: str) -> bool:
     return isinstance(transcription, str) and transcription.lstrip().startswith("#")
+
+
+def normalize_all_uppercase_input(transcription: str) -> tuple[str, bool]:
+    """Convert all-uppercase sentence-like input to lowercase before prompting."""
+    if not isinstance(transcription, str):
+        return transcription, False
+
+    stripped = transcription.strip()
+    if not stripped:
+        return transcription, False
+
+    cased_letter_count = 0
+    uppercase_cased_letter_count = 0
+    for char in stripped:
+        if not _is_unicode_cased_letter(char):
+            continue
+        cased_letter_count += 1
+        if char == char.upper() and char != char.lower():
+            uppercase_cased_letter_count += 1
+
+    if cased_letter_count == 0:
+        return transcription, False
+    if uppercase_cased_letter_count != cased_letter_count:
+        return transcription, False
+
+    lowered = transcription.lower()
+    # Some locale-sensitive mappings (for example Turkish dotted I) expand to multiple code points.
+    # Skip normalization in these cases to avoid introducing display artifacts.
+    if len(lowered) != len(transcription):
+        return transcription, False
+
+    # Avoid rewriting short acronym-like single-token inputs such as "NASA".
+    # Expect prompt to convert it back
+    # cased_word_matches = re.findall(r"[^\W\d_]+", stripped, flags=re.UNICODE)
+    # cased_word_count = sum(1 for token in cased_word_matches if _has_case_distinction(token))
+    # if cased_word_count < 2 and cased_letter_count < 10:
+    #     return transcription, False
+
+    return lowered, True
 
 
 def collect_transcriptions_from_input(input_file_value: str | None) -> list[str] | None:

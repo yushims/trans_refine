@@ -115,6 +115,7 @@ async def get_patch_payload_with_repair(
     empty_result_retries: int,
     retry_temperature_jitter: float,
     retry_top_p_jitter: float,
+    skip_first_token_casing_preservation: bool = False,
 ) -> dict | None:
     for empty_attempt in range(empty_result_retries + 1):
         attempt_temperature = temperature
@@ -153,6 +154,7 @@ async def get_patch_payload_with_repair(
             content,
             transcription,
             processing_id,
+            skip_first_token_casing_preservation=skip_first_token_casing_preservation,
         )
 
         if payload is None:
@@ -206,6 +208,7 @@ async def get_patch_payload_with_repair(
                 repaired_content,
                 transcription,
                 processing_id,
+                skip_first_token_casing_preservation=skip_first_token_casing_preservation,
             )
             if payload is None:
                 should_retry = handle_invalid_repair_json_result(

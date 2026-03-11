@@ -9,6 +9,9 @@ from common import (
     build_empty_payload,
     collect_transcriptions_from_input,
     finalize_payloads_and_write,
+    is_all_lowercase_cased_input,
+    is_all_uppercase_cased_input,
+    normalize_all_uppercase_input,
     is_input_comment_line,
     load_patch_and_repair_templates,
     print_common_runtime_settings,
@@ -128,9 +131,18 @@ async def main():
                 )
                 return
 
+            prompt_transcription, case_normalized = normalize_all_uppercase_input(
+                transcription,
+            )
+            source_was_all_uppercase = is_all_uppercase_cased_input(transcription)
+            source_was_all_lowercase = is_all_lowercase_cased_input(transcription)
+            skip_first_token_casing_preservation = source_was_all_uppercase or source_was_all_lowercase
+            if case_normalized:
+                print(f"[{processing_id}] Normalized all-uppercase input to display casing before prompt.")
+
             prompt = build_patch_prompt(
                 prompt_template,
-                transcription,
+                prompt_transcription,
                 chain_steps,
             )
             try:
@@ -142,7 +154,7 @@ async def main():
                 payload = await get_copilot_patch_payload_with_repair(
                     create_session,
                     prompt,
-                    transcription,
+                    prompt_transcription,
                     processing_id,
                     requested_model,
                     repair_prompt_template,
@@ -150,6 +162,7 @@ async def main():
                     timeout_retries,
                     empty_result_retries,
                     model_mismatch_retries,
+                    skip_first_token_casing_preservation,
                 )
 
                 assign_payload_or_emit_empty(payload, payloads, slot, index, total)

@@ -260,6 +260,7 @@ async def _get_copilot_patch_payload_with_repair_on_session(
     timeout_seconds: float,
     timeout_retries: int,
     empty_result_retries: int,
+    skip_first_token_casing_preservation: bool = False,
 ) -> dict | None:
     patch_target_schema = json.dumps(
         build_patch_payload_schema(),
@@ -292,6 +293,7 @@ async def _get_copilot_patch_payload_with_repair_on_session(
             content,
             transcription,
             processing_id,
+            skip_first_token_casing_preservation=skip_first_token_casing_preservation,
         )
 
         if payload is None:
@@ -353,6 +355,7 @@ async def _get_copilot_patch_payload_with_repair_on_session(
                 repaired_content,
                 transcription,
                 processing_id,
+                skip_first_token_casing_preservation=skip_first_token_casing_preservation,
             )
             if payload is None:
                 should_retry = handle_invalid_repair_json_result(
@@ -389,6 +392,7 @@ async def get_copilot_patch_payload_with_repair(
     timeout_retries: int,
     empty_result_retries: int,
     model_mismatch_retries: int,
+    skip_first_token_casing_preservation: bool = False,
 ) -> dict | None:
     for mismatch_attempt in range(model_mismatch_retries + 1):
         session = await create_session()
@@ -403,6 +407,7 @@ async def get_copilot_patch_payload_with_repair(
                 timeout_seconds,
                 timeout_retries,
                 empty_result_retries,
+                skip_first_token_casing_preservation,
             )
         except ModelMismatchError as mismatch_error:
             should_retry = await handle_copilot_model_mismatch_retry(
