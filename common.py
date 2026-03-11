@@ -176,18 +176,94 @@ _DOT_ABBREVIATION_COMPOUND_PATTERN = re.compile(
     r"\b(?:e\.g|i\.e|a\.k\.a|u\.s|u\.k)\.$",
     flags=re.IGNORECASE,
 )
-# Include scripts where ASR whitespace is commonly a segmentation artifact.
-_CHAR_BASED_SCRIPT_CHAR_CLASS = (
-    "\u3400-\u4dbf\u4e00-\u9fff"  # CJK Unified Ideographs + Extension A
-    "\u3040-\u30ff\uac00-\ud7af"  # Kana + Hangul
-    "\u0e00-\u0e7f\u0e80-\u0eff"  # Thai + Lao
-    "\u1780-\u17ff"                # Khmer
-    "\u1000-\u109f\uaa60-\uaa7f\ua9e0-\ua9ff"  # Myanmar + Extended-A/B
-)
-_CHAR_BASED_INTER_CHAR_SPACE_PATTERN = re.compile(
-    rf"(?<=[{_CHAR_BASED_SCRIPT_CHAR_CLASS}])\s+(?=[{_CHAR_BASED_SCRIPT_CHAR_CLASS}])",
-    flags=re.UNICODE,
-)
+
+
+def _is_hangul_char(char: str) -> bool:
+    if not isinstance(char, str) or len(char) != 1:
+        return False
+    codepoint = ord(char)
+    return 0xAC00 <= codepoint <= 0xD7AF
+
+
+def _is_kana_char(char: str) -> bool:
+    if not isinstance(char, str) or len(char) != 1:
+        return False
+    codepoint = ord(char)
+    return (
+        0x3040 <= codepoint <= 0x30FF
+        or 0x31F0 <= codepoint <= 0x31FF
+        or 0xFF66 <= codepoint <= 0xFF9D
+        or 0x1B000 <= codepoint <= 0x1B16F
+    )
+
+
+def _is_han_char(char: str) -> bool:
+    if not isinstance(char, str) or len(char) != 1:
+        return False
+    codepoint = ord(char)
+    return (
+        (0x3400 <= codepoint <= 0x4DBF)
+        or (0x4E00 <= codepoint <= 0x9FFF)
+        or (0xF900 <= codepoint <= 0xFAFF)
+        or (0x20000 <= codepoint <= 0x2A6DF)
+        or (0x2A700 <= codepoint <= 0x2B73F)
+        or (0x2B740 <= codepoint <= 0x2B81F)
+        or (0x2B820 <= codepoint <= 0x2CEAF)
+        or (0x2CEB0 <= codepoint <= 0x2EBEF)
+        or (0x30000 <= codepoint <= 0x3134F)
+        or (0x2F800 <= codepoint <= 0x2FA1F)
+    )
+
+
+def _is_thai_char(char: str) -> bool:
+    if not isinstance(char, str) or len(char) != 1:
+        return False
+    codepoint = ord(char)
+    return 0x0E00 <= codepoint <= 0x0E7F
+
+
+def _is_lao_char(char: str) -> bool:
+    if not isinstance(char, str) or len(char) != 1:
+        return False
+    codepoint = ord(char)
+    return 0x0E80 <= codepoint <= 0x0EFF
+
+
+def _is_khmer_char(char: str) -> bool:
+    if not isinstance(char, str) or len(char) != 1:
+        return False
+    codepoint = ord(char)
+    return 0x1780 <= codepoint <= 0x17FF
+
+
+def _is_myanmar_char(char: str) -> bool:
+    if not isinstance(char, str) or len(char) != 1:
+        return False
+    codepoint = ord(char)
+    return (
+        (0x1000 <= codepoint <= 0x109F)
+        or (0xAA60 <= codepoint <= 0xAA7F)
+        or (0xA9E0 <= codepoint <= 0xA9FF)
+    )
+
+
+def _char_based_script_group(char: str) -> str | None:
+    # Group name is used to ensure spacing cleanup is same-script only.
+    if _is_han_char(char):
+        return "han"
+    if _is_kana_char(char):
+        return "kana"
+    if _is_hangul_char(char):
+        return "hangul"
+    if _is_thai_char(char):
+        return "thai"
+    if _is_lao_char(char):
+        return "lao"
+    if _is_khmer_char(char):
+        return "khmer"
+    if _is_myanmar_char(char):
+        return "myanmar"
+    return None
 
 
 def _is_inner_word_connector(char: str) -> bool:
@@ -377,40 +453,11 @@ def _is_punct_token(token: str) -> bool:
 
 
 def _is_cjk_char(char: str) -> bool:
-    if not isinstance(char, str) or len(char) != 1:
-        return False
-    codepoint = ord(char)
-    return (
-        0x3400 <= codepoint <= 0x4DBF
-        or 0x4E00 <= codepoint <= 0x9FFF
-        or 0x3040 <= codepoint <= 0x30FF
-        or 0xAC00 <= codepoint <= 0xD7AF
-    )
+    return _is_han_char(char) or _is_kana_char(char) or _is_hangul_char(char)
 
 
 def _is_cjk_token(token: str) -> bool:
     return bool(token) and all(_is_cjk_char(char) for char in token)
-
-
-def _is_hangul_char(char: str) -> bool:
-    if not isinstance(char, str) or len(char) != 1:
-        return False
-    codepoint = ord(char)
-    return 0xAC00 <= codepoint <= 0xD7AF
-
-
-def _is_kana_char(char: str) -> bool:
-    if not isinstance(char, str) or len(char) != 1:
-        return False
-    codepoint = ord(char)
-    return 0x3040 <= codepoint <= 0x30FF
-
-
-def _is_han_char(char: str) -> bool:
-    if not isinstance(char, str) or len(char) != 1:
-        return False
-    codepoint = ord(char)
-    return (0x3400 <= codepoint <= 0x4DBF) or (0x4E00 <= codepoint <= 0x9FFF)
 
 
 def _is_non_latin_letter(char: str) -> bool:
@@ -486,6 +533,18 @@ def _tokenize_for_hallucination(text: str) -> list[str]:
         if _is_hangul_char(char):
             next_index = index + 1
             while next_index < length and _is_hangul_char(text[next_index]):
+                next_index += 1
+            tokens.append(text[index:next_index])
+            index = next_index
+            continue
+
+        script_group = _char_based_script_group(char)
+        if script_group in {"thai", "lao", "khmer", "myanmar"}:
+            next_index = index + 1
+            while (
+                next_index < length
+                and _char_based_script_group(text[next_index]) == script_group
+            ):
                 next_index += 1
             tokens.append(text[index:next_index])
             index = next_index
@@ -1561,12 +1620,41 @@ def is_input_comment_line(transcription: str) -> bool:
 
 
 def normalize_char_based_spacing_input(transcription: str) -> tuple[str, bool]:
-    """Remove spacing artifacts between configured char-based scripts while keeping multilingual spacing intact."""
+    """Remove spacing artifacts for same-script char-based languages while preserving mixed-script boundaries."""
     if not isinstance(transcription, str) or not transcription:
         return transcription, False
 
-    normalized = _CHAR_BASED_INTER_CHAR_SPACE_PATTERN.sub("", transcription)
-    return normalized, normalized != transcription
+    normalized_parts: list[str] = []
+    index = 0
+    changed = False
+    length = len(transcription)
+
+    while index < length:
+        char = transcription[index]
+        if not char.isspace():
+            normalized_parts.append(char)
+            index += 1
+            continue
+
+        run_start = index
+        while index < length and transcription[index].isspace():
+            index += 1
+
+        prev_char = normalized_parts[-1] if normalized_parts else ""
+        next_char = transcription[index] if index < length else ""
+        prev_group = _char_based_script_group(prev_char)
+        next_group = _char_based_script_group(next_char)
+
+        if prev_group is not None and prev_group == next_group:
+            changed = True
+            continue
+
+        normalized_parts.append(transcription[run_start:index])
+
+    if not changed:
+        return transcription, False
+
+    return "".join(normalized_parts), True
 
 
 def normalize_all_uppercase_input(transcription: str) -> tuple[str, bool]:
