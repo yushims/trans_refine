@@ -119,7 +119,7 @@ Rules:
 - If a casing/boundary error has already been fixed by PUNCT, do NOT revert that fix in CASING.
 - Without a sentence boundary, do NOT introduce mid-sentence capitalization except for proper nouns/entities.
 - For proper nouns/entities, follow their conventional writing style or use `translation` as a casing reference when casing is ambiguous.
-- Do NOT change the casing of the first token of the line.
+# - Do NOT change the casing of the first token of the line.
 - Do NOT add/remove/move punctuation in this step; only change letter case.
 
 CHAIN ORDER (within PHASE 2, execute in this exact order):
