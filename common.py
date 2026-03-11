@@ -176,6 +176,18 @@ _DOT_ABBREVIATION_COMPOUND_PATTERN = re.compile(
     r"\b(?:e\.g|i\.e|a\.k\.a|u\.s|u\.k)\.$",
     flags=re.IGNORECASE,
 )
+# Include scripts where ASR whitespace is commonly a segmentation artifact.
+_CHAR_BASED_SCRIPT_CHAR_CLASS = (
+    "\u3400-\u4dbf\u4e00-\u9fff"  # CJK Unified Ideographs + Extension A
+    "\u3040-\u30ff\uac00-\ud7af"  # Kana + Hangul
+    "\u0e00-\u0e7f\u0e80-\u0eff"  # Thai + Lao
+    "\u1780-\u17ff"                # Khmer
+    "\u1000-\u109f\uaa60-\uaa7f\ua9e0-\ua9ff"  # Myanmar + Extended-A/B
+)
+_CHAR_BASED_INTER_CHAR_SPACE_PATTERN = re.compile(
+    rf"(?<=[{_CHAR_BASED_SCRIPT_CHAR_CLASS}])\s+(?=[{_CHAR_BASED_SCRIPT_CHAR_CLASS}])",
+    flags=re.UNICODE,
+)
 
 
 def _is_inner_word_connector(char: str) -> bool:
@@ -1546,6 +1558,15 @@ def parse_transcriptions_from_file(input_path: Path) -> list[str]:
 
 def is_input_comment_line(transcription: str) -> bool:
     return isinstance(transcription, str) and transcription.lstrip().startswith("#")
+
+
+def normalize_char_based_spacing_input(transcription: str) -> tuple[str, bool]:
+    """Remove spacing artifacts between configured char-based scripts while keeping multilingual spacing intact."""
+    if not isinstance(transcription, str) or not transcription:
+        return transcription, False
+
+    normalized = _CHAR_BASED_INTER_CHAR_SPACE_PATTERN.sub("", transcription)
+    return normalized, normalized != transcription
 
 
 def normalize_all_uppercase_input(transcription: str) -> tuple[str, bool]:
