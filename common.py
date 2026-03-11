@@ -621,6 +621,22 @@ def validate_corrected_text_hallucination(corrected_text: str, source_text: str)
             f"examples={', '.join(unique)}"
         )
 
+    source_token_count = len(source_tokens)
+    corrected_token_count = len(corrected_tokens)
+    if source_token_count > 0:
+        estimated_deleted_tokens = max(0, source_token_count - corrected_token_count)
+        large_deletion_threshold = max(4, math.ceil(source_token_count * 0.35))
+        retained_ratio = corrected_token_count / source_token_count
+
+        # Flag only significant shrinkage to avoid penalizing small local cleanup.
+        if estimated_deleted_tokens >= large_deletion_threshold and retained_ratio < 0.60:
+            return False, (
+                "corrected_text appears to delete too much source content: "
+                f"source_tokens={source_token_count}, corrected_tokens={corrected_token_count}, "
+                f"deleted={estimated_deleted_tokens}, threshold={large_deletion_threshold}, "
+                f"retained_ratio={retained_ratio:.3f}"
+            )
+
     return True, ""
 
 
