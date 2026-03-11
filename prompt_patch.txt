@@ -108,15 +108,17 @@ Rules:
 - Use language-appropriate sentence-end marks; prefer neutral declarative punctuation.
 - Use locked aggressiveness_level from AGGRESSIVENESS_LEVEL to choose punctuation aggressiveness (conservative/balanced/aggressive), while still following clear boundaries/clauses.
 - When punctuation is needed to prevent run-ons, decide left-to-right and insert sentence-ending punctuation at the earliest clear boundary; do not delay to later ambiguous points.
+- Add missing sentence-ending punctuation before sentence-start capitalization.
 - Do NOT change/add/remove punctuation at the end of the line.
 - Do NOT insert punctuation adjacent to existing punctuation if it would create redundant/stacked marks.
 
 [CASING]
-Purpose: Fix capitalization only.
+Purpose: Fix wrongly cased tokens.
 Rules:
-- Sentence-ending punctuation requires following sentence-start capitalization.
-- Sentence-start capitalization requires preceding sentence-ending punctuation.
-- If a casing/boundary error has already been fixed by PUNCT, do NOT revert that fix in CASING.
+- Capitalize sentence starts that are currently lowercased after sentence-ending punctuation.
+# - Sentence-ending punctuation requires following sentence-start capitalization.
+# - Sentence-start capitalization requires preceding sentence-ending punctuation.
+# - If a casing/boundary error has already been fixed by PUNCT, do NOT revert that fix in CASING.
 - Without a sentence boundary, do NOT introduce mid-sentence capitalization except for proper nouns/entities.
 - For proper nouns/entities, follow their conventional writing style or use `translation` as a casing reference when casing is ambiguous.
 # - Do NOT change the casing of the first token of the line.

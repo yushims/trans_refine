@@ -1027,11 +1027,9 @@ def preserve_sentence_start_casing(
     ct_casing_edits: object = None,
     no_touch_tokens: object = None,
 ) -> tuple[str, bool]:
-    """Uppercase cased sentence starts after sentence-ending punctuation unless explicitly edited in ct_casing.edits."""
+    """Uppercase cased sentence starts after sentence-ending punctuation."""
     if not isinstance(corrected_text, str) or not corrected_text:
         return corrected_text, False
-
-    protected_spans = _collect_explicit_casing_edit_spans(corrected_text, ct_casing_edits)
 
     chars = list(corrected_text)
     changed = False
@@ -1061,10 +1059,6 @@ def preserve_sentence_start_casing(
 
         current_token, token_start, _token_end = token_span
         current = chars[token_start]
-
-        if any(start <= cursor < end for start, end in protected_spans):
-            index = cursor + 1
-            continue
 
         if _is_first_token_in_no_touch_entities(current_token, current_token, no_touch_tokens):
             index = cursor + 1
