@@ -778,8 +778,18 @@ def _terminal_punctuation_char(text: str) -> str:
     return tail if unicodedata.category(tail).startswith("P") else ""
 
 
+def _contains_any_punctuation(text: str) -> bool:
+    if not isinstance(text, str) or not text:
+        return False
+    return any(unicodedata.category(char).startswith("P") for char in text)
+
+
 def preserve_terminal_punctuation(corrected_text: str, source_text: str) -> tuple[str, bool]:
     if not isinstance(corrected_text, str) or not isinstance(source_text, str):
+        return corrected_text, False
+
+    # Do not force terminal punctuation parity for punctuation-free inputs.
+    if not _contains_any_punctuation(source_text):
         return corrected_text, False
 
     source_trimmed = source_text.rstrip()
