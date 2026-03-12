@@ -1686,12 +1686,14 @@ def parse_validate_and_apply_text_fixes(
         payload["corrected_text"] = corrected_text
 
     casing_normalized = False
+    spacing_normalized = False
     if not skip_first_token_casing_preservation:
         corrected_text, casing_normalized = preserve_first_token_casing(
             corrected_text,
             source_text,
             no_touch_tokens,
         )
+    corrected_text, spacing_normalized = normalize_char_based_spacing_input(corrected_text)
     corrected_text, punctuation_normalized = preserve_terminal_punctuation(
         corrected_text,
         source_text,
@@ -1703,6 +1705,7 @@ def parse_validate_and_apply_text_fixes(
 
     if (
         casing_normalized
+        or spacing_normalized
         or punctuation_normalized
         or sentence_casing_normalized
     ) and isinstance(payload, dict):
