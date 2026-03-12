@@ -128,6 +128,7 @@ async def main():
 
             if not transcription.strip():
                 payloads[slot] = build_empty_payload()
+                payloads[slot]["source_text"] = transcription
                 print(
                     f"Input transcription {index}/{total} is empty; "
                     "emitting empty payload."
@@ -172,11 +173,13 @@ async def main():
                 assign_payload_or_emit_empty(payload, payloads, slot, index, total)
                 resolved_payload = payloads[slot]
                 if isinstance(resolved_payload, dict):
+                    resolved_payload["source_text"] = transcription
                     corrected_text = resolved_payload.get("corrected_text")
                     text_output_lines[slot] = corrected_text if isinstance(corrected_text, str) else ""
                 return
             except asyncio.CancelledError:
                 payloads[slot] = build_empty_payload()
+                payloads[slot]["source_text"] = transcription
                 text_output_lines[slot] = ""
                 print(
                     f"Cancelled while processing transcription {index}/{total}; "
@@ -185,6 +188,7 @@ async def main():
                 return
             except Exception as error:
                 payloads[slot] = build_empty_payload()
+                payloads[slot]["source_text"] = transcription
                 text_output_lines[slot] = ""
                 print(
                     f"Unexpected error on transcription {index}/{total}: {error}; "
