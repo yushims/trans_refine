@@ -37,9 +37,12 @@ _REQUIRED_TOP_LEVEL_KEY_ORDER = (
 
 _REQUIRED_TOP_LEVEL_KEYS = set(_REQUIRED_TOP_LEVEL_KEY_ORDER)
 
-_OPTIONAL_TOP_LEVEL_KEYS = {
+_OPTIONAL_TOP_LEVEL_KEY_ORDER = (
+    "source_text",
     "corrected_text",
-}
+)
+
+_OPTIONAL_TOP_LEVEL_KEYS = set(_OPTIONAL_TOP_LEVEL_KEY_ORDER)
 
 
 def _new_empty_step_payload() -> dict:
@@ -1466,6 +1469,10 @@ def validate_patch_payload(payload: dict) -> tuple[bool, str]:
     if not isinstance(payload.get("corrected_text", ""), str):
         return False, "corrected_text must be a string"
 
+    source_text = payload.get("source_text")
+    if source_text is not None and not isinstance(source_text, str):
+        return False, "source_text must be a string"
+
     return True, ""
 
 
@@ -2246,13 +2253,19 @@ def write_output_artifacts(
     def _order_top_level_payload_keys(payload: dict) -> dict:
         ordered_payload: dict = {}
 
+        # Emit source_text first in serialized output when present.
+        if "source_text" in payload:
+            ordered_payload["source_text"] = payload["source_text"]
+
         # Keep canonical required key order for deterministic JSON diffs.
         for key in _REQUIRED_TOP_LEVEL_KEY_ORDER:
             if key in payload:
                 ordered_payload[key] = payload[key]
 
-        # Keep known optional keys next.
-        for key in _OPTIONAL_TOP_LEVEL_KEYS:
+        # Keep known optional keys next (except source_text already emitted first).
+        for key in _OPTIONAL_TOP_LEVEL_KEY_ORDER:
+            if key == "source_text":
+                continue
             if key in payload:
                 ordered_payload[key] = payload[key]
 
