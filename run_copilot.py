@@ -12,7 +12,6 @@ from common import (
     format_resolved_chain_steps,
     is_all_lowercase_cased_input,
     is_all_uppercase_cased_input,
-    normalize_char_based_spacing_input,
     normalize_all_uppercase_input,
     is_input_comment_line,
     load_patch_and_repair_templates,
@@ -135,13 +134,10 @@ async def main():
                 )
                 return
 
-            prompt_transcription, spacing_normalized = normalize_char_based_spacing_input(transcription)
-            prompt_transcription, case_normalized = normalize_all_uppercase_input(prompt_transcription)
+            prompt_transcription, case_normalized = normalize_all_uppercase_input(transcription)
             source_was_all_uppercase = is_all_uppercase_cased_input(transcription)
             source_was_all_lowercase = is_all_lowercase_cased_input(transcription)
             skip_first_token_casing_preservation = source_was_all_uppercase or source_was_all_lowercase
-            # if spacing_normalized:
-            #     print(f"[{processing_id}] Normalized char-based intra-script spacing artifacts before prompt.")
             # if case_normalized:
             #     print(f"[{processing_id}] Normalized all-uppercase input to display casing before prompt.")
 

@@ -129,6 +129,7 @@ Rules:
 - Use locked aggressiveness_level from AGGRESSIVENESS_LEVEL to choose punctuation aggressiveness (conservative/balanced/aggressive), while still following clear boundaries/clauses.
 - When punctuation is needed to prevent run-ons, decide left-to-right and insert sentence-ending punctuation at the earliest clear boundary; do not delay to later ambiguous points.
 - Add missing sentence-ending punctuation before sentence-start capitalization.
+- For character-based languages, replace every inter-character spaces with the correct punctuation, or remove the spaces if that’s better.
 # - Prefer Clause-Linking: Downgrade sentence-ending marks to commas unless there is a significant shift in topic or the current thought is explicitly finalized; avoid "staccato" short sentences.
 - Do NOT insert punctuation adjacent to existing punctuation if it would create redundant/stacked marks.
 
