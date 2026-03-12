@@ -10,6 +10,7 @@ from pathlib import Path
 
 
 _STEP_CHAIN_KEYS = (
+    "ct_speaker",
     "ct_combine",
     "ct_lexical",
     "ct_disfluency",
@@ -23,9 +24,15 @@ _REQUIRED_TOP_LEVEL_KEY_ORDER = (
     "tokenization",
     "translation",
     "aggressiveness_level",
+    "speaker_scope",
+    "ct_speaker",
     "ct_combine",
     "no_touch_tokens",
-    *(step_key for step_key in _STEP_CHAIN_KEYS if step_key != "ct_combine"),
+    *(
+        step_key
+        for step_key in _STEP_CHAIN_KEYS
+        if step_key not in {"ct_speaker", "ct_combine"}
+    ),
 )
 
 _REQUIRED_TOP_LEVEL_KEYS = set(_REQUIRED_TOP_LEVEL_KEY_ORDER)
@@ -79,16 +86,21 @@ def build_patch_payload_schema() -> dict:
             "type": "string",
             "enum": ["low", "medium", "high"],
         },
+        "speaker_scope": {
+            "type": "string",
+            "enum": ["single", "multi", "unknown"],
+        },
     }
 
-    # Keep field order stable for readability/debugging: ct_combine, no_touch_tokens, then remaining steps.
+    # Keep field order stable for readability/debugging: ct_speaker, ct_combine, no_touch_tokens, then remaining steps.
+    properties["ct_speaker"] = _step_field_schema()
     properties["ct_combine"] = _step_field_schema()
     properties["no_touch_tokens"] = {
         "type": "array",
         "items": {"type": "string"},
     }
     for step_key in _STEP_CHAIN_KEYS:
-        if step_key == "ct_combine":
+        if step_key in {"ct_speaker", "ct_combine"}:
             continue
         properties[step_key] = _step_field_schema()
 
@@ -129,6 +141,10 @@ _WORD_CONNECTOR_CHAR_CLASS = re.escape(_WORD_CONNECTOR_CHARS)
 _WORD_CONNECTOR_SET = set(_WORD_CONNECTOR_CHARS)
 _NUMBER_LIKE_PATTERN = re.compile(
     rf"\d+(?:[.,:٫٬]\d+)*(?:%|{_WORD_SEGMENT_PATTERN})?",
+    flags=re.UNICODE,
+)
+_NUMBER_CORE_PATTERN = re.compile(
+    r"\d+(?:[.,:٫٬]\d+)*",
     flags=re.UNICODE,
 )
 _LATIN_WORD_PATTERN = re.compile(
@@ -468,6 +484,24 @@ def _is_non_latin_letter(char: str) -> bool:
     return "LATIN" not in unicodedata.name(char, "")
 
 
+def _is_non_latin_word_char(char: str) -> bool:
+    if not isinstance(char, str) or len(char) != 1:
+        return False
+    if _is_non_latin_letter(char):
+        return True
+    # Keep combining marks attached to the preceding non-Latin base letter.
+    return unicodedata.category(char) in {"Mn", "Mc", "Me"}
+
+
+def _contains_latin_letter(text: str) -> bool:
+    if not isinstance(text, str) or not text:
+        return False
+    for char in text:
+        if char.isalpha() and "LATIN" in unicodedata.name(char, ""):
+            return True
+    return False
+
+
 def _is_hallucinated_token(token: str, source_lexicon_folded: set[str]) -> bool:
     if not isinstance(token, str) or not token.strip():
         return True
@@ -500,6 +534,227 @@ def _is_hallucinated_token(token: str, source_lexicon_folded: set[str]) -> bool:
     return True
 
 
+_COMPACT_SPEAKER_LABEL_PATTERN = re.compile(
+    r"^(?:spk|speaker|spkr)[_-]?\d+$",
+    flags=re.IGNORECASE,
+)
+_FREEFORM_SPEAKER_LABEL_PATTERN = re.compile(
+    r"^[A-Za-z][A-Za-z0-9_-]{0,15}$",
+)
+
+
+def _is_colon_token(token: str) -> bool:
+    return token in {":", "："}
+
+
+def _looks_like_speaker_label_token(token: str) -> bool:
+    if not isinstance(token, str):
+        return False
+
+    stripped = token.strip()
+    if not stripped:
+        return False
+
+    def _is_identifier_char(char: str) -> bool:
+        if char.isalnum() or char in {"_", "-"}:
+            return True
+        return unicodedata.category(char) in {"Mn", "Mc", "Me"}
+
+    if _COMPACT_SPEAKER_LABEL_PATTERN.match(stripped):
+        return True
+
+    if not _FREEFORM_SPEAKER_LABEL_PATTERN.match(stripped):
+        if not all(_is_identifier_char(char) for char in stripped):
+            return False
+
+        has_letter = any(char.isalpha() for char in stripped)
+        has_non_latin_letter = any(
+            char.isalpha() and "LATIN" not in unicodedata.name(char, "")
+            for char in stripped
+        )
+        if has_letter and has_non_latin_letter and len(stripped) <= 12:
+            return True
+
+        # Allow multilingual Latin-with-diacritics speaker names like "José:".
+        has_non_ascii = any(ord(char) > 127 for char in stripped)
+        has_digit = any(char.isdigit() for char in stripped)
+        if has_letter and has_non_ascii and len(stripped) <= 16 and (has_digit or stripped[0].isupper()):
+            return True
+
+        return False
+
+    # Accept speaker-like identifiers such as LWX, S1, USER_2.
+    has_digit = any(char.isdigit() for char in stripped)
+    return stripped.isupper() or has_digit
+
+
+def _is_single_char_letter_token(token: str) -> bool:
+    if not isinstance(token, str) or len(token) != 1:
+        return False
+    category = unicodedata.category(token)
+    return (
+        token.isalpha()
+        or category in {"Mn", "Mc", "Me"}
+    )
+
+
+def _normalize_speaker_label_signature(parts: list[str]) -> tuple[str, ...]:
+    normalized_parts: list[str] = []
+    for part in parts:
+        if not isinstance(part, str):
+            continue
+        stripped = part.strip()
+        if stripped:
+            normalized_parts.append(stripped.casefold())
+    return tuple(normalized_parts)
+
+
+def _match_speaker_label_span(tokens: list[str], index: int) -> tuple[int, tuple[str, ...]] | None:
+    if index < 0 or index >= len(tokens):
+        return None
+
+    token = tokens[index]
+    if not isinstance(token, str):
+        return None
+
+    next_token = tokens[index + 1] if index + 1 < len(tokens) else ""
+    next_next_token = tokens[index + 2] if index + 2 < len(tokens) else ""
+    next_third_token = tokens[index + 3] if index + 3 < len(tokens) else ""
+    next_fourth_token = tokens[index + 4] if index + 4 < len(tokens) else ""
+
+    # Canonical bracketed form: [LABEL]:
+    if (
+        token == "["
+        and isinstance(next_token, str)
+        and next_token
+        and next_next_token == "]"
+        and _is_colon_token(next_third_token)
+        and _looks_like_speaker_label_token(next_token)
+    ):
+        signature = _normalize_speaker_label_signature([next_token])
+        return (index + 4, signature) if signature else None
+
+    # Canonical bracketed split form: [SPK1]: tokenized as [, SPK, 1, ], :
+    folded = token.casefold()
+    if (
+        token == "["
+        and isinstance(next_token, str)
+        and next_token.casefold() in {"speaker", "spk", "spkr"}
+        and isinstance(next_next_token, str)
+        and next_next_token.isdigit()
+        and next_third_token == "]"
+        and _is_colon_token(next_fourth_token)
+    ):
+        signature = _normalize_speaker_label_signature([f"{next_token}{next_next_token}"])
+        return (index + 5, signature) if signature else None
+
+    # Handle freeform labels such as "LWX:".
+    if _is_colon_token(next_token) and _looks_like_speaker_label_token(token):
+        signature = _normalize_speaker_label_signature([token])
+        return (index + 2, signature) if signature else None
+
+    # Handle multilingual labels tokenized into multiple single-char letter tokens,
+    # e.g. "王小明:", "Аня:", "علي:".
+    if _is_single_char_letter_token(token):
+        end = index
+        while end < len(tokens) and _is_single_char_letter_token(tokens[end]) and end - index < 12:
+            end += 1
+        if end > index + 1 and end < len(tokens) and _is_colon_token(tokens[end]):
+            label_text = "".join(tokens[index:end])
+            signature = _normalize_speaker_label_signature([label_text])
+            return (end + 1, signature) if signature else None
+
+    # Handle plain labels tokenized as "speaker" + "1" + ":".
+    if folded in {"speaker", "spk", "spkr"}:
+        if (
+            isinstance(next_token, str)
+            and next_token.isdigit()
+            and _is_colon_token(next_next_token)
+        ):
+            signature = _normalize_speaker_label_signature([f"{token}{next_token}"])
+            return (index + 3, signature) if signature else None
+
+    return None
+
+
+def _collect_and_remove_speaker_labels(tokens: list[str]) -> tuple[list[str], set[tuple[str, ...]]]:
+    filtered: list[str] = []
+    collected_signatures: set[tuple[str, ...]] = set()
+    index = 0
+
+    while index < len(tokens):
+        matched = _match_speaker_label_span(tokens, index)
+        if matched is None:
+            filtered.append(tokens[index])
+            index += 1
+            continue
+
+        end, signature = matched
+        if signature:
+            collected_signatures.add(signature)
+        index = end
+
+    return filtered, collected_signatures
+
+
+def _remove_speaker_labels_by_reference(
+    tokens: list[str],
+    reference_signatures: set[tuple[str, ...]],
+) -> list[str]:
+    if not tokens or not reference_signatures:
+        return tokens
+
+    filtered: list[str] = []
+    index = 0
+
+    while index < len(tokens):
+        matched = _match_speaker_label_span(tokens, index)
+        if matched is None:
+            filtered.append(tokens[index])
+            index += 1
+            continue
+
+        end, signature = matched
+        if signature in reference_signatures:
+            index = end
+            continue
+
+        filtered.append(tokens[index])
+        index += 1
+
+    return filtered
+
+
+def _is_reasonable_number_like_token(token: str) -> bool:
+    if not isinstance(token, str) or not token:
+        return False
+
+    core_match = _NUMBER_CORE_PATTERN.match(token)
+    if core_match is None:
+        return False
+    if core_match.end() == len(token):
+        return True
+
+    suffix = token[core_match.end():]
+    if suffix == "%":
+        return True
+
+    # Keep very short unit-like suffixes (for example 年, 月, kg, ms).
+    letter_count = sum(1 for char in suffix if char.isalpha())
+    if letter_count == 0:
+        return True
+    if letter_count <= 2:
+        return True
+
+    # Allow slightly longer ASCII unit words (for example year, days).
+    ascii_letter_count = sum(1 for char in suffix if char.isascii() and char.isalpha())
+    if ascii_letter_count == letter_count and letter_count <= 4:
+        return True
+
+    # Otherwise treat as over-greedy and fall back to numeric core only.
+    return False
+
+
 def _tokenize_for_hallucination(text: str) -> list[str]:
     tokens: list[str] = []
     index = 0
@@ -521,9 +776,17 @@ def _tokenize_for_hallucination(text: str) -> list[str]:
         number_match = _NUMBER_LIKE_PATTERN.match(text, index)
         if number_match:
             token = number_match.group(0)
-            tokens.append(token)
-            index += len(token)
-            continue
+            if _is_reasonable_number_like_token(token):
+                tokens.append(token)
+                index += len(token)
+                continue
+
+            core_match = _NUMBER_CORE_PATTERN.match(text, index)
+            if core_match:
+                core_token = core_match.group(0)
+                tokens.append(core_token)
+                index += len(core_token)
+                continue
 
         if _is_han_char(char) or _is_kana_char(char):
             tokens.append(char)
@@ -551,7 +814,7 @@ def _tokenize_for_hallucination(text: str) -> list[str]:
             continue
 
         latin_match = _LATIN_WORD_PATTERN.match(text, index)
-        if latin_match:
+        if latin_match and _contains_latin_letter(latin_match.group(0)):
             token = latin_match.group(0)
             tokens.append(token)
             index += len(token)
@@ -565,7 +828,7 @@ def _tokenize_for_hallucination(text: str) -> list[str]:
 
         if _is_non_latin_letter(char):
             next_index = index + 1
-            while next_index < length and _is_non_latin_letter(text[next_index]):
+            while next_index < length and _is_non_latin_word_char(text[next_index]):
                 next_index += 1
             tokens.append(text[index:next_index])
             index = next_index
@@ -587,16 +850,17 @@ def validate_corrected_text_hallucination(corrected_text: str, source_text: str)
     if not source_text.strip():
         return False, ""
 
-    source_tokens = [
-        token
-        for token in _tokenize_for_hallucination(source_text)
-        if token.strip() and not _is_punct_token(token)
-    ]
-    corrected_tokens = [
-        token
-        for token in _tokenize_for_hallucination(corrected_text)
-        if token.strip() and not _is_punct_token(token)
-    ]
+    source_tokens_raw = _tokenize_for_hallucination(source_text)
+    corrected_tokens_raw = _tokenize_for_hallucination(corrected_text)
+
+    corrected_tokens, corrected_speaker_label_signatures = _collect_and_remove_speaker_labels(corrected_tokens_raw)
+    source_tokens = _remove_speaker_labels_by_reference(
+        source_tokens_raw,
+        corrected_speaker_label_signatures,
+    )
+
+    source_tokens = [token for token in source_tokens if token.strip() and not _is_punct_token(token)]
+    corrected_tokens = [token for token in corrected_tokens if token.strip() and not _is_punct_token(token)]
 
     source_lexicon_folded = {token.casefold() for token in source_tokens}
     source_folded_stream = [token.casefold() for token in source_tokens]
@@ -1159,6 +1423,13 @@ def validate_patch_payload(payload: dict) -> tuple[bool, str]:
     if aggressiveness_level not in {"low", "medium", "high"}:
         return False, 'aggressiveness_level must be one of "low", "medium", "high"'
 
+    speaker_scope = payload.get("speaker_scope")
+    if speaker_scope is not None:
+        if not isinstance(speaker_scope, str):
+            return False, 'speaker_scope must be one of "single", "multi", "unknown"'
+        if speaker_scope not in {"single", "multi", "unknown"}:
+            return False, 'speaker_scope must be one of "single", "multi", "unknown"'
+
     no_touch_tokens = payload.get("no_touch_tokens")
     if not isinstance(no_touch_tokens, list) or not all(isinstance(token, str) for token in no_touch_tokens):
         return False, "no_touch_tokens must be an array of strings"
@@ -1416,7 +1687,7 @@ def build_empty_payload() -> dict:
         "tokenization": {"tokens": []},
         "translation": "",
         "aggressiveness_level": "low",
-        "no_touch_tokens": [],
+        "speaker_scope": "unknown",
     }
 
     for step_key in _STEP_CHAIN_KEYS:
@@ -1700,6 +1971,12 @@ def normalize_all_uppercase_input(transcription: str) -> tuple[str, bool]:
     if uppercase_cased_letter_count != cased_letter_count:
         return transcription, False
 
+    # Avoid rewriting inputs that contain only one casable token (for example "NASA").
+    cased_word_matches = re.findall(r"[^\W\d_]+", stripped, flags=re.UNICODE)
+    cased_word_count = sum(1 for token in cased_word_matches if _has_case_distinction(token))
+    if cased_word_count <= 1:
+        return transcription, False
+
     lowered = transcription.lower()
     # Some locale-sensitive mappings (for example Turkish dotted I) expand to multiple code points.
     # Skip normalization in these cases to avoid introducing display artifacts.
@@ -1816,6 +2093,7 @@ def load_patch_and_repair_templates(
 
 
 _CHAIN_ID_TO_NAME = {
+    "0": "SPEAKER",
     "1": "COMBINE",
     "2": "NO_TOUCH",
     "3": "LEXICAL",
@@ -1926,6 +2204,15 @@ def _resolve_active_chain_ids(chain_steps: list[str] | None) -> list[str]:
         return resolved_ids
 
     return _DEFAULT_CHAIN_IDS
+
+
+def format_resolved_chain_steps(chain_steps: list[str] | None) -> str:
+    """Return a stable display string for resolved active chain steps."""
+    active_chain_ids = _resolve_active_chain_ids(chain_steps)
+    return ", ".join(
+        f"{chain_id}:{_CHAIN_ID_TO_NAME.get(chain_id, 'UNKNOWN')}"
+        for chain_id in active_chain_ids
+    )
 
 
 def build_patch_prompt(

@@ -2,7 +2,7 @@ DETERMINISTIC PATCH MODE (multilingual, ASR-aware)
 
 CRITICAL OUTPUT FORMAT:
 Return exactly ONE JSON object (no markdown/prose) with EXACT keys:
-tokenization, translation, aggressiveness_level, ct_combine, no_touch_tokens, ct_lexical, ct_disfluency, ct_format, ct_numeral, ct_punct, ct_casing.
+tokenization, translation, aggressiveness_level, speaker_scope, ct_speaker, ct_combine, no_touch_tokens, ct_lexical, ct_disfluency, ct_format, ct_numeral, ct_punct, ct_casing.
 
 Goal: single-run patch using the ordered chain below, with minimal edits.
 Tie-breaks: fewest edits → fewest chars changed → fewest punctuation insertions → earliest position.
@@ -14,7 +14,7 @@ Prefer not to perform lexical substitution inside protected entity/legal-name sp
 
 PHASE OVERVIEW:
 0) Global constraints and output contract (always active).
-1) Preprocessing (executed once, outside chain): TOKENIZATION, ENGLISH_TRANSLATION, AGGRESSIVENESS_LEVEL.
+1) Preprocessing (executed once, outside chain): TOKENIZATION, ENGLISH_TRANSLATION, AGGRESSIVENESS_LEVEL, SPEAKER_SCOPE.
 2) Chain execution (step-by-step): apply only steps listed in CHAIN, in order.
 
 PHASE 1 - PREPROCESSING (outside chain, executed once):
@@ -44,11 +44,29 @@ PHASE 1 - PREPROCESSING (outside chain, executed once):
      c) high: aggressive for punctuation + fluency cleanup only.
    - Regardless of mode: never paraphrase/rewrite and never violate Forbidden constraints.
 
+[SPEAKER_SCOPE]
+  - Detect whether the ORIGINAL segment is single-speaker or multi-speaker.
+  - Output `speaker_scope` as exactly one of: `single`, `multi`, `unknown`.
+  - Use `multi` only when there is explicit evidence of turn-taking/dialogue with distinct speaker turns.
+  - Use `single` when no such evidence exists.
+  - Use `unknown` only when evidence is insufficient/ambiguous.
+
 Global cross-step policy (applies during PHASE 2 only): for every ACTIVE step in the chain, treat `translation` as a soft reference anchor only for ambiguity resolution of English word form, numeral formatting preference, and letter casing. Use this anchor only to support minimal, local edits that remain within the current step scope and all Forbidden constraints. Do not use `translation` to trigger rewrites, semantic substitutions, step skipping, or cross-step violations.
 
 PHASE 2 - CHAIN EXECUTION:
 
 STEP_LIBRARY (chain steps only; reference text. Do NOT execute steps not in CHAIN):
+
+[SPEAKER]
+Purpose: Add/normalize speaker labels while preserving original wording.
+Rules:
+- If plain-text speaker labels already exist, normalize them into bracketed tag form regardless of `speaker_scope`.
+- Canonical speaker label format is bracketed tag + trailing colon: `[LABEL]:`.
+- If `speaker_scope` is not `multi` and no speaker labels exist, pass through unchanged.
+- If `speaker_scope` is `multi` and no labels exist, add minimal turn labels in order: `[SPK1]:`, `[SPK2]:`, ...
+- For plain-text labels, normalize to bracketed tags (for example `Speaker 1:` -> `[SPK1]:`, `Abc:` -> `[ABC]:` when mapping is unambiguous).
+- Do not rewrite lexical content, punctuation, numerals, casing, or spacing except what is strictly required to attach/normalize speaker tags.
+- Preserve turn order and boundaries exactly; do not merge/split turns.
 
 [COMBINE]
 Purpose: Combine separated token fragments for identifiers/products/proper-names/entities, numbers, thousands/decimal separators, currency/finance, dates/times, web/handles, multipliers, and other tightly bound expressions when the split is meaningless (format-only).
@@ -73,11 +91,13 @@ Rules:
 - For protected entity/legal-name spans: keep current step input unchanged unless correction is directly supported by explicit in-line evidence.
 
 [DISFLUENCY]
-Purpose: Fix fluency/grammar only (duplicates/disfluencies and minimal required grammar) while preserving meaning.
+Purpose: Fix fluency/grammar only (disfluencies and minimal required grammar) while preserving meaning.
 Rules:
 - For no-space languages, add words only when omission is unmistakable and the shortest fix.
 - Do not apply numeral/format normalization or token recombination in this step.
 - Apply aggressiveness from AGGRESSIVENESS_LEVEL only to disfluency cleanup intensity.
+- Do NOT delete long repeated spans; keep them to avoid audio-text alignment drift.
+- Do NOT remove repeated content that belongs to different speakers/turns.
 - Do NOT edit any protected token/span from NO_TOUCH (no replace/insert/delete/reorder inside protected span).
 
 [FORMAT]
@@ -109,19 +129,15 @@ Rules:
 - Use locked aggressiveness_level from AGGRESSIVENESS_LEVEL to choose punctuation aggressiveness (conservative/balanced/aggressive), while still following clear boundaries/clauses.
 - When punctuation is needed to prevent run-ons, decide left-to-right and insert sentence-ending punctuation at the earliest clear boundary; do not delay to later ambiguous points.
 - Add missing sentence-ending punctuation before sentence-start capitalization.
-- Do NOT change/add/remove punctuation at the end of the line.
+# - Prefer Clause-Linking: Downgrade sentence-ending marks to commas unless there is a significant shift in topic or the current thought is explicitly finalized; avoid "staccato" short sentences.
 - Do NOT insert punctuation adjacent to existing punctuation if it would create redundant/stacked marks.
 
 [CASING]
 Purpose: Fix wrongly cased tokens.
 Rules:
 - Capitalize sentence starts that are currently lowercased after sentence-ending punctuation.
-# - Sentence-ending punctuation requires following sentence-start capitalization.
-# - Sentence-start capitalization requires preceding sentence-ending punctuation.
-# - If a casing/boundary error has already been fixed by PUNCT, do NOT revert that fix in CASING.
 - Without a sentence boundary, do NOT introduce mid-sentence capitalization except for proper nouns/entities.
 - For proper nouns/entities, follow their conventional writing style or use `translation` as a casing reference when casing is ambiguous.
-# - Do NOT change the casing of the first token of the line.
 - Do NOT add/remove/move punctuation in this step; only change letter case.
 
 CHAIN ORDER (within PHASE 2, execute in this exact order):
@@ -137,6 +153,7 @@ CHAIN ORDER (within PHASE 2, execute in this exact order):
 - Each step may perform only its own edit type; if an edit belongs (or could belong) to another step, leave it unchanged in the current step and defer it to the designated step.
 
 Output fields (always present):
+- ct_speaker = {"edits": [[before, after], ...], "result": text after SPEAKER}
 - ct_combine = {"edits": [[before, after], ...], "result": text after COMBINE}
 - no_touch_tokens = extracted in NO_TOUCH as unique exact substrings in first-appearance order (or [] if NO_TOUCH inactive)
 - ct_lexical = {"edits": [[before, after], ...], "result": text after LEXICAL}
@@ -153,6 +170,7 @@ Schema:
 - tokenization: {"tokens":[...ORIGINAL tokens from preprocessing...]}
 - translation: English translation string from ENGLISH_TRANSLATION preprocessing
 - aggressiveness_level: one of "low", "medium", "high"
+- speaker_scope: one of "single", "multi", "unknown"
 - ct_*: {"edits": [[before, after], ...], "result": string}
 - no_touch_tokens: ["token/span1", "token/span2", ...]
 - no additional keys

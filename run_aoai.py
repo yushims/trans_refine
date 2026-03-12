@@ -9,6 +9,7 @@ from common import (
     build_empty_payload,
     collect_transcriptions_from_input,
     finalize_payloads_and_write,
+    format_resolved_chain_steps,
     is_all_lowercase_cased_input,
     is_all_uppercase_cased_input,
     normalize_char_based_spacing_input,
@@ -94,6 +95,7 @@ async def main() -> None:
     print(f"Retry jitter: temperature<=+{retry_temperature_jitter}, top_p±{retry_top_p_jitter}")
     if chain_steps:
         print(f"Chain step selector count: {len(chain_steps)}")
+    print(f"Resolved active chain: {format_resolved_chain_steps(chain_steps)}")
     print_common_runtime_settings(
         prompt_template_path,
         repair_prompt_template_path,
@@ -136,10 +138,10 @@ async def main() -> None:
         source_was_all_uppercase = is_all_uppercase_cased_input(transcription)
         source_was_all_lowercase = is_all_lowercase_cased_input(transcription)
         skip_first_token_casing_preservation = source_was_all_uppercase or source_was_all_lowercase
-        if spacing_normalized:
-            print(f"[{processing_id}] Normalized char-based intra-script spacing artifacts before prompt.")
-        if case_normalized:
-            print(f"[{processing_id}] Normalized all-uppercase input to display casing before prompt.")
+        # if spacing_normalized:
+        #     print(f"[{processing_id}] Normalized char-based intra-script spacing artifacts before prompt.")
+        # if case_normalized:
+        #     print(f"[{processing_id}] Normalized all-uppercase input to display casing before prompt.")
 
         prompt = build_patch_prompt(
             prompt_template,
