@@ -5,6 +5,7 @@ import json
 import math
 import re
 import unicodedata
+from collections import Counter
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
@@ -612,6 +613,27 @@ def _normalize_speaker_label_signature(parts: list[str]) -> tuple[str, ...]:
     return tuple(normalized_parts)
 
 
+def _is_high_confidence_speaker_signature(signature: tuple[str, ...]) -> bool:
+    if not signature:
+        return False
+
+    text = "".join(signature)
+    if not text:
+        return False
+
+    if _COMPACT_SPEAKER_LABEL_PATTERN.match(text):
+        return True
+
+    if text in {"speaker", "spk", "spkr"}:
+        return True
+
+    # Numeric/symbolic ids are usually deliberate speaker markers (S1, USER_2, host-1).
+    if any(char.isdigit() or char in {"_", "-"} for char in text):
+        return True
+
+    return False
+
+
 def _match_speaker_label_span(tokens: list[str], index: int) -> tuple[int, tuple[str, ...]] | None:
     if index < 0 or index >= len(tokens):
         return None
@@ -681,20 +703,52 @@ def _match_speaker_label_span(tokens: list[str], index: int) -> tuple[int, tuple
 
 
 def _collect_and_remove_speaker_labels(tokens: list[str]) -> tuple[list[str], set[tuple[str, ...]]]:
-    filtered: list[str] = []
-    collected_signatures: set[tuple[str, ...]] = set()
+    candidate_spans: list[tuple[int, int, tuple[str, ...]]] = []
     index = 0
 
     while index < len(tokens):
         matched = _match_speaker_label_span(tokens, index)
         if matched is None:
-            filtered.append(tokens[index])
             index += 1
             continue
 
         end, signature = matched
         if signature:
+            candidate_spans.append((index, end, signature))
+        index = end
+
+    # Be conservative for multilingual freeform labels: only strip low-confidence labels
+    # when the text clearly looks multi-speaker (2+ label spans) or signature repeats.
+    signature_counts = Counter(signature for _, _, signature in candidate_spans)
+    total_candidates = len(candidate_spans)
+
+    filtered: list[str] = []
+    collected_signatures: set[tuple[str, ...]] = set()
+    span_by_start = {
+        start: (end, signature)
+        for start, end, signature in candidate_spans
+    }
+
+    index = 0
+    while index < len(tokens):
+        span = span_by_start.get(index)
+        if span is None:
+            filtered.append(tokens[index])
+            index += 1
+            continue
+
+        end, signature = span
+        should_strip = (
+            _is_high_confidence_speaker_signature(signature)
+            or signature_counts[signature] >= 2
+            or total_candidates >= 2
+        )
+        if should_strip:
             collected_signatures.add(signature)
+            index = end
+            continue
+
+        filtered.extend(tokens[index:end])
         index = end
 
     return filtered, collected_signatures
@@ -728,6 +782,11 @@ def _remove_speaker_labels_by_reference(
     return filtered
 
 
+def _remove_speaker_label_tokens(tokens: list[str]) -> list[str]:
+    filtered, _ = _collect_and_remove_speaker_labels(tokens)
+    return filtered
+
+
 def _is_reasonable_number_like_token(token: str) -> bool:
     if not isinstance(token, str) or not token:
         return False
@@ -749,9 +808,8 @@ def _is_reasonable_number_like_token(token: str) -> bool:
     if letter_count <= 2:
         return True
 
-    # Allow slightly longer ASCII unit words (for example year, days).
-    ascii_letter_count = sum(1 for char in suffix if char.isascii() and char.isalpha())
-    if ascii_letter_count == letter_count and letter_count <= 4:
+    # Keep longer short units script-agnostic to avoid ASCII-biased behavior.
+    if letter_count <= 4:
         return True
 
     # Otherwise treat as over-greedy and fall back to numeric core only.
@@ -856,7 +914,9 @@ def validate_corrected_text_hallucination(corrected_text: str, source_text: str)
     source_tokens_raw = _tokenize_for_hallucination(source_text)
     corrected_tokens_raw = _tokenize_for_hallucination(corrected_text)
 
-    corrected_tokens, corrected_speaker_label_signatures = _collect_and_remove_speaker_labels(corrected_tokens_raw)
+    corrected_tokens, corrected_speaker_label_signatures = _collect_and_remove_speaker_labels(
+        corrected_tokens_raw
+    )
     source_tokens = _remove_speaker_labels_by_reference(
         source_tokens_raw,
         corrected_speaker_label_signatures,
@@ -1192,56 +1252,6 @@ def validate_first_token_casing_preserved(
     return True, ""
 
 
-def _normalize_string_edits(edits: object) -> list[list[str]]:
-    if not isinstance(edits, list):
-        return []
-
-    normalized_edits: list[list[str]] = []
-    for item in edits:
-        if (
-            isinstance(item, list)
-            and len(item) == 2
-            and isinstance(item[0], str)
-            and isinstance(item[1], str)
-        ):
-            normalized_edits.append(item)
-    return normalized_edits
-
-
-def _is_case_only_casing_edit(before_text: str, after_text: str) -> bool:
-    if not isinstance(before_text, str) or not isinstance(after_text, str):
-        return False
-    if not before_text or not after_text or before_text == after_text:
-        return False
-    if before_text.casefold() != after_text.casefold():
-        return False
-    return _has_case_distinction(before_text) and _has_case_distinction(after_text)
-
-
-def _collect_explicit_casing_edit_spans(
-    corrected_text: str,
-    ct_casing_edits: object,
-) -> list[tuple[int, int]]:
-    spans: list[tuple[int, int]] = []
-    if not isinstance(corrected_text, str) or not corrected_text:
-        return spans
-
-    for before_text, after_text in _normalize_string_edits(ct_casing_edits):
-        # Only protect ranges where the model explicitly changed casing (same lexical text).
-        if not _is_case_only_casing_edit(before_text, after_text):
-            continue
-
-        start = 0
-        while True:
-            index = corrected_text.find(after_text, start)
-            if index == -1:
-                break
-            spans.append((index, index + len(after_text)))
-            start = index + max(1, len(after_text))
-
-    return spans
-
-
 def _is_index_inside_url_or_email(text: str, index: int) -> bool:
     if not isinstance(text, str) or index < 0 or index >= len(text):
         return False
@@ -1268,6 +1278,22 @@ def _looks_like_dot_abbreviation_at(text: str, index: int) -> bool:
     # Detect initial chains like U.S. or J. K. at their terminal dots.
     if index >= 2 and text[index - 2] == "." and text[index - 1].isalpha():
         return True
+
+    # Generic short-word abbreviation (script-agnostic), e.g. "г. москва", "art. 5".
+    # If a very short cased word ends with a dot and next cased letter is lowercase,
+    # treat the dot as non-terminal punctuation.
+    token_start = index
+    while token_start > 0 and text[token_start - 1].isalpha():
+        token_start -= 1
+    token = text[token_start:index]
+    if 1 <= len(token) <= 3:
+        cursor = index + 1
+        while cursor < len(text) and text[cursor].isspace():
+            cursor += 1
+        if cursor < len(text):
+            next_char = text[cursor]
+            if _is_unicode_cased_letter(next_char) and next_char == next_char.lower():
+                return True
 
     return False
 
@@ -1307,7 +1333,6 @@ def _is_sentence_boundary_punctuation_at(text: str, index: int) -> bool:
 
 def preserve_sentence_start_casing(
     corrected_text: str,
-    ct_casing_edits: object = None,
     no_touch_tokens: object = None,
 ) -> tuple[str, bool]:
     """Uppercase cased sentence starts after sentence-ending punctuation."""
@@ -1358,21 +1383,6 @@ def preserve_sentence_start_casing(
         return corrected_text, False
 
     return "".join(chars), True
-
-
-def _build_text_edits(before_text: str, after_text: str) -> list[list[str]]:
-    if not isinstance(before_text, str) or not isinstance(after_text, str):
-        return []
-    if before_text == after_text:
-        return []
-
-    edits: list[list[str]] = []
-    matcher = difflib.SequenceMatcher(a=before_text, b=after_text, autojunk=False)
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        if tag == "equal":
-            continue
-        edits.append([before_text[i1:i2], after_text[j1:j2]])
-    return edits
 
 
 def _materialize_corrected_text(payload: dict) -> dict:
@@ -1639,12 +1649,10 @@ def parse_validate_and_apply_text_fixes(
         return None, validation_error, content
 
     corrected_text = ""
-    ct_casing_edits = None
     no_touch_tokens = None
     if isinstance(payload, dict):
         ct_casing = payload.get("ct_casing")
         ct_casing_result = ct_casing.get("result") if isinstance(ct_casing, dict) else None
-        ct_casing_edits = ct_casing.get("edits") if isinstance(ct_casing, dict) else None
         no_touch_tokens = payload.get("no_touch_tokens")
         if isinstance(ct_casing_result, str):
             corrected_text = ct_casing_result
@@ -1666,7 +1674,6 @@ def parse_validate_and_apply_text_fixes(
     )
     corrected_text, sentence_casing_normalized = preserve_sentence_start_casing(
         corrected_text,
-        ct_casing_edits,
         no_touch_tokens,
     )
 
