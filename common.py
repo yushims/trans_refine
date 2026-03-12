@@ -1280,7 +1280,7 @@ def _looks_like_dot_abbreviation_at(text: str, index: int) -> bool:
         return True
 
     # Generic short-word abbreviation (script-agnostic), e.g. "г. москва", "art. 5".
-    # If a very short cased word ends with a dot and next cased letter is lowercase,
+    # If a very short cased word ends with a dot and the next token suggests continuation,
     # treat the dot as non-terminal punctuation.
     token_start = index
     while token_start > 0 and text[token_start - 1].isalpha():
@@ -1292,6 +1292,23 @@ def _looks_like_dot_abbreviation_at(text: str, index: int) -> bool:
             cursor += 1
         if cursor < len(text):
             next_char = text[cursor]
+            # Avoid treating common lowercase ASCII words (e.g., "it.") as abbreviations
+            # when followed by a lowercase cased word.
+            if (
+                token.isascii()
+                and token.isalpha()
+                and token == token.lower()
+                and len(token) >= 2
+                and _is_unicode_cased_letter(next_char)
+                and next_char == next_char.lower()
+            ):
+                return False
+
+            # Treat short letter+dot references as non-terminal before numbered clauses,
+            # regardless of script/language (for example "art. 5", "ст. 5").
+            if next_char.isdigit():
+                return True
+
             if _is_unicode_cased_letter(next_char) and next_char == next_char.lower():
                 return True
 
@@ -1326,6 +1343,13 @@ def _is_sentence_boundary_punctuation_at(text: str, index: int) -> bool:
             return False
 
         if _looks_like_dot_abbreviation_at(text, index):
+            window_start = max(0, index - 24)
+            window_end = min(len(text), index + 25)
+            context_window = text[window_start:window_end]
+            print(
+                "WARNING: _looks_like_dot_abbreviation_at returned true "
+                f"at index={index}; context='{context_window}'"
+            )
             return False
 
     return True
