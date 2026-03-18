@@ -14,8 +14,8 @@ Transcription refinement pipeline with shared JSON-schema validation and one-pas
 	- `common_copilot.py`: Copilot patch runtime only (Copilot transport/session helpers + patch payload retry/repair flow).
 	- `common_eval.py`: eval-only flows and eval reporting helpers.
 - Prompt templates:
-	- `prompt_patch.txt`
-	- `prompt_repair.txt`
+	- `prompt_patch.md`
+	- `prompt_repair.md`
 
 ## Module ownership rules
 
@@ -123,11 +123,26 @@ $env:AZURE_OPENAI_API_KEY = "<your-key>"
 ./eval_e2e.ps1 --empty-result-retries 2
 ```
 
+## Multilingual regression check
+
+Run script-bucketed multilingual diagnostics on eval outputs:
+
+```powershell
+./regression-multilingual.ps1
+./regression-multilingual.ps1 -ResultsFile .\debug_eval_results\debug_eval_aoai-gpt-5-chat_results.json
+./regression-multilingual.ps1 -MaxStepMismatchRate 0.25 -MaxNullStepRate 0.25
+```
+
+This command writes a `*_multilingual_summary.csv` next to the input results file and fails when bucket-level mismatch/null-step rates exceed thresholds.
+
 ## Input / output
 
 - Default input: `sample_multi_input.txt` (one transcription per line).
+- TSV input is supported: first column = filename, second column = input segment. Optional header row is allowed (for example: `filename<TAB>input_segment`).
 - Output file path is configurable via launcher args.
 - Text output file contains joined `corrected_text` lines.
+- If `--output-file` ends with `.tsv`, output TSV rows are written as: first column = filename, second column = corrected segment.
+- When writing TSV output, a JSON sidecar with the same base name is also written (for example `query_output.json`) along with the `.txt` text output file.
 
 ## Common flags
 
@@ -154,6 +169,6 @@ Use `-HelpOnly` on either PowerShell launcher to see effective CLI options.
 - `launcher-common.ps1`
 - `run-aoai.ps1`
 - `run-copilot.ps1`
-- `prompt_patch.txt`
-- `prompt_repair.txt`
+- `prompt_patch.md`
+- `prompt_repair.md`
 - `sample_multi_input.txt` (optional, for quick demo)

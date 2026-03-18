@@ -1,8 +1,15 @@
 import argparse
 import asyncio
+import os
 
 from openai import AzureOpenAI
+from dotenv import load_dotenv
 from common import (
+    DEFAULT_AOAI_API_VERSION,
+    DEFAULT_AOAI_DEPLOYMENT,
+    DEFAULT_AOAI_ENDPOINT,
+    add_aoai_sampling_cli_arguments,
+    add_common_runtime_cli_arguments,
     assign_payload_or_emit_empty,
     build_patch_prompt,
     build_patch_response_format_schema,
@@ -18,6 +25,7 @@ from common import (
     print_common_runtime_settings,
     resolve_patch_and_repair_template_paths,
     run_transcriptions_with_concurrency,
+    write_output_artifacts,
 )
 from common_aoai import get_patch_payload_with_repair
 
@@ -30,17 +38,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-file", dest="output_file")
     parser.add_argument("--patch-prompt-file", dest="patch_prompt_file")
     parser.add_argument("--repair-prompt-file", dest="repair_prompt_file")
-    parser.add_argument("--deployment", dest="deployment", default="gpt-5-chat")
-    parser.add_argument("--endpoint", dest="endpoint", default="https://adaptationdev-resource.openai.azure.com/")
-    parser.add_argument("--api-version", dest="api_version", default="2025-01-01-preview")
-    parser.add_argument("--concurrency", dest="concurrency", type=int, default=10)
-    parser.add_argument("--timeout", dest="timeout", type=float, default=600.0)
-    parser.add_argument("--timeout-retries", dest="timeout_retries", type=int, default=2)
-    parser.add_argument("--empty-result-retries", dest="empty_result_retries", type=int, default=2)
-    parser.add_argument("--temperature", dest="temperature", type=float, default=0.0)
-    parser.add_argument("--top-p", dest="top_p", type=float, default=1.0)
-    parser.add_argument("--retry-temperature-jitter", dest="retry_temperature_jitter", type=float, default=0.08)
-    parser.add_argument("--retry-top-p-jitter", dest="retry_top_p_jitter", type=float, default=0.03)
+    parser.add_argument("--deployment", dest="deployment", default=DEFAULT_AOAI_DEPLOYMENT)
+    parser.add_argument("--endpoint", dest="endpoint", default=DEFAULT_AOAI_ENDPOINT)
+    parser.add_argument("--api-version", dest="api_version", default=DEFAULT_AOAI_API_VERSION)
+    parser.add_argument(
+        "--progress-write-every",
+        dest="progress_write_every",
+        type=int,
+        default=1,
+        help="Write incremental output snapshot every N completed items (default: 1).",
+    )
+    add_common_runtime_cli_arguments(parser)
+    add_aoai_sampling_cli_arguments(parser)
     parser.add_argument(
         "--chain-steps",
         dest="chain_steps",
@@ -51,14 +60,18 @@ def parse_args() -> argparse.Namespace:
 
 
 async def main() -> None:
+    load_dotenv()
+
     args = parse_args()
 
     input_file_value = args.input_file
     output_file_value = args.output_file
+    output_as_tsv = bool(input_file_value and str(input_file_value).lower().endswith(".tsv"))
 
-    transcriptions = collect_transcriptions_from_input(input_file_value)
-    if transcriptions is None:
+    input_data = collect_transcriptions_from_input(input_file_value)
+    if input_data is None:
         return
+    transcriptions, source_filenames = input_data
 
     endpoint = args.endpoint
     deployment = args.deployment
@@ -75,6 +88,7 @@ async def main() -> None:
     retry_temperature_jitter = max(0.0, args.retry_temperature_jitter)
     retry_top_p_jitter = max(0.0, args.retry_top_p_jitter)
     chain_steps = [step for step in (args.chain_steps or []) if isinstance(step, str) and step.strip()]
+    progress_write_every = max(1, args.progress_write_every)
 
     prompt_template_path, repair_prompt_template_path, template_error = resolve_patch_and_repair_template_paths(
         args.patch_prompt_file,
@@ -109,6 +123,13 @@ async def main() -> None:
         repair_prompt_template_path,
     )
 
+    if not os.environ.get("AZURE_OPENAI_API_KEY") and not os.environ.get("AZURE_OPENAI_AD_TOKEN"):
+        print(
+            "Missing Azure OpenAI credentials. Set AZURE_OPENAI_API_KEY (or AZURE_OPENAI_AD_TOKEN) "
+            "in the current environment or .env file."
+        )
+        return
+
     client = AzureOpenAI(
         azure_endpoint=endpoint,
         api_version=api_version,
@@ -116,12 +137,40 @@ async def main() -> None:
 
     payloads: list[dict | None] = [None] * len(transcriptions)
     text_output_lines: list[str] = [""] * len(transcriptions)
+    progress_write_lock = asyncio.Lock()
+    pending_progress_writes = 0
+
+    async def maybe_write_progress_snapshot() -> None:
+        nonlocal pending_progress_writes
+        if not output_file_value:
+            return
+        async with progress_write_lock:
+            pending_progress_writes += 1
+            if pending_progress_writes < progress_write_every:
+                return
+
+            completed_payloads = [payload for payload in payloads if isinstance(payload, dict)]
+            if not completed_payloads:
+                return
+
+            pending_progress_writes = 0
+            try:
+                write_output_artifacts(
+                    completed_payloads,
+                    output_file_value,
+                    text_output_lines,
+                    source_filenames,
+                    output_as_tsv,
+                )
+            except Exception as error:
+                print(f"Failed to write progress snapshot: {error}")
 
     async def process_item(index: int, transcription: str, total: int) -> None:
         slot = index - 1
         processing_id = f"{index}/{total}"
         if is_input_comment_line(transcription):
             text_output_lines[slot] = transcription
+            await maybe_write_progress_snapshot()
             return
 
         if not transcription.strip():
@@ -131,6 +180,7 @@ async def main() -> None:
                 f"Input transcription {index}/{total} is empty; "
                 "emitting empty payload."
             )
+            await maybe_write_progress_snapshot()
             return
 
         prompt_transcription, case_normalized = normalize_all_uppercase_input(transcription)
@@ -167,9 +217,13 @@ async def main() -> None:
             assign_payload_or_emit_empty(payload, payloads, slot, index, total)
             resolved_payload = payloads[slot]
             if isinstance(resolved_payload, dict):
+                source_filename = source_filenames[slot]
+                if isinstance(source_filename, str) and source_filename:
+                    resolved_payload["source_filename"] = source_filename
                 resolved_payload["source_text"] = transcription
                 corrected_text = resolved_payload.get("corrected_text")
                 text_output_lines[slot] = corrected_text if isinstance(corrected_text, str) else ""
+            await maybe_write_progress_snapshot()
         except asyncio.CancelledError:
             payloads[slot] = build_empty_payload()
             payloads[slot]["source_text"] = transcription
@@ -178,6 +232,7 @@ async def main() -> None:
                 f"Cancelled while processing transcription {index}/{total}; "
                 "emitting empty payload."
             )
+            await maybe_write_progress_snapshot()
             return
         except Exception as error:
             payloads[slot] = build_empty_payload()
@@ -187,11 +242,18 @@ async def main() -> None:
                 f"Unexpected error on transcription {index}/{total}: {error}; "
                 "emitting empty payload."
             )
+            await maybe_write_progress_snapshot()
             return
 
     await run_transcriptions_with_concurrency(transcriptions, concurrency, process_item)
 
-    if not finalize_payloads_and_write(payloads, output_file_value, text_output_lines):
+    if not finalize_payloads_and_write(
+        payloads,
+        output_file_value,
+        text_output_lines,
+        source_filenames,
+        output_as_tsv,
+    ):
         return
 
 

@@ -4,6 +4,9 @@ from typing import Any
 
 from copilot import CopilotClient  # pyright: ignore[reportMissingImports]
 from common import (
+    DEFAULT_COPILOT_MODEL,
+    add_common_runtime_cli_arguments,
+    add_model_mismatch_retries_cli_argument,
     assign_payload_or_emit_empty,
     build_patch_prompt,
     build_empty_payload,
@@ -18,6 +21,7 @@ from common import (
     print_common_runtime_settings,
     resolve_patch_and_repair_template_paths,
     run_transcriptions_with_concurrency,
+    write_output_artifacts,
 )
 from common_copilot import (
     build_copilot_session_parameters,
@@ -32,12 +36,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-file", dest="output_file")
     parser.add_argument("--patch-prompt-file", dest="patch_prompt_file")
     parser.add_argument("--repair-prompt-file", dest="repair_prompt_file")
-    parser.add_argument("--model", dest="model", default="gpt-5.2")
-    parser.add_argument("--concurrency", dest="concurrency", type=int, default=10)
-    parser.add_argument("--timeout", dest="timeout", type=float, default=600.0)
-    parser.add_argument("--timeout-retries", dest="timeout_retries", type=int, default=2)
-    parser.add_argument("--empty-result-retries", dest="empty_result_retries", type=int, default=2)
-    parser.add_argument("--model-mismatch-retries", dest="model_mismatch_retries", type=int, default=2)
+    parser.add_argument("--model", dest="model", default=DEFAULT_COPILOT_MODEL)
+    parser.add_argument(
+        "--progress-write-every",
+        dest="progress_write_every",
+        type=int,
+        default=1,
+        help="Write incremental output snapshot every N completed items (default: 1).",
+    )
+    add_common_runtime_cli_arguments(parser)
+    add_model_mismatch_retries_cli_argument(parser)
     parser.add_argument("--list-models-only", dest="list_models_only", action="store_true")
     parser.add_argument("--print-models", dest="print_models", action="store_true")
     parser.add_argument(
@@ -54,14 +62,18 @@ async def main():
 
     input_file_value = args.input_file
     output_file_value = args.output_file
+    output_as_tsv = bool(input_file_value and str(input_file_value).lower().endswith(".tsv"))
 
     transcriptions: list[str]
+    source_filenames: list[str | None]
     if args.list_models_only:
         transcriptions = []
+        source_filenames = []
     else:
-        transcriptions = collect_transcriptions_from_input(input_file_value)
-        if transcriptions is None:
+        input_data = collect_transcriptions_from_input(input_file_value)
+        if input_data is None:
             return
+        transcriptions, source_filenames = input_data
 
     model = args.model
     configured_concurrency = args.concurrency
@@ -72,6 +84,7 @@ async def main():
     empty_result_retries = max(0, args.empty_result_retries)
     model_mismatch_retries = max(0, args.model_mismatch_retries)
     chain_steps = [step for step in (args.chain_steps or []) if isinstance(step, str) and step.strip()]
+    progress_write_every = max(1, args.progress_write_every)
 
     prompt_template_path, repair_prompt_template_path, template_error = resolve_patch_and_repair_template_paths(
         args.patch_prompt_file,
@@ -116,6 +129,33 @@ async def main():
 
         payloads: list[dict | None] = [None] * len(transcriptions)
         text_output_lines: list[str] = [""] * len(transcriptions)
+        progress_write_lock = asyncio.Lock()
+        pending_progress_writes = 0
+
+        async def maybe_write_progress_snapshot() -> None:
+            nonlocal pending_progress_writes
+            if not output_file_value:
+                return
+            async with progress_write_lock:
+                pending_progress_writes += 1
+                if pending_progress_writes < progress_write_every:
+                    return
+
+                completed_payloads = [payload for payload in payloads if isinstance(payload, dict)]
+                if not completed_payloads:
+                    return
+
+                pending_progress_writes = 0
+                try:
+                    write_output_artifacts(
+                        completed_payloads,
+                        output_file_value,
+                        text_output_lines,
+                        source_filenames,
+                        output_as_tsv,
+                    )
+                except Exception as error:
+                    print(f"Failed to write progress snapshot: {error}")
 
         async def process_item(index: int, transcription: str, total: int) -> None:
             requested_model = model
@@ -123,6 +163,7 @@ async def main():
             processing_id = f"{index}/{total}"
             if is_input_comment_line(transcription):
                 text_output_lines[slot] = transcription
+                await maybe_write_progress_snapshot()
                 return
 
             if not transcription.strip():
@@ -132,6 +173,7 @@ async def main():
                     f"Input transcription {index}/{total} is empty; "
                     "emitting empty payload."
                 )
+                await maybe_write_progress_snapshot()
                 return
 
             prompt_transcription, case_normalized = normalize_all_uppercase_input(transcription)
@@ -169,9 +211,13 @@ async def main():
                 assign_payload_or_emit_empty(payload, payloads, slot, index, total)
                 resolved_payload = payloads[slot]
                 if isinstance(resolved_payload, dict):
+                    source_filename = source_filenames[slot]
+                    if isinstance(source_filename, str) and source_filename:
+                        resolved_payload["source_filename"] = source_filename
                     resolved_payload["source_text"] = transcription
                     corrected_text = resolved_payload.get("corrected_text")
                     text_output_lines[slot] = corrected_text if isinstance(corrected_text, str) else ""
+                await maybe_write_progress_snapshot()
                 return
             except asyncio.CancelledError:
                 payloads[slot] = build_empty_payload()
@@ -181,6 +227,7 @@ async def main():
                     f"Cancelled while processing transcription {index}/{total}; "
                     "emitting empty payload."
                 )
+                await maybe_write_progress_snapshot()
                 return
             except Exception as error:
                 payloads[slot] = build_empty_payload()
@@ -190,11 +237,18 @@ async def main():
                     f"Unexpected error on transcription {index}/{total}: {error}; "
                     "emitting empty payload."
                 )
+                await maybe_write_progress_snapshot()
                 return
 
         await run_transcriptions_with_concurrency(transcriptions, concurrency, process_item)
 
-        if not finalize_payloads_and_write(payloads, output_file_value, text_output_lines):
+        if not finalize_payloads_and_write(
+            payloads,
+            output_file_value,
+            text_output_lines,
+            source_filenames,
+            output_as_tsv,
+        ):
             return
 
     finally:

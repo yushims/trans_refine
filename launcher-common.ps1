@@ -15,6 +15,24 @@ function Resolve-PathValue {
     return [System.IO.Path]::GetFullPath($combined)
 }
 
+function Resolve-TemplatePathValue {
+    param(
+        [string]$PathValue,
+        [string]$BaseDir
+    )
+
+    $resolvedPath = Resolve-PathValue -PathValue $PathValue -BaseDir $BaseDir
+    if ([string]::IsNullOrWhiteSpace($resolvedPath)) {
+        return $resolvedPath
+    }
+
+    if (Test-Path -LiteralPath $resolvedPath) {
+        return $resolvedPath
+    }
+
+    return $resolvedPath
+}
+
 function Test-PythonModuleImport {
     param(
         [Parameter(Mandatory = $true)]

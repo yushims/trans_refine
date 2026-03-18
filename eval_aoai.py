@@ -7,41 +7,84 @@ from pathlib import Path
 from openai import AzureOpenAI
 
 from common_eval import (
-    EVAL_CHECK_FIELDS,
+    build_aligned_edits,
+    build_eval_prompt,
     build_failed_eval_payload,
-    get_aoai_eval_payload_with_repair as get_payload_with_repair_common,
+    get_aoai_eval_payload_with_repair,
     load_run_errors,
     validate_eval_payload,
     write_eval_outputs,
 )
-from common import load_prompt_template
+from common import (
+    _CHAIN_ID_TO_NAME,
+    _resolve_active_chain_ids,
+    DEFAULT_AOAI_API_VERSION,
+    DEFAULT_AOAI_DEPLOYMENT,
+    DEFAULT_AOAI_ENDPOINT,
+    add_aoai_sampling_cli_arguments,
+    add_chain_steps_cli_argument,
+    add_common_runtime_cli_arguments,
+    format_resolved_chain_steps,
+    load_prompt_template,
+    resolve_required_template_path,
+)
 
-EVAL_SCHEMA = {
-    "name": "patch_eval_output",
-    "strict": True,
-    "schema": {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "pass": {"type": "boolean"},
-            "fail_reasons": {
-                "type": "array",
-                "items": {"type": "string"},
+
+def build_eval_schema(chain_steps: list[str] | None) -> dict:
+    active_chain_ids = _resolve_active_chain_ids(chain_steps)
+    active_step_names = [_CHAIN_ID_TO_NAME.get(chain_id, "") for chain_id in active_chain_ids]
+    active_step_enum = [name for name in active_step_names if name]
+    valid_step_enum = list(active_step_enum)
+    valid_step_enum.append(None)
+
+    return {
+        "name": "patch_eval_output",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "edits": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "edit": {"type": "string"},
+                            "valid_step": {
+                                "type": ["string", "null"],
+                                "enum": valid_step_enum,
+                            },
+                            "rule": {"type": "string"},
+                            "note": {"type": "string"},
+                        },
+                        "required": ["edit", "valid_step", "rule", "note"],
+                    },
+                },
+                "missing_edits": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "span": {"type": "string"},
+                            "expected_edit": {"type": "string"},
+                            "step": {
+                                "type": "string",
+                                "enum": active_step_enum,
+                            },
+                            "reason": {"type": "string"},
+                        },
+                        "required": ["span", "expected_edit", "step", "reason"],
+                    },
+                },
             },
-            "checks": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {field: {"type": "boolean"} for field in EVAL_CHECK_FIELDS},
-                "required": EVAL_CHECK_FIELDS,
-            },
-            "diff_summary": {
-                "type": "array",
-                "items": {"type": "string"},
-            },
+            "required": [
+                "edits",
+                "missing_edits",
+            ],
         },
-        "required": ["pass", "fail_reasons", "checks", "diff_summary"],
-    },
-}
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -49,53 +92,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--orginal-trans-file", dest="orginal_trans_file", default="sample_multi_input.txt")
     parser.add_argument("--patch-result-file", dest="patch_result_file", required=True)
     parser.add_argument("--prefix", dest="prefix", default="eval")
-    parser.add_argument("--prompt-file", dest="prompt_file", default="prompt_eval.txt")
-    parser.add_argument("--repair-prompt-file", dest="repair_prompt_file", default="prompt_repair.txt")
-    parser.add_argument("--deployment", dest="deployment", default="gpt-5-chat")
-    parser.add_argument("--endpoint", dest="endpoint", default="https://adaptationdev-resource.openai.azure.com/")
-    parser.add_argument("--api-version", dest="api_version", default="2025-01-01-preview")
-    parser.add_argument("--concurrency", dest="concurrency", type=int, default=10)
-    parser.add_argument("--timeout", dest="timeout", type=float, default=600.0)
-    parser.add_argument("--timeout-retries", dest="timeout_retries", type=int, default=2)
-    parser.add_argument("--empty-result-retries", dest="empty_result_retries", type=int, default=2)
-    parser.add_argument("--temperature", dest="temperature", type=float, default=0.0)
-    parser.add_argument("--top-p", dest="top_p", type=float, default=1.0)
-    parser.add_argument("--retry-temperature-jitter", dest="retry_temperature_jitter", type=float, default=0.08)
-    parser.add_argument("--retry-top-p-jitter", dest="retry_top_p_jitter", type=float, default=0.03)
+    parser.add_argument("--prompt-file", dest="prompt_file", default="prompt_eval.md")
+    parser.add_argument("--repair-prompt-file", dest="repair_prompt_file", default="prompt_repair.md")
+    add_chain_steps_cli_argument(parser)
+    parser.add_argument("--deployment", dest="deployment", default=DEFAULT_AOAI_DEPLOYMENT)
+    parser.add_argument("--endpoint", dest="endpoint", default=DEFAULT_AOAI_ENDPOINT)
+    parser.add_argument("--api-version", dest="api_version", default=DEFAULT_AOAI_API_VERSION)
+    add_common_runtime_cli_arguments(parser)
+    add_aoai_sampling_cli_arguments(parser)
     return parser.parse_args()
-
-
-async def get_payload_with_repair(
-    client: AzureOpenAI,
-    deployment: str,
-    prompt: str,
-    processing_id: str,
-    repair_prompt_template: str,
-    temperature: float,
-    top_p: float,
-    timeout_seconds: float,
-    timeout_retries: int,
-    empty_result_retries: int,
-    retry_temperature_jitter: float,
-    retry_top_p_jitter: float,
-) -> dict:
-    return await get_payload_with_repair_common(
-        client=client,
-        deployment=deployment,
-        prompt=prompt,
-        processing_id=processing_id,
-        repair_prompt_template=repair_prompt_template,
-        schema=EVAL_SCHEMA,
-        timeout_seconds=timeout_seconds,
-        timeout_retries=timeout_retries,
-        empty_result_retries=empty_result_retries,
-        temperature=temperature,
-        top_p=top_p,
-        retry_temperature_jitter=retry_temperature_jitter,
-        retry_top_p_jitter=retry_top_p_jitter,
-        validate_payload=validate_eval_payload,
-        build_failed_payload=build_failed_eval_payload,
-    )
 
 
 async def main() -> None:
@@ -107,16 +112,22 @@ async def main() -> None:
         print(f"Input file not found: {input_file}")
         return
 
-    prompt_file_value = args.prompt_file
-    prompt_file = Path(prompt_file_value)
-    if not prompt_file.exists():
-        print(f"Evaluation prompt file not found: {prompt_file}")
+    prompt_file, prompt_error = resolve_required_template_path(
+        args.prompt_file,
+        "prompt_eval.md",
+        "Evaluation prompt",
+    )
+    if prompt_error:
+        print(prompt_error)
         return
 
-    repair_prompt_file_value = args.repair_prompt_file
-    repair_prompt_file = Path(repair_prompt_file_value)
-    if not repair_prompt_file.exists():
-        print(f"Repair prompt file not found: {repair_prompt_file}")
+    repair_prompt_file, repair_prompt_error = resolve_required_template_path(
+        args.repair_prompt_file,
+        "prompt_repair.md",
+        "Repair prompt",
+    )
+    if repair_prompt_error:
+        print(repair_prompt_error)
         return
 
     endpoint = args.endpoint
@@ -131,6 +142,8 @@ async def main() -> None:
     top_p = max(0.0, min(1.0, float(args.top_p)))
     retry_temperature_jitter = max(0.0, float(args.retry_temperature_jitter))
     retry_top_p_jitter = max(0.0, float(args.retry_top_p_jitter))
+    chain_steps_text = format_resolved_chain_steps(args.chain_steps)
+    eval_schema = build_eval_schema(args.chain_steps)
 
     client = AzureOpenAI(
         azure_endpoint=endpoint,
@@ -148,6 +161,7 @@ async def main() -> None:
     print(f"Concurrency: {concurrency}")
     print(f"Timeout: {timeout_seconds}s, retries: {timeout_retries}")
     print(f"Empty-result retries: {empty_result_retries}")
+    print(f"Active eval chain steps: {chain_steps_text}")
 
     src_lines = input_file.read_text(encoding="utf-8").splitlines()
     eval_template = load_prompt_template(prompt_file)
@@ -182,7 +196,6 @@ async def main() -> None:
                             "line": None,
                             "pass": False,
                             "fail_reasons": [reason],
-                            "checks": {field: False for field in EVAL_CHECK_FIELDS},
                             "diff_summary": [],
                         }
                     ],
@@ -204,41 +217,49 @@ async def main() -> None:
             if not src.strip() and not out.strip():
                 return
 
-            prompt = (
-                eval_template
-                .replace("{original_transcript}", src)
-                .replace("{patch_transcript}", out)
-                # .replace("{patch_json}", out)
+            extracted_edits_text = build_aligned_edits(src, out)
+
+            prompt = build_eval_prompt(
+                eval_template,
+                src,
+                out,
+                chain_steps_text,
+                extracted_edits_text,
             )
 
             if max_lines > 1:
-                print(f"Processing line {line_no}/{max_lines}...")
+                print(f"Evaluating line {line_no}/{max_lines}...")
 
             async with semaphore:
                 processing_id = f"eval-{file_name}-L{line_no}"
-                payload = await get_payload_with_repair(
-                    client,
-                    deployment,
-                    prompt,
-                    processing_id,
-                    repair_prompt_template,
-                    temperature,
-                    top_p,
-                    timeout_seconds,
-                    timeout_retries,
-                    empty_result_retries,
-                    retry_temperature_jitter,
-                    retry_top_p_jitter,
+                payload = await get_aoai_eval_payload_with_repair(
+                    client=client,
+                    deployment=deployment,
+                    prompt=prompt,
+                    processing_id=processing_id,
+                    repair_prompt_template=repair_prompt_template,
+                    schema=eval_schema,
+                    timeout_seconds=timeout_seconds,
+                    timeout_retries=timeout_retries,
+                    empty_result_retries=empty_result_retries,
+                    temperature=temperature,
+                    top_p=top_p,
+                    retry_temperature_jitter=retry_temperature_jitter,
+                    retry_top_p_jitter=retry_top_p_jitter,
+                    validate_payload=validate_eval_payload,
+                    build_failed_payload=build_failed_eval_payload,
                 )
 
             results_by_line[line_no] = {
                 "line": line_no,
                 "pass": bool(payload.get("pass")),
+                "edit_error_rate": float(payload.get("edit_error_rate", 1.0)),
                 "fail_reasons": payload.get("fail_reasons", []),
-                "checks": payload.get("checks", {field: False for field in EVAL_CHECK_FIELDS}),
                 "diff_summary": payload.get("diff_summary", []),
-                "source_excerpt": src[:160],
-                "output_excerpt": out[:160],
+                "edits": payload.get("edits", []),
+                "missing_edits": payload.get("missing_edits", []),
+                "source_excerpt": src,
+                "output_excerpt": out,
             }
 
         await asyncio.gather(*(evaluate_line(idx) for idx in range(max_lines)))

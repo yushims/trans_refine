@@ -5,10 +5,19 @@ from pathlib import Path
 
 from copilot import CopilotClient  # pyright: ignore[reportMissingImports]
 
-from common import load_prompt_template
+from common import (
+    DEFAULT_COPILOT_MODEL,
+    add_chain_steps_cli_argument,
+    add_common_runtime_cli_arguments,
+    add_model_mismatch_retries_cli_argument,
+    format_resolved_chain_steps,
+    load_prompt_template,
+    resolve_required_template_path,
+)
 from common_eval import (
-    EVAL_CHECK_FIELDS,
-    get_copilot_eval_payload_with_repair,
+    build_aligned_edits,
+    build_eval_prompt,
+    get_copilot_eval_payload_with_retries,
     load_run_errors,
     write_eval_outputs,
 )
@@ -19,13 +28,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--orginal-trans-file", default="sample_multi_input.txt")
     parser.add_argument("--patch-result-file", required=True)
     parser.add_argument("--prefix", default="eval")
-    parser.add_argument("--prompt-file", default="prompt_eval.txt")
-    parser.add_argument("--model", default="gpt-5.2")
-    parser.add_argument("--timeout", type=float, default=120.0)
-    parser.add_argument("--timeout-retries", type=int, default=2)
-    parser.add_argument("--empty-result-retries", type=int, default=2)
-    parser.add_argument("--model-mismatch-retries", type=int, default=2)
-    parser.add_argument("--concurrency", type=int, default=10)
+    parser.add_argument("--prompt-file", default="prompt_eval.md")
+    add_chain_steps_cli_argument(parser)
+    parser.add_argument("--model", default=DEFAULT_COPILOT_MODEL)
+    add_common_runtime_cli_arguments(parser, timeout_default=120.0)
+    add_model_mismatch_retries_cli_argument(parser)
     return parser.parse_args()
 
 
@@ -36,15 +43,20 @@ async def main_async() -> None:
     if not input_file.exists():
         raise FileNotFoundError(f"Input file not found: {input_file}")
 
-    prompt_file = Path(args.prompt_file)
-    if not prompt_file.exists():
-        raise FileNotFoundError(f"Evaluation prompt file not found: {prompt_file}")
+    prompt_file, prompt_error = resolve_required_template_path(
+        args.prompt_file,
+        "prompt_eval.md",
+        "Evaluation prompt",
+    )
+    if prompt_error:
+        raise FileNotFoundError(prompt_error)
 
     timeout_seconds = float(args.timeout)
     timeout_retries = max(0, int(args.timeout_retries))
     empty_result_retries = max(0, int(args.empty_result_retries))
     model_mismatch_retries = max(0, int(args.model_mismatch_retries))
     concurrency = max(1, int(args.concurrency))
+    chain_steps_text = format_resolved_chain_steps(args.chain_steps)
 
     src_lines = input_file.read_text(encoding="utf-8").splitlines()
     eval_template = load_prompt_template(prompt_file)
@@ -63,6 +75,7 @@ async def main_async() -> None:
     print(f"Timeout: {timeout_seconds}s, retries: {timeout_retries}")
     print(f"Empty-result retries: {empty_result_retries}")
     print(f"Model-mismatch retries: {model_mismatch_retries}")
+    print(f"Active eval chain steps: {chain_steps_text}")
 
     report: list[dict] = []
 
@@ -88,7 +101,6 @@ async def main_async() -> None:
                                 "line": None,
                                 "pass": False,
                                 "fail_reasons": [reason],
-                                "checks": {field: False for field in EVAL_CHECK_FIELDS},
                                 "diff_summary": [],
                             }
                         ],
@@ -110,19 +122,22 @@ async def main_async() -> None:
                 if not src.strip() and not out.strip():
                     return
 
-                prompt = (
-                    eval_template
-                    .replace("{original_transcript}", src)
-                    .replace("{patch_transcript}", out)
-                    .replace("{patch_json}", out)
+                extracted_edits_text = build_aligned_edits(src, out)
+
+                prompt = build_eval_prompt(
+                    eval_template,
+                    src,
+                    out,
+                    chain_steps_text,
+                    extracted_edits_text,
                 )
 
                 if max_lines > 1:
-                    print(f"Processing line {line_no}/{max_lines}...")
+                    print(f"Evaluating line {line_no}/{max_lines}...")
 
                 async with semaphore:
                     processing_id = f"eval-{file_name}-L{line_no}"
-                    payload = await get_copilot_eval_payload_with_repair(
+                    payload = await get_copilot_eval_payload_with_retries(
                         client=client,
                         model_name=args.model,
                         prompt=prompt,
@@ -136,11 +151,13 @@ async def main_async() -> None:
                 results_by_line[line_no] = {
                     "line": line_no,
                     "pass": bool(payload.get("pass")),
+                    "edit_error_rate": float(payload.get("edit_error_rate", 1.0)),
                     "fail_reasons": payload.get("fail_reasons", []),
-                    "checks": payload.get("checks", {field: False for field in EVAL_CHECK_FIELDS}),
                     "diff_summary": payload.get("diff_summary", []),
-                    "source_excerpt": src[:160],
-                    "output_excerpt": out[:160],
+                    "edits": payload.get("edits", []),
+                    "missing_edits": payload.get("missing_edits", []),
+                    "source_excerpt": src,
+                    "output_excerpt": out,
                 }
 
             await asyncio.gather(*(evaluate_line(idx) for idx in range(max_lines)))

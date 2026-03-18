@@ -3,18 +3,10 @@ import json
 import random
 
 from common import (
-    build_repair_prompt_after_invalid_json,
     extract_retry_after_seconds,
     extract_text_content,
-    handle_invalid_repair_json_result,
-    is_non_repairable_validation_error,
-    log_json_validation_with_key_error,
-    non_repairable_prefix,
-    parse_validate_and_apply_text_fixes,
-    print_timeout_and_retry_guidance,
-    resolve_payload_or_retry_on_empty_corrected_text,
+    get_patch_payload_with_repair_generic,
     run_with_timeout_retry,
-    should_retry_after_failure,
 )
 
 
@@ -117,6 +109,9 @@ async def get_patch_payload_with_repair(
     retry_top_p_jitter: float,
     skip_first_token_casing_preservation: bool = False,
 ) -> dict | None:
+    attempt_temperatures: list[float] = []
+    attempt_top_ps: list[float] = []
+
     for empty_attempt in range(empty_result_retries + 1):
         attempt_temperature = temperature
         attempt_top_p = top_p
@@ -129,106 +124,51 @@ async def get_patch_payload_with_repair(
                 0.0,
                 min(1.0, top_p + random.uniform(-retry_top_p_jitter, retry_top_p_jitter)),
             )
-            print(
-                f"[{processing_id}] Retry decode jitter applied: temperature={attempt_temperature:.3f}, "
-                f"top_p={attempt_top_p:.3f}"
-            )
+            # print(
+            #     f"[{processing_id}] Retry decode jitter applied: temperature={attempt_temperature:.3f}, "
+            #     f"top_p={attempt_top_p:.3f}"
+            # )
+        attempt_temperatures.append(attempt_temperature)
+        attempt_top_ps.append(attempt_top_p)
 
-        content = await aoai_send_with_timeout_retry(
+    async def _send_prompt(attempt_prompt: str, empty_attempt: int) -> str | None:
+        return await aoai_send_with_timeout_retry(
             client,
             deployment,
-            prompt,
+            attempt_prompt,
             patch_schema,
-            attempt_temperature,
-            attempt_top_p,
+            attempt_temperatures[empty_attempt],
+            attempt_top_ps[empty_attempt],
             timeout_seconds,
             timeout_retries,
             processing_id,
         )
 
-        if content is None:
-            print_timeout_and_retry_guidance(timeout_seconds, timeout_retries, processing_id)
-            return None
-
-        payload, validation_error, content = parse_validate_and_apply_text_fixes(
-            content,
-            transcription,
-            processing_id,
-            skip_first_token_casing_preservation=skip_first_token_casing_preservation,
-        )
-
-        if payload is None:
-            log_json_validation_with_key_error(validation_error, content, processing_id)
-
-            if is_non_repairable_validation_error(validation_error):
-                reason = validation_error.removeprefix(non_repairable_prefix()).strip() if isinstance(validation_error, str) else "Model output is not repairable."
-                print(f"[{processing_id}] Skipping repair: {reason}")
-                should_retry = should_retry_after_failure(
-                    empty_attempt,
-                    empty_result_retries,
-                    "Model output is not repairable.",
-                    processing_id=processing_id,
-                )
-                if not should_retry:
-                    return None
-                continue
-
-            repair_prompt = build_repair_prompt_after_invalid_json(
-                repair_prompt_template,
-                validation_error,
-                content,
-                target_schema=json.dumps(patch_schema, ensure_ascii=False, indent=2),
-                processing_id=processing_id,
-            )
-
-            repaired_content = await aoai_send_with_timeout_retry(
-                client,
-                deployment,
-                repair_prompt,
-                patch_schema,
-                attempt_temperature,
-                attempt_top_p,
-                timeout_seconds,
-                timeout_retries,
-                processing_id,
-            )
-
-            if not repaired_content:
-                should_retry = should_retry_after_failure(
-                    empty_attempt,
-                    empty_result_retries,
-                    "Repair returned empty output or timed out.",
-                    processing_id=processing_id,
-                )
-                if not should_retry:
-                    return None
-                continue
-
-            payload, validation_error, repaired_content = parse_validate_and_apply_text_fixes(
-                repaired_content,
-                transcription,
-                processing_id,
-                skip_first_token_casing_preservation=skip_first_token_casing_preservation,
-            )
-            if payload is None:
-                should_retry = handle_invalid_repair_json_result(
-                    empty_attempt,
-                    empty_result_retries,
-                    validation_error,
-                    repaired_content,
-                    processing_id,
-                )
-                if not should_retry:
-                    return None
-                continue
-
-        result_payload, should_retry = resolve_payload_or_retry_on_empty_corrected_text(
-            payload,
-            empty_attempt,
-            empty_result_retries,
+    async def _send_repair_prompt(repair_prompt: str, empty_attempt: int) -> str | None:
+        return await aoai_send_with_timeout_retry(
+            client,
+            deployment,
+            repair_prompt,
+            patch_schema,
+            attempt_temperatures[empty_attempt],
+            attempt_top_ps[empty_attempt],
+            timeout_seconds,
+            timeout_retries,
             processing_id,
         )
-        if not should_retry:
-            return result_payload
 
-    return None
+    return await get_patch_payload_with_repair_generic(
+        prompt=prompt,
+        transcription=transcription,
+        processing_id=processing_id,
+        repair_prompt_template=repair_prompt_template,
+        target_schema=json.dumps(patch_schema, ensure_ascii=False, indent=2),
+        timeout_seconds=timeout_seconds,
+        timeout_retries=timeout_retries,
+        empty_result_retries=empty_result_retries,
+        send_prompt=_send_prompt,
+        send_repair_prompt=_send_repair_prompt,
+        skip_first_token_casing_preservation=skip_first_token_casing_preservation,
+        repair_timeout_message="Repair returned empty output or timed out.",
+        repair_empty_message="Repair returned empty output or timed out.",
+    )

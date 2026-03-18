@@ -22,7 +22,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-existing-results", action="store_true")
     parser.add_argument("--copilot-model", default="gpt-5.2")
     parser.add_argument("--gemini-model", default="gemini-3-pro-preview")
-    parser.add_argument("--prompt-file", default="prompt_eval.txt")
+    parser.add_argument("--prompt-file", default="prompt_eval.md")
     parser.add_argument("--aoai-deployment", default="gpt-5-chat")
     parser.add_argument("--aoai-endpoint", default="https://adaptationdev-resource.openai.azure.com/")
     parser.add_argument("--aoai-api-version", default="2025-01-01-preview")
@@ -35,7 +35,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-retry-temperature-jitter", type=float, default=0.08)
     parser.add_argument("--eval-retry-top-p-jitter", type=float, default=0.03)
     parser.add_argument("--eval-concurrency", type=int, default=10)
-    parser.add_argument("--eval-repair-prompt-file", default="prompt_repair.txt")
+    parser.add_argument("--eval-repair-prompt-file", default="prompt_repair.md")
+    parser.add_argument(
+        "--chain-steps",
+        action="append",
+        help="Repeatable active-chain selector (ids 1-8 or step names like COMBINE, NO_TOUCH).",
+    )
     return parser.parse_args()
 
 
@@ -97,6 +102,11 @@ def extract_json_error_description(output: str) -> str:
     return ""
 
 
+def resolve_default_prompt_path(default_filename: str) -> Path:
+    default_path = Path(__file__).with_name(default_filename)
+    return default_path
+
+
 def run_model(
     model: str,
     script_path: Path,
@@ -114,6 +124,8 @@ def run_model(
 
     run_error_descriptions: dict[str, str] = {}
     logs_dir = Path(f"{prefix}_results")
+    patch_prompt_path = resolve_default_prompt_path("prompt_patch.md")
+    repair_prompt_path = resolve_default_prompt_path("prompt_repair.md")
 
     for run_index in range(1, runs + 1):
         out_txt = logs_dir / f"run{run_index}_{model}.txt"
@@ -142,9 +154,9 @@ def run_model(
                 "--output-file",
                 str(out_json),
                 "--patch-prompt-file",
-                "prompt_patch.txt",
+                str(patch_prompt_path),
                 "--repair-prompt-file",
-                "prompt_repair.txt",
+                str(repair_prompt_path),
                 "--timeout",
                 str(timeout),
                 "--timeout-retries",
@@ -225,6 +237,12 @@ def main() -> None:
     if not input_file.exists():
         raise FileNotFoundError(f"Input file not found: {input_file}")
     expected_lines = non_empty_line_count(input_file)
+    chain_steps = [step for step in (args.chain_steps or []) if isinstance(step, str) and step.strip()]
+    run_chain_step_args: list[str] = []
+    for step in chain_steps:
+        run_chain_step_args.extend(["--chain-steps", step])
+
+    eval_chain_steps_text = ", ".join(chain_steps) if chain_steps else "ALL"
 
     aoai_errors = run_model(
         model=f"aoai-{args.aoai_deployment}",
@@ -242,6 +260,7 @@ def main() -> None:
             "--deployment", args.aoai_deployment,
             "--endpoint", args.aoai_endpoint,
             "--api-version", args.aoai_api_version,
+            *run_chain_step_args,
         ],
     )
 
@@ -257,7 +276,7 @@ def main() -> None:
         empty_result_retries=args.empty_result_retries,
         expected_lines=expected_lines,
         skip_existing_results=args.skip_existing_results,
-        extra_args=["--model", args.copilot_model],
+        extra_args=["--model", args.copilot_model, *run_chain_step_args],
     )
 
     gemini_errors = run_model(
@@ -272,7 +291,7 @@ def main() -> None:
         empty_result_retries=args.empty_result_retries,
         expected_lines=expected_lines,
         skip_existing_results=args.skip_existing_results,
-        extra_args=["--model", args.gemini_model],
+        extra_args=["--model", args.gemini_model, *run_chain_step_args],
     )
 
     all_errors = {}
@@ -306,6 +325,7 @@ def main() -> None:
         "--prefix", eval_output_prefix,
         "--patch-result-file", patch_result_file_value,
         "--prompt-file", args.prompt_file,
+        "--chain-steps", eval_chain_steps_text,
     ]
 
     aoai_eval_args = [

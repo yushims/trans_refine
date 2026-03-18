@@ -5,8 +5,8 @@ param(
     [string]$ApiKey,
     [string]$InputFile = '.\sample_multi_input.txt',
     [string]$OutputFile = '.\sample_multi_output_aoai',
-    [string]$PatchPromptFile = '.\prompt_patch.txt',
-    [string]$RepairPromptFile = '.\prompt_repair.txt',
+    [string]$PatchPromptFile = '.\prompt_patch.md',
+    [string]$RepairPromptFile = '.\prompt_repair.md',
     [double]$Timeout = 600,
     [int]$TimeoutRetries = 2,
     [int]$EmptyResultRetries = 2,
@@ -52,8 +52,8 @@ else {
     $resolvedOutputPath = "$outputBasePath.json"
     $resolvedOutputTextPath = "$outputBasePath.txt"
 }
-$resolvedPatchPromptPath = Resolve-PathValue -PathValue $PatchPromptFile -BaseDir $scriptDir
-$resolvedRepairPromptPath = Resolve-PathValue -PathValue $RepairPromptFile -BaseDir $scriptDir
+$resolvedPatchPromptPath = Resolve-TemplatePathValue -PathValue $PatchPromptFile -BaseDir $scriptDir
+$resolvedRepairPromptPath = Resolve-TemplatePathValue -PathValue $RepairPromptFile -BaseDir $scriptDir
 
 if (-not $HelpOnly) {
     if (-not (Test-Path -LiteralPath $resolvedInputPath)) {

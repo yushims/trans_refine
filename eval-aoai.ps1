@@ -5,8 +5,8 @@ param(
     [string]$ApiKey,
     [string]$OrginalTransFile = '.\sample_multi_input.txt',
     [string]$OutputFile = 'eval',
-    [string]$PromptFile = '.\prompt_eval.txt',
-    [string]$RepairPromptFile = '.\prompt_repair.txt',
+    [string]$PromptFile = '.\prompt_eval.md',
+    [string]$RepairPromptFile = '.\prompt_repair.md',
     [string]$PatchResultFile,
     [double]$Timeout = 600,
     [int]$TimeoutRetries = 2,
@@ -37,8 +37,8 @@ if (-not (Test-Path -LiteralPath $resolvedScriptPath)) {
 
 $resolvedInputPath = Resolve-PathValue -PathValue $OrginalTransFile -BaseDir $scriptDir
 $resolvedOutputPath = Resolve-PathValue -PathValue $OutputFile -BaseDir $scriptDir
-$resolvedPromptPath = Resolve-PathValue -PathValue $PromptFile -BaseDir $scriptDir
-$resolvedRepairPromptPath = Resolve-PathValue -PathValue $RepairPromptFile -BaseDir $scriptDir
+$resolvedPromptPath = Resolve-TemplatePathValue -PathValue $PromptFile -BaseDir $scriptDir
+$resolvedRepairPromptPath = Resolve-TemplatePathValue -PathValue $RepairPromptFile -BaseDir $scriptDir
 $resolvedPatchResultPath = if ([string]::IsNullOrWhiteSpace($PatchResultFile)) {
     ''
 }
