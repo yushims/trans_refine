@@ -1,6 +1,9 @@
 param(
     [string]$ApiKey,
     [string]$ScriptPath = '.\eval_e2e.py',
+    [string]$AoaiDeployment = 'gpt-5-chat',
+    [string]$CopilotModel = 'gpt-5.2',
+    [string]$GeminiModel = 'gemini-3-pro-preview',
     [switch]$HelpOnly,
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$ScriptArgs
@@ -49,8 +52,16 @@ $effectiveArgs = @($resolvedScriptPath)
 if ($HelpOnly) {
     $effectiveArgs += '--help'
 }
-elseif ($ScriptArgs) {
-    $effectiveArgs += $ScriptArgs
+else {
+    $effectiveArgs += @(
+        '--aoai-deployment', $AoaiDeployment,
+        '--copilot-model', $CopilotModel,
+        '--gemini-model', $GeminiModel
+    )
+    if ($ScriptArgs) {
+        # Keep remaining script arguments last so callers can override defaults.
+        $effectiveArgs += $ScriptArgs
+    }
 }
 
 & $pythonCommand @pythonCommandArgs @effectiveArgs

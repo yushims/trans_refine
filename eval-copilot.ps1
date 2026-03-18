@@ -3,7 +3,7 @@ param(
     [string]$OrginalTransFile = '.\sample_multi_input.txt',
     [string]$OutputFile = 'eval',
     [string]$PatchResultFile,
-    [string]$PromptFile = '.\prompt_eval.txt',
+    [string]$PromptFile = '.\prompt_eval.md',
     [double]$Timeout = 600,
     [int]$TimeoutRetries = 2,
     [int]$EmptyResultRetries = 2,
@@ -30,7 +30,7 @@ if (-not (Test-Path -LiteralPath $resolvedScriptPath)) {
 
 $resolvedInputPath = Resolve-PathValue -PathValue $OrginalTransFile -BaseDir $scriptDir
 $resolvedOutputPath = Resolve-PathValue -PathValue $OutputFile -BaseDir $scriptDir
-$resolvedPromptFilePath = Resolve-PathValue -PathValue $PromptFile -BaseDir $scriptDir
+$resolvedPromptFilePath = Resolve-TemplatePathValue -PathValue $PromptFile -BaseDir $scriptDir
 $resolvedPatchResultPath = if ([string]::IsNullOrWhiteSpace($PatchResultFile)) {
     ''
 }

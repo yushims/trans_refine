@@ -1,5 +1,7 @@
 import asyncio
+import argparse
 import ast
+import csv
 import difflib
 import json
 import math
@@ -19,6 +21,7 @@ _STEP_CHAIN_KEYS = (
     "ct_numeral",
     "ct_punct",
     "ct_casing",
+    "ct_remain_fix",
 )
 
 _REQUIRED_TOP_LEVEL_KEY_ORDER = (
@@ -39,11 +42,82 @@ _REQUIRED_TOP_LEVEL_KEY_ORDER = (
 _REQUIRED_TOP_LEVEL_KEYS = set(_REQUIRED_TOP_LEVEL_KEY_ORDER)
 
 _OPTIONAL_TOP_LEVEL_KEY_ORDER = (
+    "source_filename",
     "source_text",
     "corrected_text",
 )
 
 _OPTIONAL_TOP_LEVEL_KEYS = set(_OPTIONAL_TOP_LEVEL_KEY_ORDER)
+
+
+DEFAULT_CONCURRENCY = 10
+DEFAULT_TIMEOUT_SECONDS = 600.0
+DEFAULT_TIMEOUT_RETRIES = 2
+DEFAULT_EMPTY_RESULT_RETRIES = 2
+DEFAULT_TEMPERATURE = 0.0
+DEFAULT_TOP_P = 1.0
+DEFAULT_RETRY_TEMPERATURE_JITTER = 0.08
+DEFAULT_RETRY_TOP_P_JITTER = 0.03
+DEFAULT_MODEL_MISMATCH_RETRIES = 2
+DEFAULT_AOAI_ENDPOINT = "https://adaptationdev-resource.openai.azure.com/"
+DEFAULT_AOAI_API_VERSION = "2025-01-01-preview"
+DEFAULT_AOAI_DEPLOYMENT = "gpt-5-chat"
+DEFAULT_COPILOT_MODEL = "gpt-5.2"
+
+
+def add_common_runtime_cli_arguments(
+    parser: argparse.ArgumentParser,
+    timeout_default: float = DEFAULT_TIMEOUT_SECONDS,
+    concurrency_default: int = DEFAULT_CONCURRENCY,
+    timeout_retries_default: int = DEFAULT_TIMEOUT_RETRIES,
+    empty_result_retries_default: int = DEFAULT_EMPTY_RESULT_RETRIES,
+) -> None:
+    parser.add_argument("--concurrency", dest="concurrency", type=int, default=concurrency_default)
+    parser.add_argument("--timeout", dest="timeout", type=float, default=timeout_default)
+    parser.add_argument("--timeout-retries", dest="timeout_retries", type=int, default=timeout_retries_default)
+    parser.add_argument(
+        "--empty-result-retries",
+        dest="empty_result_retries",
+        type=int,
+        default=empty_result_retries_default,
+    )
+
+
+def add_chain_steps_cli_argument(
+    parser: argparse.ArgumentParser,
+    default: str = "ALL",
+) -> None:
+    parser.add_argument("--chain-steps", dest="chain_steps", default=default)
+
+
+def add_aoai_sampling_cli_arguments(
+    parser: argparse.ArgumentParser,
+    temperature_default: float = DEFAULT_TEMPERATURE,
+    top_p_default: float = DEFAULT_TOP_P,
+    retry_temperature_jitter_default: float = DEFAULT_RETRY_TEMPERATURE_JITTER,
+    retry_top_p_jitter_default: float = DEFAULT_RETRY_TOP_P_JITTER,
+) -> None:
+    parser.add_argument("--temperature", dest="temperature", type=float, default=temperature_default)
+    parser.add_argument("--top-p", dest="top_p", type=float, default=top_p_default)
+    parser.add_argument(
+        "--retry-temperature-jitter",
+        dest="retry_temperature_jitter",
+        type=float,
+        default=retry_temperature_jitter_default,
+    )
+    parser.add_argument(
+        "--retry-top-p-jitter",
+        dest="retry_top_p_jitter",
+        type=float,
+        default=retry_top_p_jitter_default,
+    )
+
+
+def add_model_mismatch_retries_cli_argument(
+    parser: argparse.ArgumentParser,
+    default: int = DEFAULT_MODEL_MISMATCH_RETRIES,
+) -> None:
+    parser.add_argument("--model-mismatch-retries", dest="model_mismatch_retries", type=int, default=default)
 
 
 def _new_empty_step_payload() -> dict:
@@ -187,6 +261,35 @@ _SENTENCE_CLOSERS = {
     ")",
     "]",
     "}",
+}
+_OPENING_PUNCT_TOKENS = {
+    "(",
+    "[",
+    "{",
+    "<",
+    '"',
+    "'",
+    "“",
+    "‘",
+    "«",
+    "‹",
+    "「",
+    "『",
+    "《",
+    "【",
+    "〈",
+    "（",
+    "［",
+    "｛",
+}
+_CHAR_BASED_NO_SPACE_GROUPS = {
+    "han",
+    "kana",
+    "hangul",
+    "thai",
+    "lao",
+    "khmer",
+    "myanmar",
 }
 _DOT_ABBREVIATION_WORD_PATTERN = re.compile(
     r"\b(?:mr|mrs|ms|dr|prof|sr|jr|st|etc|vs|fig|no)\.$",
@@ -549,6 +652,47 @@ _FREEFORM_SPEAKER_LABEL_PATTERN = re.compile(
 
 def _is_colon_token(token: str) -> bool:
     return token in {":", "："}
+
+
+def _normalize_model_result_newlines(text: str, source_text: str) -> str:
+    if not isinstance(text, str):
+        return ""
+
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    # Remove only model-inserted line breaks before likely speaker labels.
+    normalized = re.sub(
+        r"\n\s*(?=(?:\[[^\]\r\n]{1,24}\]|(?:spk|speaker|spkr)[_-]?\d+|[A-Za-z][A-Za-z0-9_-]{0,15})\s*[:\uff1a])",
+        " ",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+
+    source_has_newline = isinstance(source_text, str) and ("\n" in source_text or "\r" in source_text)
+    if not source_has_newline:
+        # Keep single-line inputs single-line in model output.
+        normalized = re.sub(r"\s*\n\s*", " ", normalized)
+        normalized = re.sub(r" {2,}", " ", normalized)
+        return normalized.strip()
+
+    return normalized
+
+
+def normalize_payload_result_newlines(payload: dict, source_text: str) -> None:
+    if not isinstance(payload, dict):
+        return
+
+    for step_key in _STEP_CHAIN_KEYS:
+        step_payload = payload.get(step_key)
+        if not isinstance(step_payload, dict):
+            continue
+        step_result = step_payload.get("result")
+        if isinstance(step_result, str):
+            step_payload["result"] = _normalize_model_result_newlines(step_result, source_text)
+
+    corrected_text = payload.get("corrected_text")
+    if isinstance(corrected_text, str):
+        payload["corrected_text"] = _normalize_model_result_newlines(corrected_text, source_text)
 
 
 def _looks_like_speaker_label_token(token: str) -> bool:
@@ -1262,151 +1406,24 @@ def _is_index_inside_url_or_email(text: str, index: int) -> bool:
     return False
 
 
-def _looks_like_dot_abbreviation_at(text: str, index: int) -> bool:
-    if not isinstance(text, str) or index < 0 or index >= len(text):
-        return False
-
-    left = text[:index + 1]
-    # Keep the inspected context short for deterministic performance.
-    window = left[-24:]
-
-    if _DOT_ABBREVIATION_COMPOUND_PATTERN.search(window):
-        return True
-    if _DOT_ABBREVIATION_WORD_PATTERN.search(window):
-        return True
-
-    # Detect initial chains like U.S. or J. K. at their terminal dots.
-    if index >= 2 and text[index - 2] == "." and text[index - 1].isalpha():
-        return True
-
-    # Generic short-word abbreviation (script-agnostic), e.g. "г. москва", "art. 5".
-    # If a very short cased word ends with a dot and the next token suggests continuation,
-    # treat the dot as non-terminal punctuation.
-    token_start = index
-    while token_start > 0 and text[token_start - 1].isalpha():
-        token_start -= 1
-    token = text[token_start:index]
-    if 1 <= len(token) <= 3:
-        cursor = index + 1
-        while cursor < len(text) and text[cursor].isspace():
-            cursor += 1
-        if cursor < len(text):
-            next_char = text[cursor]
-            # Avoid treating common lowercase ASCII words (e.g., "it.") as abbreviations
-            # when followed by a lowercase cased word.
-            if (
-                token.isascii()
-                and token.isalpha()
-                and token == token.lower()
-                and len(token) >= 2
-                and _is_unicode_cased_letter(next_char)
-                and next_char == next_char.lower()
-            ):
-                return False
-
-            # Treat short letter+dot references as non-terminal before numbered clauses,
-            # regardless of script/language (for example "art. 5", "ст. 5").
-            if next_char.isdigit():
-                return True
-
-            if _is_unicode_cased_letter(next_char) and next_char == next_char.lower():
-                return True
-
-    return False
+# def _looks_like_dot_abbreviation_at(text: str, index: int) -> bool:
+#     # Disabled by request: abbreviation detection is too heuristic.
+#     ...
 
 
-def _is_sentence_boundary_punctuation_at(text: str, index: int) -> bool:
-    if not isinstance(text, str) or index < 0 or index >= len(text):
-        return False
-
-    punctuation = text[index]
-    if punctuation not in _SENTENCE_END_PUNCTUATION:
-        return False
-
-    # Treat decimal points like 0.1 as non-terminal punctuation.
-    if punctuation == ".":
-        if _is_index_inside_url_or_email(text, index):
-            return False
-
-        prev_char = text[index - 1] if index > 0 else ""
-        next_char = text[index + 1] if index + 1 < len(text) else ""
-
-        # Keep in-token dots (domains, versions, abbreviations) non-terminal.
-        if prev_char.isalnum() and next_char.isalnum():
-            return False
-
-        # Keep ellipsis non-terminal.
-        if prev_char == "." or next_char == ".":
-            return False
-
-        if prev_char.isdigit() and next_char.isdigit():
-            return False
-
-        if _looks_like_dot_abbreviation_at(text, index):
-            window_start = max(0, index - 24)
-            window_end = min(len(text), index + 25)
-            context_window = text[window_start:window_end]
-            print(
-                "WARNING: _looks_like_dot_abbreviation_at returned true "
-                f"at index={index}; context='{context_window}'"
-            )
-            return False
-
-    return True
+# def _is_sentence_boundary_punctuation_at(text: str, index: int) -> bool:
+#     # Disabled by request: sentence-boundary detection currently depends on
+#     # _looks_like_dot_abbreviation_at and is considered too heuristic.
+#     ...
 
 
-def preserve_sentence_start_casing(
-    corrected_text: str,
-    no_touch_tokens: object = None,
-) -> tuple[str, bool]:
-    """Uppercase cased sentence starts after sentence-ending punctuation."""
-    if not isinstance(corrected_text, str) or not corrected_text:
-        return corrected_text, False
-
-    chars = list(corrected_text)
-    changed = False
-    index = 0
-
-    while index < len(chars):
-        if not _is_sentence_boundary_punctuation_at(corrected_text, index):
-            index += 1
-            continue
-
-        cursor = index + 1
-
-        # Skip closing quotes/brackets immediately after sentence-ending punctuation.
-        while cursor < len(chars) and chars[cursor] in _SENTENCE_CLOSERS:
-            cursor += 1
-
-        while cursor < len(chars) and chars[cursor].isspace():
-            cursor += 1
-
-        if cursor >= len(chars):
-            break
-
-        token_span = _cased_word_span_at(corrected_text, cursor)
-        if token_span is None:
-            index = cursor + 1
-            continue
-
-        current_token, token_start, _token_end = token_span
-        current = chars[token_start]
-
-        if _is_first_token_in_no_touch_entities(current_token, current_token, no_touch_tokens):
-            index = cursor + 1
-            continue
-
-        upper = current.upper()
-        if isinstance(upper, str) and len(upper) == 1 and upper != current:
-            chars[token_start] = upper
-            changed = True
-
-        index = cursor + 1
-
-    if not changed:
-        return corrected_text, False
-
-    return "".join(chars), True
+# def preserve_sentence_start_casing(
+#     corrected_text: str,
+#     no_touch_tokens: object = None,
+# ) -> tuple[str, bool]:
+#     # Disabled by request: sentence-start casing depends on punctuation boundary
+#     # heuristics that are currently considered too brittle.
+#     ...
 
 
 def _materialize_corrected_text(payload: dict) -> dict:
@@ -1672,15 +1689,22 @@ def parse_validate_and_apply_text_fixes(
     if payload is None:
         return None, validation_error, content
 
+    normalize_payload_result_newlines(payload, source_text)
+
     corrected_text = ""
     no_touch_tokens = None
     if isinstance(payload, dict):
-        ct_casing = payload.get("ct_casing")
-        ct_casing_result = ct_casing.get("result") if isinstance(ct_casing, dict) else None
         no_touch_tokens = payload.get("no_touch_tokens")
-        if isinstance(ct_casing_result, str):
-            corrected_text = ct_casing_result
-        else:
+
+        # Final chain result is the last active ct_* step in chain order.
+        for step_key in reversed(_STEP_CHAIN_KEYS):
+            step_payload = payload.get(step_key)
+            step_result = step_payload.get("result") if isinstance(step_payload, dict) else None
+            if isinstance(step_result, str):
+                corrected_text = step_result
+                break
+
+        if not corrected_text:
             existing_corrected_text = payload.get("corrected_text")
             corrected_text = existing_corrected_text if isinstance(existing_corrected_text, str) else ""
         payload["corrected_text"] = corrected_text
@@ -1698,16 +1722,17 @@ def parse_validate_and_apply_text_fixes(
         corrected_text,
         source_text,
     )
-    corrected_text, sentence_casing_normalized = preserve_sentence_start_casing(
-        corrected_text,
-        no_touch_tokens,
-    )
+    # Disable this as it calls _looks_like_dot_abbreviation_at which is too heuristic.
+    # corrected_text, sentence_casing_normalized = preserve_sentence_start_casing(
+    #     corrected_text,
+    #     no_touch_tokens,
+    # )
 
     if (
         casing_normalized
         or spacing_normalized
         or punctuation_normalized
-        or sentence_casing_normalized
+        # or sentence_casing_normalized
     ) and isinstance(payload, dict):
         payload["corrected_text"] = corrected_text
 
@@ -1830,7 +1855,8 @@ def resolve_template_path(
             template_path = Path(__file__).parent / template_path
         return template_path
 
-    return Path(__file__).with_name(default_filename)
+    default_path = Path(__file__).with_name(default_filename)
+    return default_path
 
 
 def resolve_required_template_path(
@@ -1850,7 +1876,7 @@ def resolve_patch_and_repair_template_paths(
 ) -> tuple[Path | None, Path | None, str | None]:
     prompt_template_path, prompt_path_error = resolve_required_template_path(
         patch_override_value,
-        "prompt_patch.txt",
+        "prompt_patch.md",
         "Patch prompt",
     )
     if prompt_path_error:
@@ -1858,7 +1884,7 @@ def resolve_patch_and_repair_template_paths(
 
     repair_prompt_template_path, repair_path_error = resolve_required_template_path(
         repair_override_value,
-        "prompt_repair.txt",
+        "prompt_repair.md",
         "Repair prompt",
     )
     if repair_path_error:
@@ -1915,10 +1941,63 @@ async def run_transcriptions_with_concurrency(
     return total
 
 
-def parse_transcriptions_from_file(input_path: Path) -> list[str]:
+def parse_transcriptions_from_file(input_path: Path) -> tuple[list[str], list[str | None]]:
+    def _strip_emphasis_tags(text: str) -> str:
+        if not isinstance(text, str) or not text:
+            return text
+        return re.sub(r"</?\s*(?:b|strong|em|i)\b[^>]*>", "", text, flags=re.IGNORECASE)
+
     raw_text = input_path.read_text(encoding="utf-8")
     if raw_text == "":
-        return []
+        return [], []
+
+    if input_path.suffix.lower() == ".tsv":
+        transcriptions: list[str] = []
+        source_filenames: list[str | None] = []
+
+        reader = csv.reader(raw_text.splitlines(), delimiter="\t")
+        first_row_is_header = False
+        for row_index, row in enumerate(reader):
+            if not row or not any(cell.strip() for cell in row):
+                continue
+
+            first_cell = row[0].strip() if len(row) > 0 else ""
+            last_cell = row[-1].strip() if len(row) > 0 else ""
+            if row_index == 0:
+                first_label = first_cell.lower().replace(" ", "_")
+                last_label = last_cell.lower().replace(" ", "_")
+                if first_label in {"filename", "file", "file_name"} and last_label in {
+                    "input",
+                    "input_segment",
+                    "segment",
+                    "transcription",
+                    "text",
+                }:
+                    first_row_is_header = True
+                    continue
+                if len(row) == 1 and first_label in {
+                    "input",
+                    "input_segment",
+                    "segment",
+                    "transcription",
+                    "text",
+                }:
+                    first_row_is_header = True
+                    continue
+
+            if len(row) >= 2:
+                filename = first_cell
+                segment = _strip_emphasis_tags(last_cell)
+            else:
+                filename = None
+                segment = _strip_emphasis_tags(first_cell)
+            transcriptions.append(segment)
+            source_filenames.append(filename)
+
+        if first_row_is_header and not transcriptions:
+            print("TSV input contains only header and no data rows.")
+
+        return transcriptions, source_filenames
 
     stripped = raw_text.strip()
 
@@ -1928,23 +2007,36 @@ def parse_transcriptions_from_file(input_path: Path) -> list[str]:
         parsed = None
 
     if isinstance(parsed, list):
-        transcriptions = [item.strip() for item in parsed if isinstance(item, str)]
-        return transcriptions
+        transcriptions = [_strip_emphasis_tags(item.strip()) for item in parsed if isinstance(item, str)]
+        return transcriptions, [None] * len(transcriptions)
 
     if isinstance(parsed, dict):
         items = parsed.get("transcriptions")
         if isinstance(items, list):
-            transcriptions = [item.strip() for item in items if isinstance(item, str)]
-            return transcriptions
+            transcriptions = [_strip_emphasis_tags(item.strip()) for item in items if isinstance(item, str)]
+            return transcriptions, [None] * len(transcriptions)
 
     transcriptions: list[str] = []
+    source_filenames: list[str | None] = []
     for line in raw_text.splitlines():
         if line.lstrip().startswith("#"):
             # Preserve comment lines verbatim so they can be emitted unchanged.
             transcriptions.append(line)
+            source_filenames.append(None)
             continue
-        transcriptions.append(line.strip())
-    return transcriptions
+
+        stripped_line = line.strip()
+        if "\t" in stripped_line:
+            parts = stripped_line.split("\t")
+            filename = parts[0].strip() or None
+            segment = _strip_emphasis_tags(parts[-1].strip())
+            transcriptions.append(segment)
+            source_filenames.append(filename)
+            continue
+
+        transcriptions.append(_strip_emphasis_tags(stripped_line))
+        source_filenames.append(None)
+    return transcriptions, source_filenames
 
 
 def is_input_comment_line(transcription: str) -> bool:
@@ -2034,24 +2126,28 @@ def normalize_all_uppercase_input(transcription: str) -> tuple[str, bool]:
     return lowered, True
 
 
-def collect_transcriptions_from_input(input_file_value: str | None) -> list[str] | None:
+def collect_transcriptions_from_input(
+    input_file_value: str | None,
+) -> tuple[list[str], list[str | None]] | None:
     transcriptions: list[str]
+    source_filenames: list[str | None]
     if input_file_value:
         input_path = resolve_path(input_file_value)
         if not input_path.exists():
             print(f"Input file not found: {input_path}")
             return None
-        transcriptions = parse_transcriptions_from_file(input_path)
+        transcriptions, source_filenames = parse_transcriptions_from_file(input_path)
         print(f"Read {len(transcriptions)} transcription(s) from: {input_path}")
     else:
         transcription = input("Enter transcription: ").strip()
         transcriptions = [transcription] if transcription else []
+        source_filenames = [None] * len(transcriptions)
 
     if not transcriptions:
         print("No transcription provided.")
         return None
 
-    return transcriptions
+    return transcriptions, source_filenames
 
 def assign_payload_or_emit_empty(
     payload: dict | None,
@@ -2084,10 +2180,19 @@ def finalize_payloads_and_write(
     payloads: list[dict | None],
     output_file_value: str | None,
     text_output_lines: list[str] | None = None,
+    source_filenames: list[str | None] | None = None,
+    output_as_tsv: bool | None = None,
 ) -> bool:
     if text_output_lines is not None and len(text_output_lines) != len(payloads):
-        print("Internal error: text output line count does not match payload count.")
-        return False
+        print("WARNING: text output line count does not match payload count; normalizing output lines.")
+        if len(text_output_lines) < len(payloads):
+            text_output_lines = [*text_output_lines, *([""] * (len(payloads) - len(text_output_lines)))]
+        else:
+            text_output_lines = text_output_lines[:len(payloads)]
+
+    if source_filenames is not None and len(source_filenames) != len(payloads):
+        print("WARNING: source filename count does not match payload count; omitting filename metadata in output.")
+        source_filenames = None
 
     if text_output_lines is None and any(payload is None for payload in payloads):
         print("Failed to produce output for one or more transcriptions.")
@@ -2096,18 +2201,94 @@ def finalize_payloads_and_write(
     if text_output_lines is not None:
         for index, payload in enumerate(payloads):
             if payload is None and not isinstance(text_output_lines[index], str):
-                print(f"Failed to produce output for transcription {index + 1}.")
-                return False
+                print(f"WARNING: invalid text output line for transcription {index + 1}; using empty text fallback.")
+                text_output_lines[index] = ""
+
+    fallback_text_lines: list[str]
+    if text_output_lines is None:
+        fallback_text_lines = []
+        for payload in payloads:
+            if isinstance(payload, dict):
+                corrected_text = payload.get("corrected_text")
+                fallback_text_lines.append(corrected_text if isinstance(corrected_text, str) else "")
+            else:
+                fallback_text_lines.append("")
+    else:
+        fallback_text_lines = [line if isinstance(line, str) else "" for line in text_output_lines]
 
     final_payloads = [payload for payload in payloads if isinstance(payload, dict)]
 
     is_valid, validation_error = validate_output_payloads(final_payloads)
     if not is_valid:
         print(validation_error)
-        return False
+        write_fallback_text_output(
+            output_file_value,
+            fallback_text_lines,
+            source_filenames,
+            reason="Output JSON validation failed",
+            output_as_tsv=output_as_tsv,
+        )
+        return True
 
-    write_output_artifacts(final_payloads, output_file_value, text_output_lines)
+    try:
+        write_output_artifacts(final_payloads, output_file_value, text_output_lines, source_filenames)
+    except Exception as error:
+        print(f"Failed to write JSON output: {error}")
+        write_fallback_text_output(
+            output_file_value,
+            fallback_text_lines,
+            source_filenames,
+            reason="Output JSON write failed",
+            output_as_tsv=output_as_tsv,
+        )
+        return True
     return True
+
+
+def write_fallback_text_output(
+    output_file_value: str | None,
+    text_lines: list[str],
+    source_filenames: list[str | None] | None = None,
+    reason: str | None = None,
+    output_as_tsv: bool | None = None,
+) -> None:
+    normalized_text_lines = [
+        sanitize_output_string(line if isinstance(line, str) else "")
+        for line in text_lines
+    ]
+    is_tsv_output = (
+        output_as_tsv
+        if isinstance(output_as_tsv, bool)
+        else bool(
+            source_filenames
+            and any(isinstance(filename, str) and filename.strip() for filename in source_filenames)
+        )
+    )
+
+    if source_filenames is not None and len(source_filenames) == len(normalized_text_lines):
+        fallback_lines = [
+                f"{sanitize_output_string(filename if isinstance(filename, str) else '')}\t{text}"
+            for filename, text in zip(source_filenames, normalized_text_lines)
+        ]
+    else:
+        fallback_lines = normalized_text_lines
+
+    fallback_content = "\n".join(fallback_lines)
+
+    if output_file_value:
+        output_path = resolve_path(output_file_value)
+        output_text_path = output_path.with_suffix(".tsv") if is_tsv_output else output_path.with_suffix(".txt")
+        output_text_path.parent.mkdir(parents=True, exist_ok=True)
+        output_text_path.write_text(fallback_content, encoding="utf-8")
+        if reason:
+            print(f"{reason}; wrote fallback text output to: {output_text_path}")
+        else:
+            print(f"Wrote fallback text output to: {output_text_path}")
+        return
+
+    if reason:
+        print(f"{reason}; emitting fallback text output to stdout.")
+    print(fallback_content)
 
 
 def strip_prompt_comments(prompt_text: str) -> str:
@@ -2120,7 +2301,11 @@ def strip_prompt_comments(prompt_text: str) -> str:
 
 
 def load_prompt_template(template_path: Path) -> str:
-    return strip_prompt_comments(template_path.read_text(encoding="utf-8"))
+    prompt_text = template_path.read_text(encoding="utf-8")
+    if template_path.suffix.lower() == ".md":
+        # Keep markdown headings/content intact for markdown-based prompts.
+        return prompt_text
+    return strip_prompt_comments(prompt_text)
 
 
 def load_patch_and_repair_templates(
@@ -2143,6 +2328,7 @@ _CHAIN_ID_TO_NAME = {
     "6": "NUMERAL",
     "7": "PUNCT",
     "8": "CASING",
+    "9": "REMAIN_FIX",
 }
 
 _CHAIN_NAME_TO_ID = {value: key for key, value in _CHAIN_ID_TO_NAME.items()}
@@ -2283,11 +2469,26 @@ def write_output_artifacts(
     payloads: list[dict],
     output_file_value: str | None,
     text_output_lines: list[str] | None = None,
+    source_filenames: list[str | None] | None = None,
+    output_as_tsv: bool | None = None,
 ) -> None:
+    is_tsv_output = (
+        output_as_tsv
+        if isinstance(output_as_tsv, bool)
+        else bool(
+            source_filenames
+            and any(isinstance(filename, str) and filename.strip() for filename in source_filenames)
+        )
+    )
+
     def _order_top_level_payload_keys(payload: dict) -> dict:
         ordered_payload: dict = {}
 
-        # Emit source_text first in serialized output when present.
+        # Emit source_filename first in serialized output when present.
+        if "source_filename" in payload:
+            ordered_payload["source_filename"] = payload["source_filename"]
+
+        # Emit source_text next in serialized output when present.
         if "source_text" in payload:
             ordered_payload["source_text"] = payload["source_text"]
 
@@ -2310,10 +2511,35 @@ def write_output_artifacts(
 
         return ordered_payload
 
+    def _sanitize_output_payload_value(value: object) -> object:
+        if isinstance(value, str):
+            return sanitize_output_string(value)
+        if isinstance(value, list):
+            return [_sanitize_output_payload_value(item) for item in value]
+        if isinstance(value, tuple):
+            return [_sanitize_output_payload_value(item) for item in value]
+        if isinstance(value, dict):
+            return {
+                key: _sanitize_output_payload_value(item)
+                for key, item in value.items()
+            }
+        return value
+
+    can_backfill_source_filename = (
+        source_filenames is not None
+        and len(source_filenames) == len(payloads)
+    )
+
     sanitized_payloads: list[dict] = []
-    for item in payloads:
+    for index, item in enumerate(payloads):
         if isinstance(item, dict):
-            payload_copy = dict(item)
+            payload_copy = _sanitize_output_payload_value(item)
+            if not isinstance(payload_copy, dict):
+                continue
+            if can_backfill_source_filename:
+                source_filename = source_filenames[index]
+                if isinstance(source_filename, str) and source_filename.strip():
+                    payload_copy["source_filename"] = sanitize_output_string(source_filename)
             payload_copy.pop("tokenization", None)
             sanitized_payloads.append(_order_top_level_payload_keys(payload_copy))
 
@@ -2325,25 +2551,59 @@ def write_output_artifacts(
         corrected_text_lines.append(corrected_text if isinstance(corrected_text, str) else "")
 
     if text_output_lines is None:
-        text_output_content = "\n".join(corrected_text_lines)
+        normalized_text_lines = corrected_text_lines
     else:
-        normalized_text_lines = [line if isinstance(line, str) else "" for line in text_output_lines]
-        text_output_content = "\n".join(normalized_text_lines)
+        normalized_text_lines = [
+            sanitize_output_string(line if isinstance(line, str) else "")
+            for line in text_output_lines
+        ]
+    text_output_content = "\n".join(normalized_text_lines)
+
+    normalized_source_filenames: list[str] = [""] * len(normalized_text_lines)
+    if source_filenames is not None:
+        if len(source_filenames) != len(normalized_text_lines):
+            print("WARNING: source filename count does not match output line count; omitting TSV filename column.")
+        else:
+            normalized_source_filenames = [
+                sanitize_output_string(value if isinstance(value, str) else "")
+                for value in source_filenames
+            ]
 
     output_content = json.dumps(output_payload, ensure_ascii=False, indent=2)
     if output_file_value:
         output_path = resolve_path(output_file_value)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(output_content, encoding="utf-8")
-        print(f"Wrote result to: {output_path}")
 
-        output_text_path = output_path.with_suffix(".txt")
+        output_json_path = output_path.with_suffix(".json")
+        output_json_path.write_text(output_content, encoding="utf-8")
 
-        output_text_path.parent.mkdir(parents=True, exist_ok=True)
-        output_text_path.write_text(text_output_content, encoding="utf-8")
-        print(f"Wrote text output file to: {output_text_path}")
+        if is_tsv_output:
+            output_tsv_path = output_path.with_suffix(".tsv")
+            with output_tsv_path.open("w", encoding="utf-8", newline="") as output_file:
+                writer = csv.writer(output_file, delimiter="\t", lineterminator="\n")
+                for filename, corrected_text in zip(normalized_source_filenames, normalized_text_lines):
+                    writer.writerow([filename, corrected_text])
+        else:
+            output_text_path = output_path.with_suffix(".txt")
+            output_text_path.parent.mkdir(parents=True, exist_ok=True)
+            output_text_path.write_text(text_output_content, encoding="utf-8")
     else:
         print(output_content)
+
+
+def sanitize_output_string(value: str) -> str:
+    if not isinstance(value, str):
+        return ""
+
+    normalized = (
+        value.replace("\r\n", " ")
+        .replace("\r", " ")
+        .replace("\n", " ")
+        .replace("\t", " ")
+        .replace('"', " ")
+    )
+    normalized = re.sub(r" {2,}", " ", normalized)
+    return normalized.strip()
 
 
 def format_repair_prompt(
@@ -2422,6 +2682,126 @@ def build_repair_prompt_after_invalid_json(
         target_schema,
         processing_id,
     )
+
+
+async def get_patch_payload_with_repair_generic(
+    prompt: str,
+    transcription: str,
+    processing_id: str,
+    repair_prompt_template: str,
+    target_schema: str,
+    timeout_seconds: float,
+    timeout_retries: int,
+    empty_result_retries: int,
+    send_prompt: Callable[[str, int], Awaitable[str | None]],
+    send_repair_prompt: Callable[[str, int], Awaitable[str | None]],
+    build_attempt_prompt: Callable[[str, int], str] | None = None,
+    skip_first_token_casing_preservation: bool = False,
+    repair_timeout_message: str = "Repair attempt timed out.",
+    repair_empty_message: str = "Repair retry returned empty output.",
+    strip_repair_content: bool = False,
+) -> dict | None:
+    for empty_attempt in range(empty_result_retries + 1):
+        attempt_prompt = (
+            build_attempt_prompt(prompt, empty_attempt)
+            if build_attempt_prompt is not None
+            else prompt
+        )
+
+        content = await send_prompt(attempt_prompt, empty_attempt)
+        if content is None:
+            print_timeout_and_retry_guidance(timeout_seconds, timeout_retries, processing_id)
+            return None
+
+        payload, validation_error, content = parse_validate_and_apply_text_fixes(
+            content,
+            transcription,
+            processing_id,
+            skip_first_token_casing_preservation=skip_first_token_casing_preservation,
+        )
+
+        if payload is None:
+            log_json_validation_with_key_error(validation_error, content, processing_id)
+
+            if is_non_repairable_validation_error(validation_error):
+                reason = (
+                    validation_error.removeprefix(non_repairable_prefix()).strip()
+                    if isinstance(validation_error, str)
+                    else "Model output is not repairable."
+                )
+                print(f"[{processing_id}] Skipping repair: {reason}")
+                should_retry = should_retry_after_failure(
+                    empty_attempt,
+                    empty_result_retries,
+                    "Model output is not repairable.",
+                    processing_id=processing_id,
+                )
+                if not should_retry:
+                    return None
+                continue
+
+            repair_prompt = build_repair_prompt_after_invalid_json(
+                repair_prompt_template,
+                validation_error,
+                content,
+                target_schema=target_schema,
+                processing_id=processing_id,
+            )
+
+            repaired_content = await send_repair_prompt(repair_prompt, empty_attempt)
+            if repaired_content is None:
+                should_retry = should_retry_after_failure(
+                    empty_attempt,
+                    empty_result_retries,
+                    repair_timeout_message,
+                    processing_id=processing_id,
+                )
+                if not should_retry:
+                    return None
+                continue
+
+            if strip_repair_content:
+                repaired_content = repaired_content.strip()
+
+            if not repaired_content:
+                should_retry = should_retry_after_failure(
+                    empty_attempt,
+                    empty_result_retries,
+                    repair_empty_message,
+                    processing_id=processing_id,
+                )
+                if not should_retry:
+                    return None
+                continue
+
+            payload, validation_error, repaired_content = parse_validate_and_apply_text_fixes(
+                repaired_content,
+                transcription,
+                processing_id,
+                skip_first_token_casing_preservation=skip_first_token_casing_preservation,
+            )
+            if payload is None:
+                should_retry = handle_invalid_repair_json_result(
+                    empty_attempt,
+                    empty_result_retries,
+                    validation_error,
+                    repaired_content,
+                    processing_id,
+                )
+                if not should_retry:
+                    return None
+                continue
+
+        result_payload, should_retry = resolve_payload_or_retry_on_empty_corrected_text(
+            payload,
+            empty_attempt,
+            empty_result_retries,
+            processing_id,
+        )
+        if not should_retry:
+            return result_payload
+
+    return None
 
 
 def apply_corrected_text_fallback(payload: dict) -> dict | None:

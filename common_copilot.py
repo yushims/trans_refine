@@ -6,18 +6,10 @@ from typing import Any
 
 from common import (
     build_patch_payload_schema,
-    build_repair_prompt_after_invalid_json,
     extract_retry_after_seconds,
     extract_text_content,
-    handle_invalid_repair_json_result,
-    is_non_repairable_validation_error,
-    log_json_validation_with_key_error,
-    non_repairable_prefix,
-    parse_validate_and_apply_text_fixes,
-    print_timeout_and_retry_guidance,
-    resolve_payload_or_retry_on_empty_corrected_text,
+    get_patch_payload_with_repair_generic,
     run_with_timeout_retry,
-    should_retry_after_failure,
 )
 
 
@@ -268,15 +260,16 @@ async def _get_copilot_patch_payload_with_repair_on_session(
         indent=2,
     )
 
-    for empty_attempt in range(empty_result_retries + 1):
-        attempt_prompt = prompt
+    def _build_attempt_prompt(base_prompt: str, empty_attempt: int) -> str:
+        attempt_prompt = base_prompt
         if empty_attempt > 0:
             retry_nonce = random.randint(1, 1_000_000_000)
-            attempt_prompt = f"{prompt}\n\nRetry nonce: {retry_nonce}"
+            attempt_prompt = f"{base_prompt}\n\nRetry nonce: {retry_nonce}"
         json_instruction_boost = "".join(["NO prose/reasoning!!! Only JSON!!! "] * (empty_attempt + 1) * 2)
-        attempt_prompt = f"{attempt_prompt}\n\nDirectly output JSON, {json_instruction_boost}Output JSON here:"
+        return f"{attempt_prompt}\n\nDirectly output JSON, {json_instruction_boost}Output JSON here:"
 
-        content = await send_copilot_with_timeout_retry(
+    async def _send_prompt(attempt_prompt: str, _empty_attempt: int) -> str | None:
+        return await send_copilot_with_timeout_retry(
             session,
             attempt_prompt,
             timeout_seconds,
@@ -285,100 +278,33 @@ async def _get_copilot_patch_payload_with_repair_on_session(
             requested_model,
         )
 
-        if content is None:
-            print_timeout_and_retry_guidance(timeout_seconds, timeout_retries, processing_id)
-            return None
-
-        payload, validation_error, content = parse_validate_and_apply_text_fixes(
-            content,
-            transcription,
+    async def _send_repair_prompt(repair_prompt: str, _empty_attempt: int) -> str | None:
+        return await send_copilot_with_timeout_retry(
+            session,
+            repair_prompt,
+            timeout_seconds,
+            timeout_retries,
             processing_id,
-            skip_first_token_casing_preservation=skip_first_token_casing_preservation,
+            requested_model,
         )
 
-        if payload is None:
-            log_json_validation_with_key_error(validation_error, content, processing_id)
-
-            if is_non_repairable_validation_error(validation_error):
-                reason = validation_error.removeprefix(non_repairable_prefix()).strip() if isinstance(validation_error, str) else "Model output is not repairable."
-                print(f"[{processing_id}] Skipping repair: {reason}")
-                should_retry = should_retry_after_failure(
-                    empty_attempt,
-                    empty_result_retries,
-                    "Model output is not repairable.",
-                    processing_id=processing_id,
-                )
-                if not should_retry:
-                    return None
-                continue
-
-            repair_prompt = build_repair_prompt_after_invalid_json(
-                repair_prompt_template,
-                validation_error,
-                content,
-                target_schema=patch_target_schema,
-                processing_id=processing_id,
-            )
-
-            repaired_content = await send_copilot_with_timeout_retry(
-                session,
-                repair_prompt,
-                timeout_seconds,
-                timeout_retries,
-                processing_id,
-                requested_model,
-            )
-            if repaired_content is None:
-                should_retry = should_retry_after_failure(
-                    empty_attempt,
-                    empty_result_retries,
-                    "Repair attempt timed out.",
-                    processing_id=processing_id,
-                )
-                if not should_retry:
-                    return None
-                continue
-
-            repaired_content = repaired_content.strip()
-            if not repaired_content:
-                should_retry = should_retry_after_failure(
-                    empty_attempt,
-                    empty_result_retries,
-                    "Repair retry returned empty output.",
-                    processing_id=processing_id,
-                )
-                if not should_retry:
-                    return None
-                continue
-
-            payload, validation_error, repaired_content = parse_validate_and_apply_text_fixes(
-                repaired_content,
-                transcription,
-                processing_id,
-                skip_first_token_casing_preservation=skip_first_token_casing_preservation,
-            )
-            if payload is None:
-                should_retry = handle_invalid_repair_json_result(
-                    empty_attempt,
-                    empty_result_retries,
-                    validation_error,
-                    repaired_content,
-                    processing_id,
-                )
-                if not should_retry:
-                    return None
-                continue
-
-        result_payload, should_retry = resolve_payload_or_retry_on_empty_corrected_text(
-            payload,
-            empty_attempt,
-            empty_result_retries,
-            processing_id,
-        )
-        if not should_retry:
-            return result_payload
-
-    return None
+    return await get_patch_payload_with_repair_generic(
+        prompt=prompt,
+        transcription=transcription,
+        processing_id=processing_id,
+        repair_prompt_template=repair_prompt_template,
+        target_schema=patch_target_schema,
+        timeout_seconds=timeout_seconds,
+        timeout_retries=timeout_retries,
+        empty_result_retries=empty_result_retries,
+        send_prompt=_send_prompt,
+        send_repair_prompt=_send_repair_prompt,
+        build_attempt_prompt=_build_attempt_prompt,
+        skip_first_token_casing_preservation=skip_first_token_casing_preservation,
+        repair_timeout_message="Repair attempt timed out.",
+        repair_empty_message="Repair retry returned empty output.",
+        strip_repair_content=True,
+    )
 
 
 async def get_copilot_patch_payload_with_repair(
