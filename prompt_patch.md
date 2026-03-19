@@ -110,7 +110,7 @@ Current profile: Arabic (`ORIGINAL` in Arabic script)
 ### [DISFLUENCY]
 
 * Remove fillers and false starts based on `AGGRESSIVENESS_LEVEL`.
-* Forbidden: do not delete long repeated spans (prevents audio-drift).
+* Do **NOT** delete long repeated spans (prevents audio-drift).
 * For no-whitespace scripts, only add words when omission is unmistakable and the fix is shortest possible.
 * Do **NOT** remove content that is repeated across different speakers or turns.
 * Do **NOT** perform numeral/format normalization or token recombination in this step.

@@ -59,10 +59,33 @@ DEFAULT_TOP_P = 1.0
 DEFAULT_RETRY_TEMPERATURE_JITTER = 0.08
 DEFAULT_RETRY_TOP_P_JITTER = 0.03
 DEFAULT_MODEL_MISMATCH_RETRIES = 2
+DEFAULT_LONG_SPAN_MIN_DELETED_TOKENS = 10
+DEFAULT_LONG_SPAN_MIN_DELETED_CHARS = 55
 DEFAULT_AOAI_ENDPOINT = "https://adaptationdev-resource.openai.azure.com/"
 DEFAULT_AOAI_API_VERSION = "2025-01-01-preview"
 DEFAULT_AOAI_DEPLOYMENT = "gpt-5-chat"
 DEFAULT_COPILOT_MODEL = "gpt-5.2"
+
+
+_long_span_min_deleted_tokens = DEFAULT_LONG_SPAN_MIN_DELETED_TOKENS
+_long_span_min_deleted_chars = DEFAULT_LONG_SPAN_MIN_DELETED_CHARS
+
+
+def configure_long_span_preservation_guard(
+    min_deleted_tokens: int | None = None,
+    min_deleted_chars: int | None = None,
+) -> None:
+    global _long_span_min_deleted_tokens
+    global _long_span_min_deleted_chars
+
+    if isinstance(min_deleted_tokens, int):
+        _long_span_min_deleted_tokens = max(1, min_deleted_tokens)
+    if isinstance(min_deleted_chars, int):
+        _long_span_min_deleted_chars = max(1, min_deleted_chars)
+
+
+def get_long_span_preservation_guard_config() -> tuple[int, int]:
+    return _long_span_min_deleted_tokens, _long_span_min_deleted_chars
 
 
 def add_common_runtime_cli_arguments(
@@ -80,6 +103,26 @@ def add_common_runtime_cli_arguments(
         dest="empty_result_retries",
         type=int,
         default=empty_result_retries_default,
+    )
+    parser.add_argument(
+        "--long-span-min-deleted-tokens",
+        dest="long_span_min_deleted_tokens",
+        type=int,
+        default=DEFAULT_LONG_SPAN_MIN_DELETED_TOKENS,
+        help=(
+            "Retry if a contiguous deleted source span has at least this many non-punctuation tokens "
+            f"(default: {DEFAULT_LONG_SPAN_MIN_DELETED_TOKENS})."
+        ),
+    )
+    parser.add_argument(
+        "--long-span-min-deleted-chars",
+        dest="long_span_min_deleted_chars",
+        type=int,
+        default=DEFAULT_LONG_SPAN_MIN_DELETED_CHARS,
+        help=(
+            "Retry if a contiguous deleted source span has at least this many characters "
+            f"(default: {DEFAULT_LONG_SPAN_MIN_DELETED_CHARS})."
+        ),
     )
 
 
@@ -1111,6 +1154,208 @@ def validate_corrected_text_hallucination(corrected_text: str, source_text: str)
     return True, ""
 
 
+def _folded_non_punct_tokens(text: str) -> list[str]:
+    if not isinstance(text, str) or not text.strip():
+        return []
+    tokens = _tokenize_for_hallucination(text)
+    return [token.casefold() for token in tokens if token.strip() and not _is_punct_token(token)]
+
+
+def _build_ngram_counter(tokens: list[str], phrase_length: int) -> Counter[tuple[str, ...]]:
+    counter: Counter[tuple[str, ...]] = Counter()
+    if phrase_length <= 0 or len(tokens) < phrase_length:
+        return counter
+
+    for start in range(0, len(tokens) - phrase_length + 1):
+        counter[tuple(tokens[start:start + phrase_length])] += 1
+
+    return counter
+
+
+def _no_space_script_char_stream(text: str) -> list[str]:
+    if not isinstance(text, str) or not text:
+        return []
+
+    chars: list[str] = []
+    for char in text:
+        if char.isspace():
+            continue
+        if unicodedata.category(char).startswith(("P", "S")):
+            continue
+        if _char_based_script_group(char) in _CHAR_BASED_NO_SPACE_GROUPS:
+            chars.append(char)
+
+    return chars
+
+
+def _build_char_ngram_counter(chars: list[str], ngram_length: int) -> Counter[tuple[str, ...]]:
+    counter: Counter[tuple[str, ...]] = Counter()
+    if ngram_length <= 0 or len(chars) < ngram_length:
+        return counter
+
+    for start in range(0, len(chars) - ngram_length + 1):
+        counter[tuple(chars[start:start + ngram_length])] += 1
+
+    return counter
+
+
+def validate_long_repeated_spans_preserved_no_space_scripts(
+    corrected_text: str,
+    source_text: str,
+) -> tuple[bool, str]:
+    if not isinstance(corrected_text, str) or not isinstance(source_text, str):
+        return True, ""
+
+    source_chars = _no_space_script_char_stream(source_text)
+    corrected_chars = _no_space_script_char_stream(corrected_text)
+    if len(source_chars) < 16:
+        return True, ""
+
+    min_ngram_chars = 8
+    max_ngram_chars = min(24, len(source_chars), len(corrected_chars) + 8)
+    if max_ngram_chars < min_ngram_chars:
+        return True, ""
+
+    for ngram_length in range(max_ngram_chars, min_ngram_chars - 1, -1):
+        source_counter = _build_char_ngram_counter(source_chars, ngram_length)
+        if not source_counter:
+            continue
+
+        corrected_counter = _build_char_ngram_counter(corrected_chars, ngram_length)
+        for phrase_tuple, source_count in source_counter.items():
+            if source_count < 2:
+                continue
+
+            corrected_count = corrected_counter.get(phrase_tuple, 0)
+            if corrected_count < source_count:
+                snippet = "".join(phrase_tuple[:16])
+                return (
+                    False,
+                    "long repeated no-space-script span was shortened "
+                    f"(source_repeats={source_count}, corrected_repeats={corrected_count}, "
+                    f"span='{snippet}')",
+                )
+
+    return True, ""
+
+
+def validate_no_long_span_removed_no_space_scripts(
+    corrected_text: str,
+    source_text: str,
+) -> tuple[bool, str]:
+    if not isinstance(corrected_text, str) or not isinstance(source_text, str):
+        return True, ""
+
+    source_chars = _no_space_script_char_stream(source_text)
+    corrected_chars = _no_space_script_char_stream(corrected_text)
+    if not source_chars:
+        return True, ""
+
+    _min_deleted_tokens, min_deleted_chars = get_long_span_preservation_guard_config()
+    min_deleted_no_space_chars = max(12, min_deleted_chars // 2)
+
+    matcher = difflib.SequenceMatcher(a=source_chars, b=corrected_chars, autojunk=False)
+    for tag, i1, i2, _j1, _j2 in matcher.get_opcodes():
+        if tag != "delete":
+            continue
+
+        deleted_chars = source_chars[i1:i2]
+        if len(deleted_chars) < min_deleted_no_space_chars:
+            continue
+
+        snippet = "".join(deleted_chars[:20])
+        return (
+            False,
+            "long no-space-script span was removed "
+            f"(deleted_chars={len(deleted_chars)}, threshold={min_deleted_no_space_chars}, "
+            f"span='{snippet}')",
+        )
+
+    return True, ""
+
+
+def validate_long_repeated_spans_preserved(
+    corrected_text: str,
+    source_text: str,
+) -> tuple[bool, str]:
+    if not isinstance(corrected_text, str) or not isinstance(source_text, str):
+        return True, ""
+
+    # Detect long repeated spans in source and ensure they are not collapsed.
+    source_tokens = _folded_non_punct_tokens(source_text)
+    corrected_tokens = _folded_non_punct_tokens(corrected_text)
+
+    min_phrase_tokens = 6
+    min_phrase_chars = 28
+    max_phrase_tokens = min(24, len(source_tokens), len(corrected_tokens) + 8)
+    if max_phrase_tokens < min_phrase_tokens:
+        return True, ""
+
+    for phrase_length in range(max_phrase_tokens, min_phrase_tokens - 1, -1):
+        source_counter = _build_ngram_counter(source_tokens, phrase_length)
+        if not source_counter:
+            continue
+
+        corrected_counter = _build_ngram_counter(corrected_tokens, phrase_length)
+        for phrase_tuple, source_count in source_counter.items():
+            if source_count < 2:
+                continue
+
+            phrase_text = " ".join(phrase_tuple)
+            if len(phrase_text) < min_phrase_chars:
+                continue
+
+            corrected_count = corrected_counter.get(phrase_tuple, 0)
+            if corrected_count < source_count:
+                snippet = " ".join(phrase_tuple[:12])
+                return (
+                    False,
+                    "long repeated span was shortened "
+                    f"(source_repeats={source_count}, corrected_repeats={corrected_count}, "
+                    f"span='{snippet}')",
+                )
+
+    return True, ""
+
+
+def validate_no_long_span_removed(
+    corrected_text: str,
+    source_text: str,
+) -> tuple[bool, str]:
+    if not isinstance(corrected_text, str) or not isinstance(source_text, str):
+        return True, ""
+
+    source_tokens = _folded_non_punct_tokens(source_text)
+    corrected_tokens = _folded_non_punct_tokens(corrected_text)
+    if not source_tokens:
+        return True, ""
+
+    matcher = difflib.SequenceMatcher(a=source_tokens, b=corrected_tokens, autojunk=False)
+
+    min_deleted_tokens, min_deleted_chars = get_long_span_preservation_guard_config()
+    for tag, i1, i2, _j1, _j2 in matcher.get_opcodes():
+        if tag != "delete":
+            continue
+
+        deleted_tokens = source_tokens[i1:i2]
+        if len(deleted_tokens) < min_deleted_tokens:
+            continue
+
+        deleted_span = " ".join(deleted_tokens).strip()
+        if len(deleted_span) < min_deleted_chars:
+            continue
+
+        snippet = " ".join(deleted_tokens[:12])
+        return (
+            False,
+            "long span was removed "
+            f"(deleted_tokens={len(deleted_tokens)}, deleted_chars={len(deleted_span)}, "
+            f"span='{snippet}')",
+        )
+
+    return True, ""
+
+
 def _is_unicode_cased_letter(char: str) -> bool:
     if not isinstance(char, str) or len(char) != 1:
         return False
@@ -1736,6 +1981,34 @@ def parse_validate_and_apply_text_fixes(
     ) and isinstance(payload, dict):
         payload["corrected_text"] = corrected_text
 
+    repeated_spans_ok, repeated_spans_error = validate_long_repeated_spans_preserved(
+        corrected_text,
+        source_text,
+    )
+    if not repeated_spans_ok:
+        return None, f"Repeated-span preservation check failed: {repeated_spans_error}", content
+
+    repeated_no_space_ok, repeated_no_space_error = validate_long_repeated_spans_preserved_no_space_scripts(
+        corrected_text,
+        source_text,
+    )
+    if not repeated_no_space_ok:
+        return None, f"Repeated-span preservation check failed: {repeated_no_space_error}", content
+
+    long_span_ok, long_span_error = validate_no_long_span_removed(
+        corrected_text,
+        source_text,
+    )
+    if not long_span_ok:
+        return None, f"Long-span preservation check failed: {long_span_error}", content
+
+    long_no_space_ok, long_no_space_error = validate_no_long_span_removed_no_space_scripts(
+        corrected_text,
+        source_text,
+    )
+    if not long_no_space_ok:
+        return None, f"Long-span preservation check failed: {long_no_space_error}", content
+
     hallucination_ok, hallucination_error = validate_corrected_text_hallucination(
         corrected_text,
         source_text,
@@ -1901,11 +2174,16 @@ def print_common_runtime_settings(
     timeout_retries: int,
     empty_result_retries: int,
 ) -> None:
+    min_deleted_tokens, min_deleted_chars = get_long_span_preservation_guard_config()
     print(f"Using patch prompt file: {prompt_template_path}")
     print(f"Using repair prompt file: {repair_prompt_template_path}")
     print(f"Concurrency: {concurrency}")
     print(f"Timeout: {timeout_seconds}s, retries: {timeout_retries}")
     print(f"Empty-result retries: {empty_result_retries}")
+    print(
+        "Long-span preservation guard: "
+        f"min_deleted_tokens={min_deleted_tokens}, min_deleted_chars={min_deleted_chars}"
+    )
 
 
 def print_processing_progress(index: int, total: int) -> None:
