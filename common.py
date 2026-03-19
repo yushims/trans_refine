@@ -62,8 +62,6 @@ DEFAULT_MODEL_MISMATCH_RETRIES = 2
 DEFAULT_MAX_INPUT_CHARS_PER_CALL = 6000
 DEFAULT_LONG_SPAN_MIN_DELETED_TOKENS = 10
 DEFAULT_LONG_SPAN_MIN_DELETED_CHARS = 55
-DEFAULT_REPEATED_SPAN_MIN_SOURCE_REPEATS = 2
-DEFAULT_REPEATED_SPAN_MIN_REPEAT_DROP = 1
 DEFAULT_AOAI_ENDPOINT = "https://adaptationdev-resource.openai.azure.com/"
 DEFAULT_AOAI_API_VERSION = "2025-01-01-preview"
 DEFAULT_AOAI_DEPLOYMENT = "gpt-5-chat"
@@ -72,8 +70,6 @@ DEFAULT_COPILOT_MODEL = "gpt-5.2"
 
 _long_span_min_deleted_tokens = DEFAULT_LONG_SPAN_MIN_DELETED_TOKENS
 _long_span_min_deleted_chars = DEFAULT_LONG_SPAN_MIN_DELETED_CHARS
-_repeated_span_min_source_repeats = DEFAULT_REPEATED_SPAN_MIN_SOURCE_REPEATS
-_repeated_span_min_repeat_drop = DEFAULT_REPEATED_SPAN_MIN_REPEAT_DROP
 
 
 def configure_long_span_preservation_guard(
@@ -91,23 +87,6 @@ def configure_long_span_preservation_guard(
 
 def get_long_span_preservation_guard_config() -> tuple[int, int]:
     return _long_span_min_deleted_tokens, _long_span_min_deleted_chars
-
-
-def configure_repeated_span_preservation_guard(
-    min_source_repeats: int | None = None,
-    min_repeat_drop: int | None = None,
-) -> None:
-    global _repeated_span_min_source_repeats
-    global _repeated_span_min_repeat_drop
-
-    if isinstance(min_source_repeats, int):
-        _repeated_span_min_source_repeats = max(2, min_source_repeats)
-    if isinstance(min_repeat_drop, int):
-        _repeated_span_min_repeat_drop = max(1, min_repeat_drop)
-
-
-def get_repeated_span_preservation_guard_config() -> tuple[int, int]:
-    return _repeated_span_min_source_repeats, _repeated_span_min_repeat_drop
 
 
 def add_common_runtime_cli_arguments(
@@ -155,26 +134,6 @@ def add_common_runtime_cli_arguments(
         help=(
             "Retry if a contiguous deleted source span has at least this many characters "
             f"(default: {DEFAULT_LONG_SPAN_MIN_DELETED_CHARS})."
-        ),
-    )
-    parser.add_argument(
-        "--repeated-span-min-source-repeats",
-        dest="repeated_span_min_source_repeats",
-        type=int,
-        default=DEFAULT_REPEATED_SPAN_MIN_SOURCE_REPEATS,
-        help=(
-            "Minimum repeat count in source for repeated-span collapse guard "
-            f"(default: {DEFAULT_REPEATED_SPAN_MIN_SOURCE_REPEATS})."
-        ),
-    )
-    parser.add_argument(
-        "--repeated-span-min-repeat-drop",
-        dest="repeated_span_min_repeat_drop",
-        type=int,
-        default=DEFAULT_REPEATED_SPAN_MIN_REPEAT_DROP,
-        help=(
-            "Minimum drop in repeat count (source - corrected) for repeated-span collapse guard "
-            f"(default: {DEFAULT_REPEATED_SPAN_MIN_REPEAT_DROP})."
         ),
     )
 
@@ -1269,8 +1228,6 @@ def validate_long_repeated_spans_preserved_no_space_scripts(
     if max_ngram_chars < min_ngram_chars:
         return True, ""
 
-    min_source_repeats, min_repeat_drop = get_repeated_span_preservation_guard_config()
-
     for ngram_length in range(max_ngram_chars, min_ngram_chars - 1, -1):
         source_counter = _build_char_ngram_counter(source_chars, ngram_length)
         if not source_counter:
@@ -1278,12 +1235,12 @@ def validate_long_repeated_spans_preserved_no_space_scripts(
 
         corrected_counter = _build_char_ngram_counter(corrected_chars, ngram_length)
         for phrase_tuple, source_count in source_counter.items():
-            if source_count < min_source_repeats:
+            if source_count < 2:
                 continue
 
             corrected_count = corrected_counter.get(phrase_tuple, 0)
             repeat_drop = source_count - corrected_count
-            if repeat_drop >= min_repeat_drop:
+            if repeat_drop >= 1:
                 snippet = "".join(phrase_tuple[:16])
                 return (
                     False,
@@ -1380,8 +1337,6 @@ def validate_long_repeated_spans_preserved(
     if max_phrase_tokens < min_phrase_tokens:
         return True, ""
 
-    min_source_repeats, min_repeat_drop = get_repeated_span_preservation_guard_config()
-
     for phrase_length in range(max_phrase_tokens, min_phrase_tokens - 1, -1):
         source_counter = _build_ngram_counter(source_tokens, phrase_length)
         if not source_counter:
@@ -1389,7 +1344,7 @@ def validate_long_repeated_spans_preserved(
 
         corrected_counter = _build_ngram_counter(corrected_tokens, phrase_length)
         for phrase_tuple, source_count in source_counter.items():
-            if source_count < min_source_repeats:
+            if source_count < 2:
                 continue
 
             phrase_text = " ".join(phrase_tuple)
@@ -1398,7 +1353,7 @@ def validate_long_repeated_spans_preserved(
 
             corrected_count = corrected_counter.get(phrase_tuple, 0)
             repeat_drop = source_count - corrected_count
-            if repeat_drop >= min_repeat_drop:
+            if repeat_drop >= 1:
                 snippet = " ".join(phrase_tuple[:12])
                 return (
                     False,
@@ -2277,7 +2232,6 @@ def print_common_runtime_settings(
     max_input_chars_per_call: int,
 ) -> None:
     min_deleted_tokens, min_deleted_chars = get_long_span_preservation_guard_config()
-    min_source_repeats, min_repeat_drop = get_repeated_span_preservation_guard_config()
     print(f"Using patch prompt file: {prompt_template_path}")
     print(f"Using repair prompt file: {repair_prompt_template_path}")
     print(f"Concurrency: {concurrency}")
@@ -2293,7 +2247,7 @@ def print_common_runtime_settings(
     )
     print(
         "Repeated-span preservation guard: "
-        f"min_source_repeats={min_source_repeats}, min_repeat_drop={min_repeat_drop}"
+        "min_source_repeats=2, min_repeat_drop=1"
     )
 
 
