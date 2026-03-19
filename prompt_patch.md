@@ -15,6 +15,7 @@
 * Forbidden: rewrites, paraphrases, reordering, style/idiom edits; semantic-content deletion or unsupported lexical additions (hallucinations).
 * Keep `ORIGINAL` language/script variant unchanged by default. Do **NOT** perform transliteration or orthographic normalization unless explicit in-line evidence requires it.
 * For writing systems with multiple orthographic variants, treat character form as lexical content; do **NOT** swap characters for normalization.
+* Treat `ORIGINAL` as a possibly chunked segment of a longer utterance. Do **NOT** delete text to improve global coherence outside the current segment.
 * Prefer to avoid em dash; use language-appropriate alternatives.
 * For technically ambiguous tokens or protected entities without clear evidence, prefer the **no-edit** decision.
 
@@ -113,6 +114,8 @@ Current profile: Arabic (`ORIGINAL` in Arabic script)
 
 * Remove fillers and false starts based on `AGGRESSIVENESS_LEVEL`.
 * Do **NOT** delete long repeated spans (prevents audio-drift).
+* Only collapse repetitions when all of the following hold: (a) repetition is adjacent, (b) repeated unit is short (filler-like), and (c) no new lexical information appears between repeats.
+* Never reduce repeated long-span counts in one segment, even by 1.
 * For no-whitespace scripts, only add words when omission is unmistakable and the fix is shortest possible.
 * Do **NOT** remove content that is repeated across different speakers or turns.
 * Do **NOT** perform numeral/format normalization or token recombination in this step.
@@ -215,6 +218,8 @@ Current profile: Arabic (`ORIGINAL` in Arabic script)
 ## 7. DETERMINISM TARGET
 
 Prefer idempotent output on re-run, no meaningful segment loss, no hallucinated lexical content, and consistent punctuation/capitalization/spacing.
+
+Repeated-span safety check before finalizing active steps: if the source contains repeated long spans, preserve their repetition structure unless duplication is clearly adjacent filler-level stutter.
 
 ---
 
