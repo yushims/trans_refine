@@ -98,11 +98,12 @@ Current profile: Arabic (`ORIGINAL` in Arabic script)
 
 ### [LEXICAL]
 
-* Fix typos and phonetic ASR errors.
+* Fix typos and phonetic ASR errors only.
 * Preserve pronunciation similarity. Use `ENGLISH_TRANSLATION` for disambiguation only.
-* For Arabic input, lexical edits must be limited to spelling/orthography standardization toward formal MSA writing while preserving meaning and original style.
+* Do NOT replace a valid token with a different valid token unless there is clear evidence from `ORIGINAL` that the original token is incorrect.
+* For Arabic input, lexical edits must be limited to spelling/orthography standardization of the same token toward formal MSA writing while preserving meaning and original style.
 * For Arabic input, remove diacritics but do not replace base letters unless fixing a clear spelling error supported by `ORIGINAL` evidence.
-* Forbidden: do **NOT** normalize brand/proper-name forms from `ENGLISH_TRANSLATION` alone; require explicit in-line `ORIGINAL` evidence.
+* Do **NOT** normalize brand/proper-name forms from `ENGLISH_TRANSLATION` alone; require explicit in-line `ORIGINAL` evidence.
 * Do **NOT** edit any protected token/span from `NO_TOUCH` (no replace/insert/delete/reorder).
 * You are **STRICTLY FORBIDDEN** from reordering tokens to match English syntax. Even if `ENGLISH_TRANSLATION` suggests a different word order, you **MUST** maintain the original token sequence from `ORIGINAL`.
 
