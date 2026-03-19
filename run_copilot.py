@@ -19,10 +19,12 @@ from common import (
     normalize_all_uppercase_input,
     is_input_comment_line,
     load_patch_and_repair_templates,
+    merge_segment_payloads,
     print_common_runtime_settings,
     resolve_active_chain_step_keys,
     resolve_patch_and_repair_template_paths,
     run_transcriptions_with_concurrency,
+    split_transcription_for_llm,
     write_output_artifacts,
 )
 from common_copilot import (
@@ -86,6 +88,7 @@ async def main():
     timeout_seconds = args.timeout
     timeout_retries = max(0, args.timeout_retries)
     empty_result_retries = max(0, args.empty_result_retries)
+    max_input_chars_per_call = max(0, int(args.max_input_chars_per_call))
     long_span_min_deleted_tokens = max(1, int(args.long_span_min_deleted_tokens))
     long_span_min_deleted_chars = max(1, int(args.long_span_min_deleted_chars))
     configure_long_span_preservation_guard(
@@ -118,6 +121,7 @@ async def main():
         timeout_seconds,
         timeout_retries,
         empty_result_retries,
+        max_input_chars_per_call,
     )
     prompt_template, repair_prompt_template = load_patch_and_repair_templates(
         prompt_template_path,
@@ -195,31 +199,69 @@ async def main():
             # if case_normalized:
             #     print(f"[{processing_id}] Normalized all-uppercase input to display casing before prompt.")
 
-            prompt = build_patch_prompt(
-                prompt_template,
-                prompt_transcription,
-                chain_steps,
-            )
             try:
                 session_parameters = build_copilot_session_parameters(model)
 
                 async def create_session() -> Any:
                     return await client.create_session(session_parameters)
 
-                payload = await get_copilot_patch_payload_with_repair(
-                    create_session,
-                    prompt,
+                segments = split_transcription_for_llm(
                     prompt_transcription,
-                    processing_id,
-                    requested_model,
-                    repair_prompt_template,
-                    timeout_seconds,
-                    timeout_retries,
-                    empty_result_retries,
-                    model_mismatch_retries,
-                    skip_first_token_casing_preservation,
-                    active_step_keys,
+                    max_input_chars_per_call,
                 )
+                if len(segments) > 1:
+                    print(
+                        f"[{processing_id}] Input length {len(prompt_transcription)} exceeded "
+                        f"max-input-chars-per-call={max_input_chars_per_call}; "
+                        f"processing {len(segments)} segments."
+                    )
+
+                segment_payloads: list[dict] = []
+                payload: dict | None = None
+                for segment_index, segment_transcription in enumerate(segments, start=1):
+                    segment_processing_id = (
+                        f"{processing_id} seg {segment_index}/{len(segments)}"
+                        if len(segments) > 1
+                        else processing_id
+                    )
+                    prompt = build_patch_prompt(
+                        prompt_template,
+                        segment_transcription,
+                        chain_steps,
+                    )
+                    segment_payload = await get_copilot_patch_payload_with_repair(
+                        create_session,
+                        prompt,
+                        segment_transcription,
+                        segment_processing_id,
+                        requested_model,
+                        repair_prompt_template,
+                        timeout_seconds,
+                        timeout_retries,
+                        empty_result_retries,
+                        model_mismatch_retries,
+                        skip_first_token_casing_preservation,
+                        active_step_keys,
+                    )
+                    if segment_payload is None:
+                        payload = None
+                        break
+                    segment_payloads.append(segment_payload)
+
+                if segments and len(segments) > 1:
+                    if len(segment_payloads) != len(segments):
+                        payload = None
+                    else:
+                        payload = merge_segment_payloads(segment_payloads, segments)
+                    if payload is None:
+                        print(
+                            f"[{processing_id}] Failed to merge segmented payloads; "
+                            "emitting empty payload."
+                        )
+                elif segment_payloads:
+                    payload = segment_payloads[0]
+                else:
+                    payload = None
 
                 assign_payload_or_emit_empty(payload, payloads, slot, index, total)
                 resolved_payload = payloads[slot]

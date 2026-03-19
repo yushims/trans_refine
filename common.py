@@ -59,6 +59,7 @@ DEFAULT_TOP_P = 1.0
 DEFAULT_RETRY_TEMPERATURE_JITTER = 0.08
 DEFAULT_RETRY_TOP_P_JITTER = 0.03
 DEFAULT_MODEL_MISMATCH_RETRIES = 2
+DEFAULT_MAX_INPUT_CHARS_PER_CALL = 6000
 DEFAULT_LONG_SPAN_MIN_DELETED_TOKENS = 10
 DEFAULT_LONG_SPAN_MIN_DELETED_CHARS = 55
 DEFAULT_AOAI_ENDPOINT = "https://adaptationdev-resource.openai.azure.com/"
@@ -94,6 +95,7 @@ def add_common_runtime_cli_arguments(
     concurrency_default: int = DEFAULT_CONCURRENCY,
     timeout_retries_default: int = DEFAULT_TIMEOUT_RETRIES,
     empty_result_retries_default: int = DEFAULT_EMPTY_RESULT_RETRIES,
+    max_input_chars_per_call_default: int = DEFAULT_MAX_INPUT_CHARS_PER_CALL,
 ) -> None:
     parser.add_argument("--concurrency", dest="concurrency", type=int, default=concurrency_default)
     parser.add_argument("--timeout", dest="timeout", type=float, default=timeout_default)
@@ -103,6 +105,16 @@ def add_common_runtime_cli_arguments(
         dest="empty_result_retries",
         type=int,
         default=empty_result_retries_default,
+    )
+    parser.add_argument(
+        "--max-input-chars-per-call",
+        dest="max_input_chars_per_call",
+        type=int,
+        default=max_input_chars_per_call_default,
+        help=(
+            "Split very long input into smaller segments and call the model once per segment "
+            f"(default: {DEFAULT_MAX_INPUT_CHARS_PER_CALL}; 0 disables segmentation)."
+        ),
     )
     parser.add_argument(
         "--long-span-min-deleted-tokens",
@@ -2213,6 +2225,7 @@ def print_common_runtime_settings(
     timeout_seconds: float,
     timeout_retries: int,
     empty_result_retries: int,
+    max_input_chars_per_call: int,
 ) -> None:
     min_deleted_tokens, min_deleted_chars = get_long_span_preservation_guard_config()
     print(f"Using patch prompt file: {prompt_template_path}")
@@ -2220,10 +2233,274 @@ def print_common_runtime_settings(
     print(f"Concurrency: {concurrency}")
     print(f"Timeout: {timeout_seconds}s, retries: {timeout_retries}")
     print(f"Empty-result retries: {empty_result_retries}")
+    if max_input_chars_per_call > 0:
+        print(f"Long-input segmentation: enabled, max chars per call={max_input_chars_per_call}")
+    else:
+        print("Long-input segmentation: disabled")
     print(
         "Long-span preservation guard: "
         f"min_deleted_tokens={min_deleted_tokens}, min_deleted_chars={min_deleted_chars}"
     )
+
+
+def _find_segment_cut_index(text: str, start: int, max_chars: int) -> int:
+    text_length = len(text)
+    hard_limit = min(text_length, start + max_chars)
+    if hard_limit >= text_length:
+        return text_length
+
+    min_candidate = start + max(1, max_chars // 2)
+    window = text[start:hard_limit]
+
+    def _candidate_from_find(fragment: str) -> int | None:
+        index = window.rfind(fragment)
+        if index < 0:
+            return None
+        candidate = start + index + len(fragment)
+        if candidate < min_candidate:
+            return None
+        return candidate
+
+    for marker in ("\n\n", "\r\n\r\n", "\n", "\r\n"):
+        candidate = _candidate_from_find(marker)
+        if candidate is not None:
+            return _stabilize_segment_cut_index(text, start, candidate, hard_limit)
+
+    sentence_candidates: list[int] = []
+    sentence_chars = ".!?;:。！？；："
+    for match in re.finditer(r"[.!?;:。！？；：]\s", window):
+        candidate = start + match.start() + 1
+        if candidate >= min_candidate:
+            sentence_candidates.append(candidate)
+    if sentence_candidates:
+        return _stabilize_segment_cut_index(text, start, sentence_candidates[-1], hard_limit)
+
+    for index in range(len(window) - 1, -1, -1):
+        if window[index].isspace():
+            candidate = start + index + 1
+            if candidate >= min_candidate:
+                return _stabilize_segment_cut_index(text, start, candidate, hard_limit)
+
+    for index in range(len(window) - 1, -1, -1):
+        if window[index] in sentence_chars:
+            candidate = start + index + 1
+            if candidate >= min_candidate:
+                return _stabilize_segment_cut_index(text, start, candidate, hard_limit)
+
+    return _stabilize_segment_cut_index(text, start, hard_limit, hard_limit)
+
+
+def _is_unicode_join_or_modifier(char: str) -> bool:
+    if not isinstance(char, str) or len(char) != 1:
+        return False
+    code = ord(char)
+    category = unicodedata.category(char)
+    if category in {"Mn", "Mc", "Me"}:
+        return True
+    if char in {"\u200d", "\u200c"}:
+        return True
+    if 0xFE00 <= code <= 0xFE0F:
+        return True
+    if 0xE0100 <= code <= 0xE01EF:
+        return True
+    if 0x1F3FB <= code <= 0x1F3FF:
+        return True
+    return False
+
+
+def _is_regional_indicator(char: str) -> bool:
+    if not isinstance(char, str) or len(char) != 1:
+        return False
+    code = ord(char)
+    return 0x1F1E6 <= code <= 0x1F1FF
+
+
+def _splits_regional_indicator_pair(text: str, cut_index: int) -> bool:
+    if not isinstance(text, str):
+        return False
+    if cut_index <= 0 or cut_index >= len(text):
+        return False
+    if not (_is_regional_indicator(text[cut_index - 1]) and _is_regional_indicator(text[cut_index])):
+        return False
+
+    run_start = cut_index - 1
+    while run_start - 1 >= 0 and _is_regional_indicator(text[run_start - 1]):
+        run_start -= 1
+
+    run_length_before_cut = cut_index - run_start
+    return run_length_before_cut % 2 == 1
+
+
+def _stabilize_segment_cut_index(text: str, start: int, candidate: int, hard_limit: int) -> int:
+    text_length = len(text)
+    minimum = start + 1
+    cut_index = max(minimum, min(candidate, hard_limit))
+
+    while cut_index < text_length:
+        previous_char = text[cut_index - 1] if cut_index - 1 >= 0 else ""
+        current_char = text[cut_index]
+        if previous_char == "\u200d" or _is_unicode_join_or_modifier(current_char):
+            if cut_index >= hard_limit:
+                break
+            cut_index += 1
+            continue
+        if _splits_regional_indicator_pair(text, cut_index):
+            if cut_index >= hard_limit:
+                break
+            cut_index += 1
+            continue
+        break
+
+    while cut_index > start:
+        previous_char = text[cut_index - 1] if cut_index - 1 >= 0 else ""
+        current_is_modifier = cut_index < text_length and _is_unicode_join_or_modifier(text[cut_index])
+        if previous_char == "\u200d" or current_is_modifier:
+            cut_index -= 1
+            continue
+        break
+
+    while (
+        cut_index < text_length
+        and cut_index > start
+        and _splits_regional_indicator_pair(text, cut_index)
+    ):
+        cut_index -= 1
+
+    if cut_index <= start:
+        return min(text_length, start + 1)
+    return cut_index
+
+
+def split_transcription_for_llm(transcription: str, max_chars_per_call: int) -> list[str]:
+    if not isinstance(transcription, str):
+        return [""]
+
+    max_chars = max(0, int(max_chars_per_call))
+    if max_chars == 0 or len(transcription) <= max_chars:
+        return [transcription]
+
+    segments: list[str] = []
+    start = 0
+    text_length = len(transcription)
+    while start < text_length:
+        cut_index = _find_segment_cut_index(transcription, start, max_chars)
+        if cut_index <= start:
+            cut_index = min(text_length, start + max_chars)
+        segments.append(transcription[start:cut_index])
+        start = cut_index
+
+    return segments if segments else [transcription]
+
+
+def merge_segment_payloads(
+    segment_payloads: list[dict],
+    segment_sources: list[str],
+) -> dict | None:
+    if not segment_payloads:
+        return None
+
+    merged_payload = build_empty_payload()
+
+    merged_tokens: list[str] = []
+    merged_no_touch_tokens: list[str] = []
+    seen_no_touch_tokens: set[str] = set()
+    merged_translations: list[str] = []
+    merged_corrected_parts: list[str] = []
+    merged_step_results: dict[str, list[str]] = {step_key: [] for step_key in _STEP_CHAIN_KEYS}
+    merged_step_edits: dict[str, list[list[str]]] = {step_key: [] for step_key in _STEP_CHAIN_KEYS}
+
+    aggressiveness_rank = {"low": 0, "medium": 1, "high": 2}
+    ranked_aggressiveness_values: list[int] = []
+    saw_single_scope = False
+    saw_multi_scope = False
+
+    for payload in segment_payloads:
+        if not isinstance(payload, dict):
+            return None
+
+        tokenization = payload.get("tokenization")
+        tokens = tokenization.get("tokens") if isinstance(tokenization, dict) else None
+        if isinstance(tokens, list):
+            for token in tokens:
+                if isinstance(token, str):
+                    merged_tokens.append(token)
+
+        translation = payload.get("translation")
+        if isinstance(translation, str) and translation:
+            merged_translations.append(translation)
+
+        aggressiveness_level = payload.get("aggressiveness_level")
+        if isinstance(aggressiveness_level, str) and aggressiveness_level in aggressiveness_rank:
+            ranked_aggressiveness_values.append(aggressiveness_rank[aggressiveness_level])
+
+        speaker_scope = payload.get("speaker_scope")
+        if speaker_scope == "single":
+            saw_single_scope = True
+        elif speaker_scope == "multi":
+            saw_multi_scope = True
+
+        no_touch_tokens = payload.get("no_touch_tokens")
+        if isinstance(no_touch_tokens, list):
+            for token in no_touch_tokens:
+                if isinstance(token, str) and token not in seen_no_touch_tokens:
+                    seen_no_touch_tokens.add(token)
+                    merged_no_touch_tokens.append(token)
+
+        for step_key in _STEP_CHAIN_KEYS:
+            step_payload = payload.get(step_key)
+            if not isinstance(step_payload, dict):
+                continue
+            step_result = step_payload.get("result")
+            if isinstance(step_result, str):
+                merged_step_results[step_key].append(step_result)
+            step_edits = step_payload.get("edits")
+            if isinstance(step_edits, list):
+                for pair in step_edits:
+                    if (
+                        isinstance(pair, list)
+                        and len(pair) == 2
+                        and isinstance(pair[0], str)
+                        and isinstance(pair[1], str)
+                    ):
+                        merged_step_edits[step_key].append([pair[0], pair[1]])
+
+        corrected_text = payload.get("corrected_text")
+        if isinstance(corrected_text, str):
+            merged_corrected_parts.append(corrected_text)
+
+    merged_payload["tokenization"]["tokens"] = merged_tokens
+    merged_payload["translation"] = "\n\n".join(merged_translations) if merged_translations else ""
+
+    if ranked_aggressiveness_values:
+        max_rank = max(ranked_aggressiveness_values)
+        reverse_rank = {rank: level for level, rank in aggressiveness_rank.items()}
+        merged_payload["aggressiveness_level"] = reverse_rank.get(max_rank, "low")
+    else:
+        merged_payload["aggressiveness_level"] = "low"
+
+    if saw_multi_scope:
+        merged_payload["speaker_scope"] = "multi"
+    elif saw_single_scope:
+        merged_payload["speaker_scope"] = "single"
+    else:
+        merged_payload["speaker_scope"] = "unknown"
+
+    merged_payload["no_touch_tokens"] = merged_no_touch_tokens
+
+    for step_key in _STEP_CHAIN_KEYS:
+        merged_payload[step_key]["edits"] = merged_step_edits[step_key]
+        merged_payload[step_key]["result"] = "".join(merged_step_results[step_key])
+
+    merged_payload["corrected_text"] = "".join(merged_corrected_parts)
+
+    if segment_sources:
+        merged_payload["source_text"] = "".join(segment_sources)
+
+    is_valid, _validation_error = validate_patch_payload(merged_payload)
+    if not is_valid:
+        return None
+
+    return merged_payload
 
 
 def print_processing_progress(index: int, total: int) -> None:
