@@ -108,6 +108,7 @@ async def get_patch_payload_with_repair(
     retry_temperature_jitter: float,
     retry_top_p_jitter: float,
     skip_first_token_casing_preservation: bool = False,
+    active_step_keys: set[str] | None = None,
 ) -> dict | None:
     attempt_temperatures: list[float] = []
     attempt_top_ps: list[float] = []
@@ -169,6 +170,7 @@ async def get_patch_payload_with_repair(
         send_prompt=_send_prompt,
         send_repair_prompt=_send_repair_prompt,
         skip_first_token_casing_preservation=skip_first_token_casing_preservation,
+        active_step_keys=active_step_keys,
         repair_timeout_message="Repair returned empty output or timed out.",
         repair_empty_message="Repair returned empty output or timed out.",
     )
