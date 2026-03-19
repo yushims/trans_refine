@@ -66,14 +66,16 @@ async def main():
 
     transcriptions: list[str]
     source_filenames: list[str | None]
+    source_rows: list[list[str] | None]
     if args.list_models_only:
         transcriptions = []
         source_filenames = []
+        source_rows = []
     else:
         input_data = collect_transcriptions_from_input(input_file_value)
         if input_data is None:
             return
-        transcriptions, source_filenames = input_data
+        transcriptions, source_filenames, source_rows = input_data
 
     model = args.model
     configured_concurrency = args.concurrency
@@ -152,6 +154,7 @@ async def main():
                         output_file_value,
                         text_output_lines,
                         source_filenames,
+                        source_rows,
                         output_as_tsv,
                     )
                 except Exception as error:
@@ -247,6 +250,7 @@ async def main():
             output_file_value,
             text_output_lines,
             source_filenames,
+            source_rows,
             output_as_tsv,
         ):
             return

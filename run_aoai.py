@@ -71,7 +71,7 @@ async def main() -> None:
     input_data = collect_transcriptions_from_input(input_file_value)
     if input_data is None:
         return
-    transcriptions, source_filenames = input_data
+    transcriptions, source_filenames, source_rows = input_data
 
     endpoint = args.endpoint
     deployment = args.deployment
@@ -160,6 +160,7 @@ async def main() -> None:
                     output_file_value,
                     text_output_lines,
                     source_filenames,
+                    source_rows,
                     output_as_tsv,
                 )
             except Exception as error:
@@ -252,6 +253,7 @@ async def main() -> None:
         output_file_value,
         text_output_lines,
         source_filenames,
+        source_rows,
         output_as_tsv,
     ):
         return

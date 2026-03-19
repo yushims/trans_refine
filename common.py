@@ -1941,7 +1941,26 @@ async def run_transcriptions_with_concurrency(
     return total
 
 
-def parse_transcriptions_from_file(input_path: Path) -> tuple[list[str], list[str | None]]:
+def parse_transcriptions_from_file(
+    input_path: Path,
+) -> tuple[list[str], list[str | None], list[list[str] | None]]:
+    def _select_source_identifier(cells: list[str]) -> str | None:
+        if not cells or len(cells) < 2:
+            return None
+
+        # Treat the last column as the segment text; prefer the metadata column
+        # immediately before it as a stable row-level identifier.
+        preferred = cells[-2].strip()
+        if preferred:
+            return preferred
+
+        for value in reversed(cells[:-1]):
+            candidate = value.strip()
+            if candidate:
+                return candidate
+
+        return None
+
     def _strip_emphasis_tags(text: str) -> str:
         if not isinstance(text, str) or not text:
             return text
@@ -1949,11 +1968,12 @@ def parse_transcriptions_from_file(input_path: Path) -> tuple[list[str], list[st
 
     raw_text = input_path.read_text(encoding="utf-8")
     if raw_text == "":
-        return [], []
+        return [], [], []
 
     if input_path.suffix.lower() == ".tsv":
         transcriptions: list[str] = []
         source_filenames: list[str | None] = []
+        source_rows: list[list[str] | None] = []
 
         reader = csv.reader(raw_text.splitlines(), delimiter="\t")
         first_row_is_header = False
@@ -1986,18 +2006,19 @@ def parse_transcriptions_from_file(input_path: Path) -> tuple[list[str], list[st
                     continue
 
             if len(row) >= 2:
-                filename = first_cell
+                filename = _select_source_identifier(row)
                 segment = _strip_emphasis_tags(last_cell)
             else:
                 filename = None
                 segment = _strip_emphasis_tags(first_cell)
             transcriptions.append(segment)
             source_filenames.append(filename)
+            source_rows.append(list(row))
 
         if first_row_is_header and not transcriptions:
             print("TSV input contains only header and no data rows.")
 
-        return transcriptions, source_filenames
+        return transcriptions, source_filenames, source_rows
 
     stripped = raw_text.strip()
 
@@ -2008,35 +2029,39 @@ def parse_transcriptions_from_file(input_path: Path) -> tuple[list[str], list[st
 
     if isinstance(parsed, list):
         transcriptions = [_strip_emphasis_tags(item.strip()) for item in parsed if isinstance(item, str)]
-        return transcriptions, [None] * len(transcriptions)
+        return transcriptions, [None] * len(transcriptions), [None] * len(transcriptions)
 
     if isinstance(parsed, dict):
         items = parsed.get("transcriptions")
         if isinstance(items, list):
             transcriptions = [_strip_emphasis_tags(item.strip()) for item in items if isinstance(item, str)]
-            return transcriptions, [None] * len(transcriptions)
+            return transcriptions, [None] * len(transcriptions), [None] * len(transcriptions)
 
     transcriptions: list[str] = []
     source_filenames: list[str | None] = []
+    source_rows: list[list[str] | None] = []
     for line in raw_text.splitlines():
         if line.lstrip().startswith("#"):
             # Preserve comment lines verbatim so they can be emitted unchanged.
             transcriptions.append(line)
             source_filenames.append(None)
+            source_rows.append(None)
             continue
 
         stripped_line = line.strip()
         if "\t" in stripped_line:
             parts = stripped_line.split("\t")
-            filename = parts[0].strip() or None
+            filename = _select_source_identifier(parts)
             segment = _strip_emphasis_tags(parts[-1].strip())
             transcriptions.append(segment)
             source_filenames.append(filename)
+            source_rows.append(parts)
             continue
 
         transcriptions.append(_strip_emphasis_tags(stripped_line))
         source_filenames.append(None)
-    return transcriptions, source_filenames
+        source_rows.append(None)
+    return transcriptions, source_filenames, source_rows
 
 
 def is_input_comment_line(transcription: str) -> bool:
@@ -2128,26 +2153,28 @@ def normalize_all_uppercase_input(transcription: str) -> tuple[str, bool]:
 
 def collect_transcriptions_from_input(
     input_file_value: str | None,
-) -> tuple[list[str], list[str | None]] | None:
+) -> tuple[list[str], list[str | None], list[list[str] | None]] | None:
     transcriptions: list[str]
     source_filenames: list[str | None]
+    source_rows: list[list[str] | None]
     if input_file_value:
         input_path = resolve_path(input_file_value)
         if not input_path.exists():
             print(f"Input file not found: {input_path}")
             return None
-        transcriptions, source_filenames = parse_transcriptions_from_file(input_path)
+        transcriptions, source_filenames, source_rows = parse_transcriptions_from_file(input_path)
         print(f"Read {len(transcriptions)} transcription(s) from: {input_path}")
     else:
         transcription = input("Enter transcription: ").strip()
         transcriptions = [transcription] if transcription else []
         source_filenames = [None] * len(transcriptions)
+        source_rows = [None] * len(transcriptions)
 
     if not transcriptions:
         print("No transcription provided.")
         return None
 
-    return transcriptions, source_filenames
+    return transcriptions, source_filenames, source_rows
 
 def assign_payload_or_emit_empty(
     payload: dict | None,
@@ -2181,6 +2208,7 @@ def finalize_payloads_and_write(
     output_file_value: str | None,
     text_output_lines: list[str] | None = None,
     source_filenames: list[str | None] | None = None,
+    source_rows: list[list[str] | None] | None = None,
     output_as_tsv: bool | None = None,
 ) -> bool:
     if text_output_lines is not None and len(text_output_lines) != len(payloads):
@@ -2193,6 +2221,10 @@ def finalize_payloads_and_write(
     if source_filenames is not None and len(source_filenames) != len(payloads):
         print("WARNING: source filename count does not match payload count; omitting filename metadata in output.")
         source_filenames = None
+
+    if source_rows is not None and len(source_rows) != len(payloads):
+        print("WARNING: source row count does not match payload count; omitting row metadata in output.")
+        source_rows = None
 
     if text_output_lines is None and any(payload is None for payload in payloads):
         print("Failed to produce output for one or more transcriptions.")
@@ -2225,19 +2257,28 @@ def finalize_payloads_and_write(
             output_file_value,
             fallback_text_lines,
             source_filenames,
+            source_rows,
             reason="Output JSON validation failed",
             output_as_tsv=output_as_tsv,
         )
         return True
 
     try:
-        write_output_artifacts(final_payloads, output_file_value, text_output_lines, source_filenames)
+        write_output_artifacts(
+            final_payloads,
+            output_file_value,
+            text_output_lines,
+            source_filenames,
+            source_rows,
+            output_as_tsv,
+        )
     except Exception as error:
         print(f"Failed to write JSON output: {error}")
         write_fallback_text_output(
             output_file_value,
             fallback_text_lines,
             source_filenames,
+            source_rows,
             reason="Output JSON write failed",
             output_as_tsv=output_as_tsv,
         )
@@ -2249,6 +2290,7 @@ def write_fallback_text_output(
     output_file_value: str | None,
     text_lines: list[str],
     source_filenames: list[str | None] | None = None,
+    source_rows: list[list[str] | None] | None = None,
     reason: str | None = None,
     output_as_tsv: bool | None = None,
 ) -> None:
@@ -2273,13 +2315,29 @@ def write_fallback_text_output(
     else:
         fallback_lines = normalized_text_lines
 
+    fallback_rows: list[list[str]] | None = None
+    if source_rows is not None and len(source_rows) == len(normalized_text_lines):
+        fallback_rows = []
+        for original_row, corrected_text in zip(source_rows, normalized_text_lines):
+            if isinstance(original_row, list) and original_row:
+                rebuilt_row = [sanitize_output_string(value) for value in original_row]
+                rebuilt_row[-1] = corrected_text
+                fallback_rows.append(rebuilt_row)
+            else:
+                fallback_rows.append([corrected_text])
+
     fallback_content = "\n".join(fallback_lines)
 
     if output_file_value:
         output_path = resolve_path(output_file_value)
         output_text_path = output_path.with_suffix(".tsv") if is_tsv_output else output_path.with_suffix(".txt")
         output_text_path.parent.mkdir(parents=True, exist_ok=True)
-        output_text_path.write_text(fallback_content, encoding="utf-8")
+        if is_tsv_output and fallback_rows is not None:
+            with output_text_path.open("w", encoding="utf-8", newline="") as output_file:
+                writer = csv.writer(output_file, delimiter="\t", lineterminator="\n")
+                writer.writerows(fallback_rows)
+        else:
+            output_text_path.write_text(fallback_content, encoding="utf-8")
         if reason:
             print(f"{reason}; wrote fallback text output to: {output_text_path}")
         else:
@@ -2470,6 +2528,7 @@ def write_output_artifacts(
     output_file_value: str | None,
     text_output_lines: list[str] | None = None,
     source_filenames: list[str | None] | None = None,
+    source_rows: list[list[str] | None] | None = None,
     output_as_tsv: bool | None = None,
 ) -> None:
     is_tsv_output = (
@@ -2569,6 +2628,18 @@ def write_output_artifacts(
                 for value in source_filenames
             ]
 
+    normalized_source_rows: list[list[str] | None] | None = None
+    if source_rows is not None:
+        if len(source_rows) != len(normalized_text_lines):
+            print("WARNING: source row count does not match output line count; omitting full-row TSV reconstruction.")
+        else:
+            normalized_source_rows = []
+            for row in source_rows:
+                if isinstance(row, list):
+                    normalized_source_rows.append([sanitize_output_string(value) for value in row])
+                else:
+                    normalized_source_rows.append(None)
+
     output_content = json.dumps(output_payload, ensure_ascii=False, indent=2)
     if output_file_value:
         output_path = resolve_path(output_file_value)
@@ -2581,7 +2652,23 @@ def write_output_artifacts(
             output_tsv_path = output_path.with_suffix(".tsv")
             with output_tsv_path.open("w", encoding="utf-8", newline="") as output_file:
                 writer = csv.writer(output_file, delimiter="\t", lineterminator="\n")
-                for filename, corrected_text in zip(normalized_source_filenames, normalized_text_lines):
+                for row_index, corrected_text in enumerate(normalized_text_lines):
+                    if (
+                        normalized_source_rows is not None
+                        and row_index < len(normalized_source_rows)
+                        and isinstance(normalized_source_rows[row_index], list)
+                        and normalized_source_rows[row_index]
+                    ):
+                        row = list(normalized_source_rows[row_index])
+                        row[-1] = corrected_text
+                        writer.writerow(row)
+                        continue
+
+                    filename = (
+                        normalized_source_filenames[row_index]
+                        if row_index < len(normalized_source_filenames)
+                        else ""
+                    )
                     writer.writerow([filename, corrected_text])
         else:
             output_text_path = output_path.with_suffix(".txt")
