@@ -12,6 +12,7 @@ from common import (
     build_empty_payload,
     collect_transcriptions_from_input,
     configure_long_span_preservation_guard,
+    configure_repeated_span_preservation_guard,
     finalize_payloads_and_write,
     format_resolved_chain_steps,
     is_all_lowercase_cased_input,
@@ -91,9 +92,15 @@ async def main():
     max_input_chars_per_call = max(0, int(args.max_input_chars_per_call))
     long_span_min_deleted_tokens = max(1, int(args.long_span_min_deleted_tokens))
     long_span_min_deleted_chars = max(1, int(args.long_span_min_deleted_chars))
+    repeated_span_min_source_repeats = max(2, int(args.repeated_span_min_source_repeats))
+    repeated_span_min_repeat_drop = max(1, int(args.repeated_span_min_repeat_drop))
     configure_long_span_preservation_guard(
         min_deleted_tokens=long_span_min_deleted_tokens,
         min_deleted_chars=long_span_min_deleted_chars,
+    )
+    configure_repeated_span_preservation_guard(
+        min_source_repeats=repeated_span_min_source_repeats,
+        min_repeat_drop=repeated_span_min_repeat_drop,
     )
     model_mismatch_retries = max(0, args.model_mismatch_retries)
     chain_steps = [step for step in (args.chain_steps or []) if isinstance(step, str) and step.strip()]
