@@ -51,6 +51,7 @@ Current profile: Arabic (`ORIGINAL` in Arabic script)
 
 ### [AGGRESSIVENESS_LEVEL]
 
+* Estimate `aggressiveness_level` once as `low`/`medium`/`high` from transcript quality signals (ASR disfluencies, punctuation sparsity, boundary ambiguity, token noise).
 * Mapping: `low` (conservative), `medium` (balanced), `high` (aggressive punctuation/fluency).
 * This value is locked for the full chain. Never violate Forbidden constraints regardless of level.
 
@@ -68,6 +69,7 @@ Current profile: Arabic (`ORIGINAL` in Arabic script)
 * Lexical content **MUST** come from `ORIGINAL`.
 * Formatting, casing, and punctuation density **SHOULD** follow `ENGLISH_TRANSLATION`.
 * Do **NOT** use translation to trigger rewrites or semantic substitutions.
+* `ENGLISH_TRANSLATION` is reference-only: do **NOT** use it by itself to trigger schema/key changes, step skipping, or output-field changes.
 
 ---
 
@@ -146,8 +148,12 @@ Current profile: Arabic (`ORIGINAL` in Arabic script)
 * Use `AGGRESSIVENESS_LEVEL` to control punctuation-density matching; when `high`, mirror the full punctuation/rhythmic cadence of `ENGLISH_TRANSLATION` even with higher edit count.
 * Insert punctuation at the earliest clear boundary where a new Subject-Verb clause begins.
 * Add missing sentence-ending marks before any sentence-start capitalization.
+* Boundary restoration rule: when `ENGLISH_TRANSLATION` clearly indicates multiple sentence boundaries, mirror those boundaries with language-appropriate sentence-ending marks unless contradicted by strong `ORIGINAL` evidence.
+* If a boundary from `ENGLISH_TRANSLATION` resolves run-on ambiguity and is supported by `ORIGINAL`, prioritize that boundary over the fewest-edits tie-break.
+* Run-on control: if a segment is long and contains 2+ clear clause boundaries, split into multiple sentences instead of keeping a single comma chain.
 * For scripts without whitespace, resolve all inter-character spaces into punctuation (preferring commas for flow) or remove them.
-* Downgrade sentence-ending marks to commas unless there is a significant topic shift or thought finalization.
+* Conditional downgrade rule: if `ORIGINAL` is over-segmented (spurious full stops between tightly connected fragments of one thought), downgrade those specific sentence-ending marks to commas.
+* Do **NOT** downgrade true sentence boundaries; keep full-stop boundaries for complete thoughts, topic shifts, or boundaries supported by `ENGLISH_TRANSLATION`.
 * Do **NOT** insert punctuation adjacent to existing marks to avoid redundant or stacked punctuation.
 * At segment end, avoid changing terminal punctuation by default; allow change only when strongly supported by clear clause completion within the current segment.
 
@@ -179,9 +185,10 @@ Current profile: Arabic (`ORIGINAL` in Arabic script)
 ## 5. EXECUTION DISCIPLINE
 
 1. **Chain Order:** `{chain_steps}`.
-2. **Inactive Steps:** Must be pass-through: `{"edits": [], "result": <unchanged>}`.
+2. **Inactive Steps:** Must be pass-through: `{"edits": [], "result": <unchanged input-to-that-step>}`; if `NO_TOUCH` is inactive, `no_touch_tokens` must be `[]`.
 3. **Left-to-Right:** Process text exhaustively per step before moving to the next.
 4. **No Type-Creep:** Each step performs only its assigned edit type (except `REMAIN_FIX`).
+4. **No Type-Creep (Strict):** If an edit belongs to another step, leave it unchanged in the current step and defer it to the designated step.
 5. **Completion Rule:** Emit each active step result only after exhaustively fixing all in-scope cases or explicitly leaving ambiguous cases unchanged.
 6. **Step-Translation Discipline:** Every active step must consult `ENGLISH_TRANSLATION` under global policy and its own step rules.
 7. **Edits Disambiguation:** Interpret each `[before, after]` left-to-right on the first unmatched occurrence in the current step input.
