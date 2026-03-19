@@ -15,6 +15,7 @@ from common import (
     build_patch_response_format_schema,
     build_empty_payload,
     collect_transcriptions_from_input,
+    configure_long_span_preservation_guard,
     finalize_payloads_and_write,
     format_resolved_chain_steps,
     is_all_lowercase_cased_input,
@@ -82,6 +83,12 @@ async def main() -> None:
     timeout_seconds = args.timeout
     timeout_retries = max(0, args.timeout_retries)
     empty_result_retries = max(0, args.empty_result_retries)
+    long_span_min_deleted_tokens = max(1, int(args.long_span_min_deleted_tokens))
+    long_span_min_deleted_chars = max(1, int(args.long_span_min_deleted_chars))
+    configure_long_span_preservation_guard(
+        min_deleted_tokens=long_span_min_deleted_tokens,
+        min_deleted_chars=long_span_min_deleted_chars,
+    )
 
     temperature = args.temperature
     top_p = args.top_p
