@@ -20,6 +20,7 @@ from common import (
     is_input_comment_line,
     load_patch_and_repair_templates,
     print_common_runtime_settings,
+    resolve_active_chain_step_keys,
     resolve_patch_and_repair_template_paths,
     run_transcriptions_with_concurrency,
     write_output_artifacts,
@@ -93,6 +94,7 @@ async def main():
     )
     model_mismatch_retries = max(0, args.model_mismatch_retries)
     chain_steps = [step for step in (args.chain_steps or []) if isinstance(step, str) and step.strip()]
+    active_step_keys = resolve_active_chain_step_keys(chain_steps)
     progress_write_every = max(1, args.progress_write_every)
 
     prompt_template_path, repair_prompt_template_path, template_error = resolve_patch_and_repair_template_paths(
@@ -216,6 +218,7 @@ async def main():
                     empty_result_retries,
                     model_mismatch_retries,
                     skip_first_token_casing_preservation,
+                    active_step_keys,
                 )
 
                 assign_payload_or_emit_empty(payload, payloads, slot, index, total)

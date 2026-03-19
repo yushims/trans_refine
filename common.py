@@ -1274,6 +1274,38 @@ def validate_no_long_span_removed_no_space_scripts(
     return True, ""
 
 
+def validate_inactive_step_edits_empty(
+    payload: dict,
+    active_step_keys: set[str] | None,
+) -> tuple[bool, str]:
+    if not isinstance(payload, dict):
+        return True, ""
+    if not isinstance(active_step_keys, set):
+        return True, ""
+
+    inactive_steps_with_edits: list[str] = []
+    for step_key in _STEP_CHAIN_KEYS:
+        if step_key in active_step_keys:
+            continue
+
+        step_payload = payload.get(step_key)
+        if not isinstance(step_payload, dict):
+            continue
+
+        edits = step_payload.get("edits")
+        if isinstance(edits, list) and len(edits) > 0:
+            inactive_steps_with_edits.append(step_key)
+
+    if inactive_steps_with_edits:
+        return (
+            False,
+            "inactive chain step contains non-empty edits "
+            f"(steps={', '.join(inactive_steps_with_edits)})",
+        )
+
+    return True, ""
+
+
 def validate_long_repeated_spans_preserved(
     corrected_text: str,
     source_text: str,
@@ -1925,6 +1957,7 @@ def parse_validate_and_apply_text_fixes(
     source_text: str,
     processing_id: str,
     skip_first_token_casing_preservation: bool = False,
+    active_step_keys: set[str] | None = None,
 ) -> tuple[dict | None, str | None, str]:
     content = raw_content.strip()
     if not content:
@@ -1980,6 +2013,13 @@ def parse_validate_and_apply_text_fixes(
         # or sentence_casing_normalized
     ) and isinstance(payload, dict):
         payload["corrected_text"] = corrected_text
+
+    inactive_edits_ok, inactive_edits_error = validate_inactive_step_edits_empty(
+        payload,
+        active_step_keys,
+    )
+    if not inactive_edits_ok:
+        return None, f"Inactive-step edits check failed: {inactive_edits_error}", content
 
     repeated_spans_ok, repeated_spans_error = validate_long_repeated_spans_preserved(
         corrected_text,
@@ -2778,6 +2818,29 @@ def format_resolved_chain_steps(chain_steps: list[str] | None) -> str:
     )
 
 
+def resolve_active_chain_step_keys(chain_steps: list[str] | None) -> set[str]:
+    """Resolve active chain selectors into payload step keys that own `edits` fields."""
+    active_chain_ids = _resolve_active_chain_ids(chain_steps)
+    chain_id_to_step_key = {
+        "0": "ct_speaker",
+        "1": "ct_combine",
+        "3": "ct_lexical",
+        "4": "ct_disfluency",
+        "5": "ct_format",
+        "6": "ct_numeral",
+        "7": "ct_punct",
+        "8": "ct_casing",
+        "9": "ct_remain_fix",
+    }
+
+    resolved_step_keys: set[str] = set()
+    for chain_id in active_chain_ids:
+        step_key = chain_id_to_step_key.get(chain_id)
+        if isinstance(step_key, str):
+            resolved_step_keys.add(step_key)
+    return resolved_step_keys
+
+
 def build_patch_prompt(
     prompt_template: str,
     transcription: str,
@@ -2785,15 +2848,33 @@ def build_patch_prompt(
 ) -> str:
     active_chain_ids = _resolve_active_chain_ids(chain_steps)
     active_chain_names = [_CHAIN_ID_TO_NAME[chain_id] for chain_id in active_chain_ids]
+    active_step_keys = resolve_active_chain_step_keys(chain_steps)
+    inactive_step_keys = [step_key for step_key in _STEP_CHAIN_KEYS if step_key not in active_step_keys]
 
     chain_steps_text = "\n".join(
         f"{chain_id}) {chain_name}"
         for chain_id, chain_name in zip(active_chain_ids, active_chain_names)
     )
 
+    active_payload_steps_text = ", ".join(sorted(active_step_keys)) if active_step_keys else "<none>"
+    inactive_payload_steps_text = ", ".join(inactive_step_keys) if inactive_step_keys else "<none>"
+    runtime_chain_policy = (
+        "[RUNTIME_CHAIN_POLICY]\n"
+        f"- Active chain IDs: {', '.join(active_chain_ids)}\n"
+        f"- Active payload step keys: {active_payload_steps_text}\n"
+        f"- Inactive payload step keys: {inactive_payload_steps_text}\n"
+        "- For every inactive payload step key, edits MUST be [] and result MUST be pass-through unchanged.\n"
+        "- If any inactive payload step has non-empty edits, the output is invalid and will be retried.\n"
+        "- If NO_TOUCH is inactive, no_touch_tokens MUST be []."
+    )
+
     prompt = prompt_template
     if "{chain_steps}" in prompt:
         prompt = prompt.replace("{chain_steps}", chain_steps_text)
+    if "{runtime_chain_policy}" in prompt:
+        prompt = prompt.replace("{runtime_chain_policy}", runtime_chain_policy)
+    else:
+        prompt = f"{prompt}\n\n{runtime_chain_policy}"
     if "{input_transcript}" in prompt:
         prompt = prompt.replace("{input_transcript}", transcription)
         return prompt
@@ -3062,6 +3143,7 @@ async def get_patch_payload_with_repair_generic(
     send_repair_prompt: Callable[[str, int], Awaitable[str | None]],
     build_attempt_prompt: Callable[[str, int], str] | None = None,
     skip_first_token_casing_preservation: bool = False,
+    active_step_keys: set[str] | None = None,
     repair_timeout_message: str = "Repair attempt timed out.",
     repair_empty_message: str = "Repair retry returned empty output.",
     strip_repair_content: bool = False,
@@ -3083,6 +3165,7 @@ async def get_patch_payload_with_repair_generic(
             transcription,
             processing_id,
             skip_first_token_casing_preservation=skip_first_token_casing_preservation,
+            active_step_keys=active_step_keys,
         )
 
         if payload is None:
@@ -3144,6 +3227,7 @@ async def get_patch_payload_with_repair_generic(
                 transcription,
                 processing_id,
                 skip_first_token_casing_preservation=skip_first_token_casing_preservation,
+                active_step_keys=active_step_keys,
             )
             if payload is None:
                 should_retry = handle_invalid_repair_json_result(
