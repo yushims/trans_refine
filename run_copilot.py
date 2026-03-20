@@ -90,10 +90,8 @@ async def main():
     empty_result_retries = max(0, args.empty_result_retries)
     max_input_chars_per_call = max(0, int(args.max_input_chars_per_call))
     long_span_min_deleted_tokens = max(1, int(args.long_span_min_deleted_tokens))
-    long_span_min_deleted_chars = max(1, int(args.long_span_min_deleted_chars))
     configure_long_span_preservation_guard(
         min_deleted_tokens=long_span_min_deleted_tokens,
-        min_deleted_chars=long_span_min_deleted_chars,
     )
     model_mismatch_retries = max(0, args.model_mismatch_retries)
     chain_steps = [step for step in (args.chain_steps or []) if isinstance(step, str) and step.strip()]
@@ -169,6 +167,7 @@ async def main():
                         source_filenames,
                         source_rows,
                         output_as_tsv,
+                        active_step_keys,
                     )
                 except Exception as error:
                     print(f"Failed to write progress snapshot: {error}")
@@ -304,6 +303,7 @@ async def main():
             source_filenames,
             source_rows,
             output_as_tsv,
+            active_step_keys,
         ):
             return
 
