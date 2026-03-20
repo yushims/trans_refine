@@ -51,7 +51,7 @@ _OPTIONAL_TOP_LEVEL_KEYS = set(_OPTIONAL_TOP_LEVEL_KEY_ORDER)
 
 
 DEFAULT_CONCURRENCY = 5
-DEFAULT_TIMEOUT_SECONDS = 600.0
+DEFAULT_TIMEOUT_SECONDS = 1000.0
 DEFAULT_TIMEOUT_RETRIES = 1
 DEFAULT_EMPTY_RESULT_RETRIES = 1
 DEFAULT_TEMPERATURE = 0.0
@@ -2366,6 +2366,61 @@ def split_transcription_for_llm(transcription: str, max_chars_per_call: int) -> 
     return segments if segments else [transcription]
 
 
+def _is_word_like_join_char(char: str) -> bool:
+    if not isinstance(char, str) or len(char) != 1:
+        return False
+    if char.isspace():
+        return False
+    category = unicodedata.category(char)
+    return category.startswith("L") or category.startswith("N")
+
+
+def _needs_space_between_segment_parts(left: str, right: str) -> bool:
+    if not isinstance(left, str) or not isinstance(right, str):
+        return False
+    if not left or not right:
+        return False
+
+    left_char = left[-1]
+    right_char = right[0]
+    if left_char.isspace() or right_char.isspace():
+        return False
+
+    left_category = unicodedata.category(left_char)
+    right_category = unicodedata.category(right_char)
+    if left_category.startswith(("P", "S")) or right_category.startswith(("P", "S")):
+        return False
+
+    left_group = _char_based_script_group(left_char)
+    right_group = _char_based_script_group(right_char)
+    if (
+        left_group is not None
+        and right_group is not None
+        and left_group == right_group
+        and left_group in _CHAR_BASED_NO_SPACE_GROUPS
+    ):
+        return False
+
+    return _is_word_like_join_char(left_char) and _is_word_like_join_char(right_char)
+
+
+def join_segment_text_parts(parts: list[str]) -> str:
+    merged_parts: list[str] = []
+    previous_part = ""
+
+    for part in parts:
+        if not isinstance(part, str) or not part:
+            continue
+
+        if merged_parts and _needs_space_between_segment_parts(previous_part, part):
+            merged_parts.append(" ")
+
+        merged_parts.append(part)
+        previous_part = part
+
+    return "".join(merged_parts)
+
+
 def merge_segment_payloads(
     segment_payloads: list[dict],
     segment_sources: list[str],
@@ -2463,9 +2518,9 @@ def merge_segment_payloads(
 
     for step_key in _STEP_CHAIN_KEYS:
         merged_payload[step_key]["edits"] = merged_step_edits[step_key]
-        merged_payload[step_key]["result"] = "".join(merged_step_results[step_key])
+        merged_payload[step_key]["result"] = join_segment_text_parts(merged_step_results[step_key])
 
-    merged_payload["corrected_text"] = "".join(merged_corrected_parts)
+    merged_payload["corrected_text"] = join_segment_text_parts(merged_corrected_parts)
 
     if segment_sources:
         merged_payload["source_text"] = "".join(segment_sources)
