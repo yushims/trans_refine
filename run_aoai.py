@@ -88,10 +88,8 @@ async def main() -> None:
     empty_result_retries = max(0, args.empty_result_retries)
     max_input_chars_per_call = max(0, int(args.max_input_chars_per_call))
     long_span_min_deleted_tokens = max(1, int(args.long_span_min_deleted_tokens))
-    long_span_min_deleted_chars = max(1, int(args.long_span_min_deleted_chars))
     configure_long_span_preservation_guard(
         min_deleted_tokens=long_span_min_deleted_tokens,
-        min_deleted_chars=long_span_min_deleted_chars,
     )
 
     temperature = args.temperature
@@ -175,6 +173,7 @@ async def main() -> None:
                     source_filenames,
                     source_rows,
                     output_as_tsv,
+                    active_step_keys,
                 )
             except Exception as error:
                 print(f"Failed to write progress snapshot: {error}")
@@ -310,6 +309,7 @@ async def main() -> None:
         source_filenames,
         source_rows,
         output_as_tsv,
+        active_step_keys,
     ):
         return
 
