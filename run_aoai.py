@@ -208,7 +208,7 @@ async def main() -> None:
         # if case_normalized:
         #     print(f"[{processing_id}] Normalized all-uppercase input to display casing before prompt.")
 
-        if True:
+        try:
             source_length = len(prompt_transcription)
             if max_input_chars_per_call > 0 and source_length > max_input_chars_per_call:
                 print(
@@ -334,26 +334,26 @@ async def main() -> None:
                 corrected_text = resolved_payload.get("corrected_text")
                 text_output_lines[slot] = corrected_text if isinstance(corrected_text, str) else ""
             await maybe_write_progress_snapshot()
-        # except asyncio.CancelledError:
-        #     payloads[slot] = build_empty_payload()
-        #     payloads[slot]["source_text"] = transcription
-        #     text_output_lines[slot] = ""
-        #     print(
-        #         f"Cancelled while processing transcription {index}/{total}; "
-        #         "emitting empty payload."
-        #     )
-        #     await maybe_write_progress_snapshot()
-        #     return
-        # except Exception as error:
-        #     payloads[slot] = build_empty_payload()
-        #     payloads[slot]["source_text"] = transcription
-        #     text_output_lines[slot] = ""
-        #     print(
-        #         f"Unexpected error on transcription {index}/{total}: {error}; "
-        #         "emitting empty payload."
-        #     )
-        #     await maybe_write_progress_snapshot()
-        #     return
+        except asyncio.CancelledError:
+            payloads[slot] = build_empty_payload()
+            payloads[slot]["source_text"] = transcription
+            text_output_lines[slot] = ""
+            print(
+                f"Cancelled while processing transcription {index}/{total}; "
+                "emitting empty payload."
+            )
+            await maybe_write_progress_snapshot()
+            return
+        except Exception as error:
+            payloads[slot] = build_empty_payload()
+            payloads[slot]["source_text"] = transcription
+            text_output_lines[slot] = ""
+            print(
+                f"Unexpected error on transcription {index}/{total}: {error}; "
+                "emitting empty payload."
+            )
+            await maybe_write_progress_snapshot()
+            return
 
     await run_transcriptions_with_concurrency(transcriptions, concurrency, process_item)
 

@@ -59,7 +59,7 @@ DEFAULT_TOP_P = 1.0
 DEFAULT_RETRY_TEMPERATURE_JITTER = 0.08
 DEFAULT_RETRY_TOP_P_JITTER = 0.03
 DEFAULT_MODEL_MISMATCH_RETRIES = 2
-DEFAULT_MAX_INPUT_CHARS_PER_CALL = 300
+DEFAULT_MAX_INPUT_CHARS_PER_CALL = 500
 DEFAULT_LONG_SPAN_MIN_DELETED_TOKENS = 3
 DEFAULT_HALLUCINATION_MAX_INSERTED_TOKENS = 3
 DEFAULT_AOAI_ENDPOINT = "https://adaptationdev-resource.openai.azure.com/"
@@ -2326,7 +2326,7 @@ def take_next_transcription_segment_for_llm(
         return "", text_length
 
     max_chars = max(0, int(max_chars_per_call))
-    if max_chars == 0 or (text_length - start) <= max_chars:
+    if max_chars == 0 or (text_length - start) <= max_chars * 1.5:
         return transcription[start:], text_length
 
     cut_index = _find_segment_cut_index(transcription, start, max_chars)
