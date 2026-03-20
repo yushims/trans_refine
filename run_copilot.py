@@ -50,7 +50,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Write incremental output snapshot every N completed items "
-            "(default: 1, or 500 when --resume-from-output is enabled)."
+            "(default: 1, or 100 when --resume-from-output is enabled)."
         ),
     )
     add_common_runtime_cli_arguments(parser)
@@ -110,7 +110,7 @@ async def main():
     if isinstance(progress_write_every_arg, int):
         progress_write_every = max(1, progress_write_every_arg)
     else:
-        progress_write_every = 500 if resume_from_output else 1
+        progress_write_every = 100 if resume_from_output else 1
 
     prompt_template_path, repair_prompt_template_path, template_error = resolve_patch_and_repair_template_paths(
         args.patch_prompt_file,
