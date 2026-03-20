@@ -20,6 +20,7 @@ from common import (
     normalize_all_uppercase_input,
     is_input_comment_line,
     load_patch_and_repair_templates,
+    load_existing_output_text_lines,
     merge_segment_payloads,
     print_common_runtime_settings,
     resolve_active_chain_step_keys,
@@ -46,8 +47,11 @@ def parse_args() -> argparse.Namespace:
         "--progress-write-every",
         dest="progress_write_every",
         type=int,
-        default=1,
-        help="Write incremental output snapshot every N completed items (default: 1).",
+        default=None,
+        help=(
+            "Write incremental output snapshot every N completed items "
+            "(default: 1, or 500 when --resume-from-output is enabled)."
+        ),
     )
     add_common_runtime_cli_arguments(parser)
     add_model_mismatch_retries_cli_argument(parser)
@@ -101,7 +105,12 @@ async def main():
     model_mismatch_retries = max(0, args.model_mismatch_retries)
     chain_steps = [step for step in (args.chain_steps or []) if isinstance(step, str) and step.strip()]
     active_step_keys = resolve_active_chain_step_keys(chain_steps)
-    progress_write_every = max(1, args.progress_write_every)
+    resume_from_output = bool(args.resume_from_output)
+    progress_write_every_arg = args.progress_write_every
+    if isinstance(progress_write_every_arg, int):
+        progress_write_every = max(1, progress_write_every_arg)
+    else:
+        progress_write_every = 500 if resume_from_output else 1
 
     prompt_template_path, repair_prompt_template_path, template_error = resolve_patch_and_repair_template_paths(
         args.patch_prompt_file,
@@ -147,6 +156,14 @@ async def main():
 
         payloads: list[dict | None] = [None] * len(transcriptions)
         text_output_lines: list[str] = [""] * len(transcriptions)
+        if resume_from_output:
+            loaded_lines = load_existing_output_text_lines(
+                output_file_value,
+                len(transcriptions),
+                output_as_tsv,
+            )
+            if loaded_lines is not None:
+                text_output_lines = loaded_lines
         progress_write_lock = asyncio.Lock()
         pending_progress_writes = 0
 
@@ -195,6 +212,22 @@ async def main():
                 )
                 await maybe_write_progress_snapshot()
                 return
+
+            if resume_from_output:
+                existing_line = text_output_lines[slot] if slot < len(text_output_lines) else ""
+                if isinstance(existing_line, str) and existing_line.strip():
+                    payloads[slot] = build_empty_payload()
+                    payloads[slot]["source_text"] = transcription
+                    payloads[slot]["corrected_text"] = existing_line
+                    source_filename = source_filenames[slot]
+                    if isinstance(source_filename, str) and source_filename:
+                        payloads[slot]["source_filename"] = source_filename
+                    print(
+                        f"[{processing_id}] Resume enabled: existing output is non-empty; "
+                        "skipping transcription."
+                    )
+                    await maybe_write_progress_snapshot()
+                    return
 
             prompt_transcription, case_normalized = normalize_all_uppercase_input(transcription)
             source_was_all_uppercase = is_all_uppercase_cased_input(transcription)
@@ -281,16 +314,14 @@ async def main():
                             break
 
                         should_shorten = (
-                            max_input_chars_per_call > 0
-                            and "long_span" in failure_reasons
-                            and len(segment_transcription) > 1
+                            len(segment_transcription) > 1
                             and current_limit > 1
                         )
                         if should_shorten:
                             next_limit = max(1, min(current_limit - 1, len(segment_transcription) - 1, current_limit // 2))
                             if next_limit < current_limit:
                                 print(
-                                    f"[{segment_processing_id}] Long-span preservation failed; "
+                                    f"[{segment_processing_id}] Segment failed after retries; "
                                     f"shortening segment and retrying (limit {current_limit} -> {next_limit})."
                                 )
                                 current_limit = next_limit

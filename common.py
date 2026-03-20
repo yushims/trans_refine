@@ -50,15 +50,15 @@ _OPTIONAL_TOP_LEVEL_KEY_ORDER = (
 _OPTIONAL_TOP_LEVEL_KEYS = set(_OPTIONAL_TOP_LEVEL_KEY_ORDER)
 
 
-DEFAULT_CONCURRENCY = 10
+DEFAULT_CONCURRENCY = 5
 DEFAULT_TIMEOUT_SECONDS = 600.0
-DEFAULT_TIMEOUT_RETRIES = 2
-DEFAULT_EMPTY_RESULT_RETRIES = 2
+DEFAULT_TIMEOUT_RETRIES = 1
+DEFAULT_EMPTY_RESULT_RETRIES = 1
 DEFAULT_TEMPERATURE = 0.0
 DEFAULT_TOP_P = 1.0
 DEFAULT_RETRY_TEMPERATURE_JITTER = 0.08
 DEFAULT_RETRY_TOP_P_JITTER = 0.03
-DEFAULT_MODEL_MISMATCH_RETRIES = 2
+DEFAULT_MODEL_MISMATCH_RETRIES = 1
 DEFAULT_MAX_INPUT_CHARS_PER_CALL = 500
 DEFAULT_LONG_SPAN_MIN_DELETED_TOKENS = 3
 DEFAULT_HALLUCINATION_MAX_INSERTED_TOKENS = 3
@@ -143,6 +143,15 @@ def add_common_runtime_cli_arguments(
         help=(
             "Fail hallucination check if a contiguous inserted span exceeds this many tokens "
             f"(default: {DEFAULT_HALLUCINATION_MAX_INSERTED_TOKENS})."
+        ),
+    )
+    parser.add_argument(
+        "--resume-from-output",
+        dest="resume_from_output",
+        action="store_true",
+        help=(
+            "Resume from existing output text file (.txt or .tsv). "
+            "Rows with non-empty existing output are skipped; non-empty input rows with empty output are retried."
         ),
     )
 
@@ -2735,6 +2744,51 @@ def collect_transcriptions_from_input(
         return None
 
     return transcriptions, source_filenames, source_rows
+
+
+def load_existing_output_text_lines(
+    output_file_value: str | None,
+    expected_count: int,
+    output_as_tsv: bool,
+) -> list[str] | None:
+    if not output_file_value:
+        print("Resume requested but no --output-file was provided; ignoring resume option.")
+        return None
+
+    output_path = resolve_path(output_file_value)
+    output_text_path = output_path.with_suffix(".tsv") if output_as_tsv else output_path.with_suffix(".txt")
+    if not output_text_path.exists():
+        print(f"Resume requested but output file does not exist: {output_text_path}")
+        return None
+
+    try:
+        raw_text = output_text_path.read_text(encoding="utf-8")
+    except Exception as error:
+        print(f"Failed to read resume output file {output_text_path}: {error}")
+        return None
+
+    loaded_lines: list[str] = []
+    if output_as_tsv:
+        reader = csv.reader(raw_text.splitlines(), delimiter="\t")
+        for row in reader:
+            if not row:
+                loaded_lines.append("")
+                continue
+            loaded_lines.append(sanitize_output_string(row[-1]))
+    else:
+        loaded_lines = [sanitize_output_string(line) for line in raw_text.splitlines()]
+
+    if len(loaded_lines) < expected_count:
+        loaded_lines.extend([""] * (expected_count - len(loaded_lines)))
+    elif len(loaded_lines) > expected_count:
+        loaded_lines = loaded_lines[:expected_count]
+
+    non_empty_count = sum(1 for line in loaded_lines if isinstance(line, str) and line.strip())
+    print(
+        f"Loaded resume output rows from {output_text_path}: "
+        f"{non_empty_count}/{expected_count} non-empty."
+    )
+    return loaded_lines
 
 def assign_payload_or_emit_empty(
     payload: dict | None,
