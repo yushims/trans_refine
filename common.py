@@ -59,8 +59,9 @@ DEFAULT_TOP_P = 1.0
 DEFAULT_RETRY_TEMPERATURE_JITTER = 0.08
 DEFAULT_RETRY_TOP_P_JITTER = 0.03
 DEFAULT_MODEL_MISMATCH_RETRIES = 2
-DEFAULT_MAX_INPUT_CHARS_PER_CALL = 1000
-DEFAULT_LONG_SPAN_MIN_DELETED_TOKENS = 5
+DEFAULT_MAX_INPUT_CHARS_PER_CALL = 300
+DEFAULT_LONG_SPAN_MIN_DELETED_TOKENS = 3
+DEFAULT_HALLUCINATION_MAX_INSERTED_TOKENS = 3
 DEFAULT_AOAI_ENDPOINT = "https://adaptationdev-resource.openai.azure.com/"
 DEFAULT_AOAI_API_VERSION = "2025-01-01-preview"
 DEFAULT_AOAI_DEPLOYMENT = "gpt-5-chat"
@@ -68,6 +69,7 @@ DEFAULT_COPILOT_MODEL = "gpt-5.2"
 
 
 _long_span_min_deleted_tokens = DEFAULT_LONG_SPAN_MIN_DELETED_TOKENS
+_hallucination_max_inserted_tokens = DEFAULT_HALLUCINATION_MAX_INSERTED_TOKENS
 
 
 def configure_long_span_preservation_guard(
@@ -81,6 +83,19 @@ def configure_long_span_preservation_guard(
 
 def get_long_span_preservation_guard_config() -> int:
     return _long_span_min_deleted_tokens
+
+
+def configure_hallucination_guard(
+    max_inserted_tokens: int | None = None,
+) -> None:
+    global _hallucination_max_inserted_tokens
+
+    if isinstance(max_inserted_tokens, int):
+        _hallucination_max_inserted_tokens = max(1, max_inserted_tokens)
+
+
+def get_hallucination_guard_config() -> int:
+    return _hallucination_max_inserted_tokens
 
 
 def add_common_runtime_cli_arguments(
@@ -118,6 +133,16 @@ def add_common_runtime_cli_arguments(
         help=(
             "Retry if a contiguous deleted source span has at least this many non-punctuation tokens "
             f"(default: {DEFAULT_LONG_SPAN_MIN_DELETED_TOKENS})."
+        ),
+    )
+    parser.add_argument(
+        "--hallucination-max-inserted-tokens",
+        dest="hallucination_max_inserted_tokens",
+        type=int,
+        default=DEFAULT_HALLUCINATION_MAX_INSERTED_TOKENS,
+        help=(
+            "Fail hallucination check if a contiguous inserted span exceeds this many tokens "
+            f"(default: {DEFAULT_HALLUCINATION_MAX_INSERTED_TOKENS})."
         ),
     )
 
@@ -237,14 +262,6 @@ def build_patch_response_format_schema() -> dict:
     }
 
 
-_ALLOWED_INSERTION_FUNCTION_WORDS = {
-    "a", "an", "the", "of", "to", "and", "or", "in", "on", "at", "for",
-    "is", "are", "was", "were", "be", "been", "being", "that", "this", "these",
-    "those", "it", "as", "by", "with", "from", "if", "then", "so", "but", "not",
-    "de", "la", "el", "y", "en", "un", "una", "con", "le", "les", "des", "et",
-    "du", "au", "aux", "das", "der", "die", "und", "mit", "zu", "da", "do", "dos",
-    "e", "di", "del", "della", "van", "het",
-}
 _URL_EMAIL_PATTERN = re.compile(
     r"(?:https?://\S+|www\.\S+|[^\s@]+@(?:[^\s@.]+\.)+[^\s@.]{2,})",
     flags=re.IGNORECASE,
@@ -444,14 +461,23 @@ def _is_inner_word_connector(char: str) -> bool:
     return char in _WORD_CONNECTOR_SET or unicodedata.category(char) == "Pd"
 
 
-def extract_text_content(content: object) -> str:
+def _extract_text_content_recursive(content: object, visited_ids: set[int]) -> str:
     if isinstance(content, str):
         return content
+
+    if content is None:
+        return ""
+
+    if isinstance(content, (list, dict)) or hasattr(content, "__dict__"):
+        object_id = id(content)
+        if object_id in visited_ids:
+            return ""
+        visited_ids.add(object_id)
 
     if isinstance(content, list):
         parts: list[str] = []
         for item in content:
-            extracted = extract_text_content(item)
+            extracted = _extract_text_content_recursive(item, visited_ids)
             if extracted:
                 parts.append(extracted)
         return "".join(parts)
@@ -463,7 +489,7 @@ def extract_text_content(content: object) -> str:
 
         for key in ("content", "delta_content", "message"):
             nested = content.get(key)
-            extracted = extract_text_content(nested)
+            extracted = _extract_text_content_recursive(nested, visited_ids)
             if extracted:
                 return extracted
         return ""
@@ -473,16 +499,84 @@ def extract_text_content(content: object) -> str:
         return text
 
     nested_content = getattr(content, "content", None)
-    extracted = extract_text_content(nested_content)
+    extracted = _extract_text_content_recursive(nested_content, visited_ids)
     if extracted:
         return extracted
 
     nested_delta = getattr(content, "delta_content", None)
-    extracted = extract_text_content(nested_delta)
+    extracted = _extract_text_content_recursive(nested_delta, visited_ids)
     if extracted:
         return extracted
 
     return ""
+
+
+def _extract_text_content_iterative(content: object) -> str:
+    if isinstance(content, str):
+        return content
+
+    if content is None:
+        return ""
+
+    visited_ids: set[int] = set()
+    stack: list[object] = [content]
+    parts: list[str] = []
+
+    while stack:
+        current = stack.pop()
+
+        if isinstance(current, str):
+            parts.append(current)
+            continue
+
+        if current is None:
+            continue
+
+        if isinstance(current, (list, dict)) or hasattr(current, "__dict__"):
+            object_id = id(current)
+            if object_id in visited_ids:
+                continue
+            visited_ids.add(object_id)
+
+        if isinstance(current, list):
+            # Preserve left-to-right order when popping from stack.
+            for item in reversed(current):
+                stack.append(item)
+            continue
+
+        if isinstance(current, dict):
+            text = current.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+                continue
+
+            # Preserve recursive preference order.
+            for key in ("message", "delta_content", "content"):
+                nested = current.get(key)
+                if nested is not None:
+                    stack.append(nested)
+            continue
+
+        text = getattr(current, "text", None)
+        if isinstance(text, str):
+            parts.append(text)
+            continue
+
+        nested_delta = getattr(current, "delta_content", None)
+        if nested_delta is not None:
+            stack.append(nested_delta)
+        nested_content = getattr(current, "content", None)
+        if nested_content is not None:
+            stack.append(nested_content)
+
+    return "".join(parts)
+
+
+def extract_text_content(content: object) -> str:
+    try:
+        return _extract_text_content_recursive(content, set())
+    except RecursionError:
+        return _extract_text_content_iterative(content)
 
 
 async def run_with_timeout_retry(
@@ -627,10 +721,6 @@ def _is_cjk_char(char: str) -> bool:
     return _is_han_char(char) or _is_kana_char(char) or _is_hangul_char(char)
 
 
-def _is_cjk_token(token: str) -> bool:
-    return bool(token) and all(_is_cjk_char(char) for char in token)
-
-
 def _is_non_latin_letter(char: str) -> bool:
     if not isinstance(char, str) or len(char) != 1:
         return False
@@ -655,38 +745,6 @@ def _contains_latin_letter(text: str) -> bool:
         if char.isalpha() and "LATIN" in unicodedata.name(char, ""):
             return True
     return False
-
-
-def _is_hallucinated_token(token: str, source_lexicon_folded: set[str]) -> bool:
-    if not isinstance(token, str) or not token.strip():
-        return True
-    if len(token) > 40:
-        return True
-    if any(char.isspace() for char in token):
-        return True
-
-    folded = token.casefold()
-    if folded in source_lexicon_folded:
-        return False
-    if folded in _ALLOWED_INSERTION_FUNCTION_WORDS:
-        return False
-
-    if all(unicodedata.category(char).startswith(("P", "S", "N")) for char in token):
-        return False
-
-    if not any(char.isalpha() for char in token):
-        return False
-
-    if len(token) == 1 and _is_cjk_token(token):
-        return False
-
-    if len(token) <= 2 and token.isalpha() and not _is_cjk_token(token):
-        return False
-
-    if any(_is_non_latin_letter(char) for char in token) and len(token) <= 2:
-        return False
-
-    return True
 
 
 _COMPACT_SPEAKER_LABEL_PATTERN = re.compile(
@@ -1117,43 +1175,22 @@ def validate_corrected_text_hallucination(corrected_text: str, source_text: str)
     source_tokens = [token for token in source_tokens if token.strip() and not _is_punct_token(token)]
     corrected_tokens = [token for token in corrected_tokens if token.strip() and not _is_punct_token(token)]
 
-    source_lexicon_folded = {token.casefold() for token in source_tokens}
     source_folded_stream = [token.casefold() for token in source_tokens]
     corrected_folded_stream = [token.casefold() for token in corrected_tokens]
 
-    suspicious_tokens: list[str] = []
     matcher = difflib.SequenceMatcher(a=source_folded_stream, b=corrected_folded_stream, autojunk=False)
+    max_inserted_tokens = get_hallucination_guard_config()
     for tag, _i1, _i2, j1, j2 in matcher.get_opcodes():
         if tag != "insert":
             continue
-        for token in corrected_tokens[j1:j2]:
-            if _is_hallucinated_token(token, source_lexicon_folded):
-                suspicious_tokens.append(token)
 
-    suspicious_insert_count = len(suspicious_tokens)
-    many_new_tokens_threshold = max(2, math.ceil(len(source_tokens) * 0.12))
-    if suspicious_insert_count >= many_new_tokens_threshold:
-        unique = sorted(set(suspicious_tokens))[:8]
-        return False, (
-            "corrected_text contains too many potential hallucinated inserted token(s): "
-            f"count={suspicious_insert_count}, threshold={many_new_tokens_threshold}, "
-            f"examples={', '.join(unique)}"
-        )
-
-    source_token_count = len(source_tokens)
-    corrected_token_count = len(corrected_tokens)
-    if source_token_count > 0:
-        estimated_deleted_tokens = max(0, source_token_count - corrected_token_count)
-        large_deletion_threshold = max(4, math.ceil(source_token_count * 0.35))
-        retained_ratio = corrected_token_count / source_token_count
-
-        # Flag only significant shrinkage to avoid penalizing small local cleanup.
-        if estimated_deleted_tokens >= large_deletion_threshold and retained_ratio < 0.60:
+        inserted_tokens = corrected_tokens[j1:j2]
+        if len(inserted_tokens) > max_inserted_tokens:
+            snippet = " ".join(inserted_tokens[:8])
             return False, (
-                "corrected_text appears to delete too much source content: "
-                f"source_tokens={source_token_count}, corrected_tokens={corrected_token_count}, "
-                f"deleted={estimated_deleted_tokens}, threshold={large_deletion_threshold}, "
-                f"retained_ratio={retained_ratio:.3f}"
+                "corrected_text contains long inserted span: "
+                f"inserted_tokens={len(inserted_tokens)}, "
+                f"max_allowed={max_inserted_tokens}, span='{snippet}'"
             )
 
     return True, ""
@@ -1185,6 +1222,7 @@ def _no_space_script_char_stream(text: str) -> list[str]:
 def validate_no_long_span_removed_no_space_scripts(
     corrected_text: str,
     source_text: str,
+    processing_id: str | None = None,
 ) -> tuple[bool, str]:
     if not isinstance(corrected_text, str) or not isinstance(source_text, str):
         return True, ""
@@ -1251,6 +1289,7 @@ def validate_inactive_step_edits_empty(
 def validate_no_long_span_removed(
     corrected_text: str,
     source_text: str,
+    processing_id: str | None = None,
 ) -> tuple[bool, str]:
     if not isinstance(corrected_text, str) or not isinstance(source_text, str):
         return True, ""
@@ -1268,7 +1307,7 @@ def validate_no_long_span_removed(
             continue
 
         deleted_tokens = source_tokens[i1:i2]
-        if len(deleted_tokens) < min_deleted_tokens:
+        if len(deleted_tokens) <= min_deleted_tokens:
             continue
 
         deleted_span = " ".join(deleted_tokens).strip()
@@ -1776,6 +1815,18 @@ def is_non_repairable_validation_error(validation_error: str | None) -> bool:
     return validation_error.startswith(non_repairable_prefix())
 
 
+def is_long_span_preservation_validation_error(validation_error: str | None) -> bool:
+    if not isinstance(validation_error, str):
+        return False
+    return "Long-span preservation check failed:" in validation_error
+
+
+def is_json_recursion_validation_error(validation_error: str | None) -> bool:
+    if not isinstance(validation_error, str):
+        return False
+    return validation_error.startswith("JSON parse recursion error:")
+
+
 def _mark_non_repairable_validation_error(validation_error: str) -> str:
     return f"{non_repairable_prefix()} {validation_error}"
 
@@ -1837,6 +1888,8 @@ def parse_and_validate_json(content: str) -> tuple[dict | None, str | None]:
                 f"{json_like_reason}; JSON parse error: {error}; raw content: {content[:10]} ..."
             )
         return None, f"JSON parse error: {error}"
+    except RecursionError as error:
+        return None, f"JSON parse recursion error: {error}"
 
     payload = _materialize_corrected_text(payload)
 
@@ -1853,6 +1906,7 @@ def parse_validate_and_apply_text_fixes(
     processing_id: str,
     skip_first_token_casing_preservation: bool = False,
     active_step_keys: set[str] | None = None,
+    allow_long_span_preservation_failure: bool = False,
 ) -> tuple[dict | None, str | None, str]:
     content = raw_content.strip()
     if not content:
@@ -1919,16 +1973,30 @@ def parse_validate_and_apply_text_fixes(
     long_span_ok, long_span_error = validate_no_long_span_removed(
         corrected_text,
         source_text,
+        processing_id,
     )
     if not long_span_ok:
-        return None, f"Long-span preservation check failed: {long_span_error}", content
+        if allow_long_span_preservation_failure:
+            print(
+                f"[{processing_id}] WARNING: Long-span preservation check failed "
+                f"but accepting final retry result: {long_span_error}"
+            )
+        else:
+            return None, f"Long-span preservation check failed: {long_span_error}", content
 
     long_no_space_ok, long_no_space_error = validate_no_long_span_removed_no_space_scripts(
         corrected_text,
         source_text,
+        processing_id,
     )
     if not long_no_space_ok:
-        return None, f"Long-span preservation check failed: {long_no_space_error}", content
+        if allow_long_span_preservation_failure:
+            print(
+                f"[{processing_id}] WARNING: Long-span preservation check failed "
+                f"but accepting final retry result: {long_no_space_error}"
+            )
+        else:
+            return None, f"Long-span preservation check failed: {long_no_space_error}", content
 
     hallucination_ok, hallucination_error = validate_corrected_text_hallucination(
         corrected_text,
@@ -2097,6 +2165,7 @@ def print_common_runtime_settings(
     max_input_chars_per_call: int,
 ) -> None:
     min_deleted_tokens = get_long_span_preservation_guard_config()
+    max_inserted_tokens = get_hallucination_guard_config()
     print(f"Using patch prompt file: {prompt_template_path}")
     print(f"Using repair prompt file: {repair_prompt_template_path}")
     print(f"Concurrency: {concurrency}")
@@ -2109,6 +2178,10 @@ def print_common_runtime_settings(
     print(
         "Long-span preservation guard: "
         f"min_deleted_tokens={min_deleted_tokens}"
+    )
+    print(
+        "Hallucination guard: "
+        f"max_inserted_tokens={max_inserted_tokens}"
     )
 
 
@@ -2239,22 +2312,46 @@ def _stabilize_segment_cut_index(text: str, start: int, candidate: int, hard_lim
     return cut_index
 
 
+def take_next_transcription_segment_for_llm(
+    transcription: str,
+    start_offset: int,
+    max_chars_per_call: int,
+) -> tuple[str, int]:
+    if not isinstance(transcription, str):
+        return "", 0
+
+    text_length = len(transcription)
+    start = max(0, min(int(start_offset), text_length))
+    if start >= text_length:
+        return "", text_length
+
+    max_chars = max(0, int(max_chars_per_call))
+    if max_chars == 0 or (text_length - start) <= max_chars:
+        return transcription[start:], text_length
+
+    cut_index = _find_segment_cut_index(transcription, start, max_chars)
+    if cut_index <= start:
+        cut_index = min(text_length, start + max_chars)
+
+    return transcription[start:cut_index], cut_index
+
+
 def split_transcription_for_llm(transcription: str, max_chars_per_call: int) -> list[str]:
     if not isinstance(transcription, str):
         return [""]
-
-    max_chars = max(0, int(max_chars_per_call))
-    if max_chars == 0 or len(transcription) <= max_chars:
-        return [transcription]
 
     segments: list[str] = []
     start = 0
     text_length = len(transcription)
     while start < text_length:
-        cut_index = _find_segment_cut_index(transcription, start, max_chars)
+        segment, cut_index = take_next_transcription_segment_for_llm(
+            transcription,
+            start,
+            max_chars_per_call,
+        )
         if cut_index <= start:
-            cut_index = min(text_length, start + max_chars)
-        segments.append(transcription[start:cut_index])
+            break
+        segments.append(segment)
         start = cut_index
 
     return segments if segments else [transcription]
@@ -3303,10 +3400,19 @@ async def get_patch_payload_with_repair_generic(
     build_attempt_prompt: Callable[[str, int], str] | None = None,
     skip_first_token_casing_preservation: bool = False,
     active_step_keys: set[str] | None = None,
+    on_final_failure: Callable[[str], None] | None = None,
     repair_timeout_message: str = "Repair attempt timed out.",
     repair_empty_message: str = "Repair retry returned empty output.",
     strip_repair_content: bool = False,
 ) -> dict | None:
+    def _notify_final_failure(reason: str) -> None:
+        if on_final_failure is None:
+            return
+        try:
+            on_final_failure(reason)
+        except Exception:
+            pass
+
     for empty_attempt in range(empty_result_retries + 1):
         attempt_prompt = (
             build_attempt_prompt(prompt, empty_attempt)
@@ -3330,6 +3436,18 @@ async def get_patch_payload_with_repair_generic(
         if payload is None:
             log_json_validation_with_key_error(validation_error, content, processing_id)
 
+            if is_json_recursion_validation_error(validation_error):
+                should_retry = should_retry_after_failure(
+                    empty_attempt,
+                    empty_result_retries,
+                    "JSON parse recursion depth exceeded.",
+                    "JSON parse recursion depth exceeded. Rerunning patch without repair.",
+                    processing_id,
+                )
+                if not should_retry:
+                    return None
+                continue
+
             if is_non_repairable_validation_error(validation_error):
                 reason = (
                     validation_error.removeprefix(non_repairable_prefix()).strip()
@@ -3346,6 +3464,14 @@ async def get_patch_payload_with_repair_generic(
                 if not should_retry:
                     return None
                 continue
+
+            if is_long_span_preservation_validation_error(validation_error):
+                print(
+                    f"[{processing_id}] Long-span preservation check failed. "
+                    "Retrying with shortened segment."
+                )
+                _notify_final_failure("long_span")
+                return None
 
             repair_prompt = build_repair_prompt_after_invalid_json(
                 repair_prompt_template,
@@ -3389,6 +3515,14 @@ async def get_patch_payload_with_repair_generic(
                 active_step_keys=active_step_keys,
             )
             if payload is None:
+                if is_long_span_preservation_validation_error(validation_error):
+                    print(
+                        f"[{processing_id}] Long-span preservation check failed after repair. "
+                        "Retrying with shortened segment."
+                    )
+                    _notify_final_failure("long_span")
+                    return None
+
                 should_retry = handle_invalid_repair_json_result(
                     empty_attempt,
                     empty_result_retries,

@@ -254,6 +254,7 @@ async def _get_copilot_patch_payload_with_repair_on_session(
     empty_result_retries: int,
     skip_first_token_casing_preservation: bool = False,
     active_step_keys: set[str] | None = None,
+    on_final_failure: Callable[[str], None] | None = None,
 ) -> dict | None:
     patch_target_schema = json.dumps(
         build_patch_payload_schema(),
@@ -303,6 +304,7 @@ async def _get_copilot_patch_payload_with_repair_on_session(
         build_attempt_prompt=_build_attempt_prompt,
         skip_first_token_casing_preservation=skip_first_token_casing_preservation,
         active_step_keys=active_step_keys,
+        on_final_failure=on_final_failure,
         repair_timeout_message="Repair attempt timed out.",
         repair_empty_message="Repair retry returned empty output.",
         strip_repair_content=True,
@@ -322,6 +324,7 @@ async def get_copilot_patch_payload_with_repair(
     model_mismatch_retries: int,
     skip_first_token_casing_preservation: bool = False,
     active_step_keys: set[str] | None = None,
+    on_final_failure: Callable[[str], None] | None = None,
 ) -> dict | None:
     for mismatch_attempt in range(model_mismatch_retries + 1):
         session = await create_session()
@@ -338,6 +341,7 @@ async def get_copilot_patch_payload_with_repair(
                 empty_result_retries,
                 skip_first_token_casing_preservation,
                 active_step_keys,
+                on_final_failure,
             )
         except ModelMismatchError as mismatch_error:
             should_retry = await handle_copilot_model_mismatch_retry(
