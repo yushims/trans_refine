@@ -3235,6 +3235,124 @@ def build_patch_prompt(
     return prompt + transcription
 
 
+def _order_top_level_output_payload_keys(payload: dict) -> dict:
+    ordered_payload: dict = {}
+
+    # Emit source_filename first in serialized output when present.
+    if "source_filename" in payload:
+        ordered_payload["source_filename"] = payload["source_filename"]
+
+    # Emit source_text next in serialized output when present.
+    if "source_text" in payload:
+        ordered_payload["source_text"] = payload["source_text"]
+
+    # Keep canonical required key order for deterministic JSON diffs.
+    for key in _REQUIRED_TOP_LEVEL_KEY_ORDER:
+        if key in payload:
+            ordered_payload[key] = payload[key]
+
+    # Keep known optional keys next (except source_text already emitted first).
+    for key in _OPTIONAL_TOP_LEVEL_KEY_ORDER:
+        if key == "source_text":
+            continue
+        if key in payload:
+            ordered_payload[key] = payload[key]
+
+    # Preserve any unexpected keys at the end in original insertion order.
+    for key, value in payload.items():
+        if key not in ordered_payload:
+            ordered_payload[key] = value
+
+    return ordered_payload
+
+
+def _sanitize_output_payload_value(value: object) -> object:
+    if isinstance(value, str):
+        return sanitize_output_string(value)
+    if isinstance(value, list):
+        return [_sanitize_output_payload_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [_sanitize_output_payload_value(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _sanitize_output_payload_value(item)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _strip_inactive_step_payloads(payload: dict, active_step_keys: set[str] | None) -> dict:
+    if not isinstance(active_step_keys, set):
+        return payload
+
+    compacted = dict(payload)
+    for step_key in _STEP_CHAIN_KEYS:
+        if step_key not in active_step_keys:
+            compacted.pop(step_key, None)
+    return compacted
+
+
+def sanitize_payload_for_output(
+    payload: dict,
+    source_filename: str | None = None,
+    active_step_keys: set[str] | None = None,
+) -> dict | None:
+    if not isinstance(payload, dict):
+        return None
+
+    payload_copy = _sanitize_output_payload_value(payload)
+    if not isinstance(payload_copy, dict):
+        return None
+
+    if isinstance(source_filename, str) and source_filename.strip():
+        payload_copy["source_filename"] = sanitize_output_string(source_filename)
+
+    payload_copy.pop("tokenization", None)
+    payload_copy = _strip_inactive_step_payloads(payload_copy, active_step_keys)
+    return _order_top_level_output_payload_keys(payload_copy)
+
+
+def prepare_jsonl_output_path(
+    output_file_value: str | None,
+    resume_mode: bool = False,
+) -> Path | None:
+    if not output_file_value:
+        return None
+
+    output_path = resolve_path(output_file_value)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_jsonl_path = output_path.with_suffix(".jsonl")
+
+    if not resume_mode:
+        output_jsonl_path.write_text("", encoding="utf-8")
+
+    return output_jsonl_path
+
+
+def append_payload_jsonl_record(
+    output_jsonl_path: Path | None,
+    payload: dict | None,
+    source_filename: str | None = None,
+    active_step_keys: set[str] | None = None,
+) -> bool:
+    if output_jsonl_path is None or not isinstance(payload, dict):
+        return False
+
+    sanitized_payload = sanitize_payload_for_output(
+        payload,
+        source_filename,
+        active_step_keys,
+    )
+    if not isinstance(sanitized_payload, dict):
+        return False
+
+    line = json.dumps(sanitized_payload, ensure_ascii=False, separators=(",", ":"))
+    with output_jsonl_path.open("a", encoding="utf-8", newline="") as output_file:
+        output_file.write(line)
+        output_file.write("\n")
+    return True
+
+
 def write_output_artifacts(
     payloads: list[dict],
     output_file_value: str | None,
@@ -3253,60 +3371,6 @@ def write_output_artifacts(
         )
     )
 
-    def _order_top_level_payload_keys(payload: dict) -> dict:
-        ordered_payload: dict = {}
-
-        # Emit source_filename first in serialized output when present.
-        if "source_filename" in payload:
-            ordered_payload["source_filename"] = payload["source_filename"]
-
-        # Emit source_text next in serialized output when present.
-        if "source_text" in payload:
-            ordered_payload["source_text"] = payload["source_text"]
-
-        # Keep canonical required key order for deterministic JSON diffs.
-        for key in _REQUIRED_TOP_LEVEL_KEY_ORDER:
-            if key in payload:
-                ordered_payload[key] = payload[key]
-
-        # Keep known optional keys next (except source_text already emitted first).
-        for key in _OPTIONAL_TOP_LEVEL_KEY_ORDER:
-            if key == "source_text":
-                continue
-            if key in payload:
-                ordered_payload[key] = payload[key]
-
-        # Preserve any unexpected keys at the end in original insertion order.
-        for key, value in payload.items():
-            if key not in ordered_payload:
-                ordered_payload[key] = value
-
-        return ordered_payload
-
-    def _sanitize_output_payload_value(value: object) -> object:
-        if isinstance(value, str):
-            return sanitize_output_string(value)
-        if isinstance(value, list):
-            return [_sanitize_output_payload_value(item) for item in value]
-        if isinstance(value, tuple):
-            return [_sanitize_output_payload_value(item) for item in value]
-        if isinstance(value, dict):
-            return {
-                key: _sanitize_output_payload_value(item)
-                for key, item in value.items()
-            }
-        return value
-
-    def _strip_inactive_step_payloads(payload: dict) -> dict:
-        if not isinstance(active_step_keys, set):
-            return payload
-
-        compacted = dict(payload)
-        for step_key in _STEP_CHAIN_KEYS:
-            if step_key not in active_step_keys:
-                compacted.pop(step_key, None)
-        return compacted
-
     can_backfill_source_filename = (
         source_filenames is not None
         and len(source_filenames) == len(payloads)
@@ -3315,16 +3379,14 @@ def write_output_artifacts(
     sanitized_payloads: list[dict] = []
     for index, item in enumerate(payloads):
         if isinstance(item, dict):
-            payload_copy = _sanitize_output_payload_value(item)
-            if not isinstance(payload_copy, dict):
-                continue
-            if can_backfill_source_filename:
-                source_filename = source_filenames[index]
-                if isinstance(source_filename, str) and source_filename.strip():
-                    payload_copy["source_filename"] = sanitize_output_string(source_filename)
-            payload_copy.pop("tokenization", None)
-            payload_copy = _strip_inactive_step_payloads(payload_copy)
-            sanitized_payloads.append(_order_top_level_payload_keys(payload_copy))
+            source_filename = source_filenames[index] if can_backfill_source_filename else None
+            sanitized_payload = sanitize_payload_for_output(
+                item,
+                source_filename,
+                active_step_keys,
+            )
+            if isinstance(sanitized_payload, dict):
+                sanitized_payloads.append(sanitized_payload)
 
     output_payload = sanitized_payloads[0] if len(sanitized_payloads) == 1 else sanitized_payloads
 

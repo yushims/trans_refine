@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import os
+import signal
 
 from openai import AzureOpenAI
 from dotenv import load_dotenv
@@ -10,6 +11,7 @@ from common import (
     DEFAULT_AOAI_ENDPOINT,
     add_aoai_sampling_cli_arguments,
     add_common_runtime_cli_arguments,
+    append_payload_jsonl_record,
     assign_payload_or_emit_empty,
     build_patch_prompt,
     build_patch_response_format_schema,
@@ -26,12 +28,13 @@ from common import (
     load_patch_and_repair_templates,
     load_existing_output_text_lines,
     merge_segment_payloads,
+    prepare_jsonl_output_path,
     print_common_runtime_settings,
     resolve_active_chain_step_keys,
     resolve_patch_and_repair_template_paths,
     run_transcriptions_with_concurrency,
     take_next_transcription_segment_for_llm,
-    write_output_artifacts,
+    write_fallback_text_output,
 )
 from common_aoai import get_patch_payload_with_repair
 
@@ -53,7 +56,8 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help=(
-            "Write incremental output snapshot every N completed items "
+            "Write incremental text snapshot (.txt/.tsv) and JSONL progress (.jsonl) "
+            "every N completed items "
             "(default: 1, or 100 when --resume-from-output is enabled)."
         ),
     )
@@ -70,6 +74,35 @@ def parse_args() -> argparse.Namespace:
 
 async def main() -> None:
     load_dotenv()
+    loop = asyncio.get_running_loop()
+    shutdown_requested = asyncio.Event()
+    installed_signal_handlers: list[tuple[signal.Signals, object]] = []
+
+    def _request_shutdown(signal_name: str) -> None:
+        if shutdown_requested.is_set():
+            return
+        shutdown_requested.set()
+        print(
+            f"Shutdown requested ({signal_name}); "
+            "stopping new items and flushing progress."
+        )
+
+    def _handle_shutdown_signal(signum: int, _frame: object) -> None:
+        try:
+            signal_name = signal.Signals(signum).name
+        except Exception:
+            signal_name = str(signum)
+        loop.call_soon_threadsafe(_request_shutdown, signal_name)
+
+    for candidate_signal in (signal.SIGINT, getattr(signal, "SIGTERM", None)):
+        if candidate_signal is None:
+            continue
+        try:
+            previous_handler = signal.getsignal(candidate_signal)
+            signal.signal(candidate_signal, _handle_shutdown_signal)
+            installed_signal_handlers.append((candidate_signal, previous_handler))
+        except Exception:
+            continue
 
     args = parse_args()
 
@@ -113,6 +146,7 @@ async def main() -> None:
         progress_write_every = max(1, progress_write_every_arg)
     else:
         progress_write_every = 100 if resume_from_output else 1
+    base_progress_write_every = progress_write_every
 
     prompt_template_path, repair_prompt_template_path, template_error = resolve_patch_and_repair_template_paths(
         args.patch_prompt_file,
@@ -172,40 +206,103 @@ async def main() -> None:
             text_output_lines = loaded_lines
     progress_write_lock = asyncio.Lock()
     pending_progress_writes = 0
+    resume_progress_write_every = base_progress_write_every
+    output_jsonl_path = prepare_jsonl_output_path(output_file_value, resume_mode=resume_from_output)
+    streamed_jsonl_slots: set[int] = set()
+    pending_jsonl_slots: list[int] = []
 
-    async def maybe_write_progress_snapshot() -> None:
-        nonlocal pending_progress_writes
+    async def maybe_write_progress_snapshot(
+        *,
+        slot: int | None = None,
+        used_existing_output_line: bool = False,
+        force: bool = False,
+    ) -> None:
+        nonlocal pending_progress_writes, resume_progress_write_every
         if not output_file_value:
             return
         async with progress_write_lock:
-            pending_progress_writes += 1
-            if pending_progress_writes < progress_write_every:
+            if (
+                isinstance(slot, int)
+                and slot >= 0
+                and slot not in streamed_jsonl_slots
+                and slot not in pending_jsonl_slots
+            ):
+                pending_jsonl_slots.append(slot)
+
+            current_progress_write_every = base_progress_write_every
+            if resume_from_output and used_existing_output_line:
+                current_progress_write_every = resume_progress_write_every
+
+            if not force:
+                pending_progress_writes += 1
+                if pending_progress_writes < current_progress_write_every:
+                    if resume_from_output and used_existing_output_line:
+                        resume_progress_write_every = max(
+                            base_progress_write_every,
+                            resume_progress_write_every * 2,
+                        )
+                    return
+                pending_progress_writes = 0
+
+            remaining_jsonl_slots: list[int] = []
+            for pending_slot in pending_jsonl_slots:
+                try:
+                    source_filename = source_filenames[pending_slot] if pending_slot < len(source_filenames) else None
+                    if append_payload_jsonl_record(
+                        output_jsonl_path,
+                        payloads[pending_slot],
+                        source_filename,
+                        active_step_keys,
+                    ):
+                        streamed_jsonl_slots.add(pending_slot)
+                    else:
+                        remaining_jsonl_slots.append(pending_slot)
+                except Exception as error:
+                    print(f"Failed to append JSONL progress record: {error}")
+                    remaining_jsonl_slots.append(pending_slot)
+            pending_jsonl_slots.clear()
+            pending_jsonl_slots.extend(remaining_jsonl_slots)
+
+            if not any(isinstance(line, str) and line.strip() for line in text_output_lines):
+                if resume_from_output and used_existing_output_line:
+                    resume_progress_write_every = max(
+                        base_progress_write_every,
+                        resume_progress_write_every * 2,
+                    )
                 return
 
-            completed_payloads = [payload for payload in payloads if isinstance(payload, dict)]
-            if not completed_payloads:
-                return
-
-            pending_progress_writes = 0
             try:
-                write_output_artifacts(
-                    completed_payloads,
+                write_fallback_text_output(
                     output_file_value,
                     text_output_lines,
                     source_filenames,
                     source_rows,
-                    output_as_tsv,
-                    active_step_keys,
+                    output_as_tsv=output_as_tsv,
                 )
             except Exception as error:
                 print(f"Failed to write progress snapshot: {error}")
+            finally:
+                if resume_from_output and used_existing_output_line:
+                    resume_progress_write_every = max(
+                        base_progress_write_every,
+                        resume_progress_write_every * 2,
+                    )
+
+    async def reset_resume_progress_write_interval() -> None:
+        nonlocal resume_progress_write_every
+        if not resume_from_output:
+            return
+        async with progress_write_lock:
+            resume_progress_write_every = base_progress_write_every
 
     async def process_item(index: int, transcription: str, total: int) -> None:
+        if shutdown_requested.is_set():
+            return
         slot = index - 1
         processing_id = f"{index}/{total}"
         if is_input_comment_line(transcription):
             text_output_lines[slot] = transcription
-            await maybe_write_progress_snapshot()
+            await maybe_write_progress_snapshot(slot=slot)
             return
 
         if not transcription.strip():
@@ -215,7 +312,7 @@ async def main() -> None:
                 f"Input transcription {index}/{total} is empty; "
                 "emitting empty payload."
             )
-            await maybe_write_progress_snapshot()
+            await maybe_write_progress_snapshot(slot=slot)
             return
 
         if resume_from_output:
@@ -231,8 +328,9 @@ async def main() -> None:
                     f"[{processing_id}] Resume enabled: existing output is non-empty; "
                     "skipping transcription."
                 )
-                await maybe_write_progress_snapshot()
+                await maybe_write_progress_snapshot(slot=slot, used_existing_output_line=True)
                 return
+            await reset_resume_progress_write_interval()
 
         prompt_transcription, case_normalized = normalize_all_uppercase_input(transcription)
         source_was_all_uppercase = is_all_uppercase_cased_input(transcription)
@@ -364,7 +462,7 @@ async def main() -> None:
                 resolved_payload["source_text"] = transcription
                 corrected_text = resolved_payload.get("corrected_text")
                 text_output_lines[slot] = corrected_text if isinstance(corrected_text, str) else ""
-            await maybe_write_progress_snapshot()
+            await maybe_write_progress_snapshot(slot=slot)
         except asyncio.CancelledError:
             payloads[slot] = build_empty_payload()
             payloads[slot]["source_text"] = transcription
@@ -373,7 +471,7 @@ async def main() -> None:
                 f"Cancelled while processing transcription {index}/{total}; "
                 "emitting empty payload."
             )
-            await maybe_write_progress_snapshot()
+            await maybe_write_progress_snapshot(slot=slot)
             return
         except Exception as error:
             payloads[slot] = build_empty_payload()
@@ -383,10 +481,21 @@ async def main() -> None:
                 f"Unexpected error on transcription {index}/{total}: {error}; "
                 "emitting empty payload."
             )
-            await maybe_write_progress_snapshot()
+            await maybe_write_progress_snapshot(slot=slot)
             return
 
-    await run_transcriptions_with_concurrency(transcriptions, concurrency, process_item)
+    try:
+        await run_transcriptions_with_concurrency(transcriptions, concurrency, process_item)
+    finally:
+        await maybe_write_progress_snapshot(force=True)
+        for candidate_signal, previous_handler in installed_signal_handlers:
+            try:
+                signal.signal(candidate_signal, previous_handler)
+            except Exception:
+                continue
+
+    if shutdown_requested.is_set():
+        print("Shutdown handler completed final progress flush.")
 
     if not finalize_payloads_and_write(
         payloads,

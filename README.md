@@ -2,6 +2,12 @@
 
 Transcription refinement pipeline with shared JSON-schema validation and one-pass strict JSON repair.
 
+TL;DR:
+This tool uses LLMs to refine multilingual ASR training ground truth by correcting clear errors and improving consistency.
+It is language agnostic, prioritizes semantic correctness and training robustness, and aims to stay faithful to spoken content.
+Locale specific conventions, prescriptive transliteration rules, and style/register normalization are explicit non goals.
+
+
 ## What this repo contains
 
 - `run_aoai.py`: AOAI pipeline runner.
