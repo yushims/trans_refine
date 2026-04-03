@@ -3250,6 +3250,7 @@ def build_patch_prompt(
     prompt_template: str,
     transcription: str,
     chain_steps: list[str] | None = None,
+    locale: str | None = None,
 ) -> str:
     active_chain_ids = _resolve_active_chain_ids(chain_steps)
     active_chain_names = [_CHAIN_ID_TO_NAME[chain_id] for chain_id in active_chain_ids]
@@ -3280,6 +3281,17 @@ def build_patch_prompt(
         prompt = prompt.replace("{runtime_chain_policy}", runtime_chain_policy)
     else:
         prompt = f"{prompt}\n\n{runtime_chain_policy}"
+
+    if locale:
+        locale_info = (
+            f"[LOCALE]\n"
+            f"- The input audio locale is: {locale}\n"
+            f"- Use this locale information to guide language-specific editing decisions."
+        )
+        if "{locale}" in prompt:
+            prompt = prompt.replace("{locale}", locale_info)
+        else:
+            prompt = f"{prompt}\n\n{locale_info}"
     if "{input_transcript}" in prompt:
         prompt = prompt.replace("{input_transcript}", transcription)
         return prompt

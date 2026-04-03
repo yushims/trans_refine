@@ -64,6 +64,7 @@ def parse_args() -> argparse.Namespace:
     )
     add_common_runtime_cli_arguments(parser)
     add_aoai_sampling_cli_arguments(parser)
+    parser.add_argument("--locale", dest="locale", default=None, help="Locale of the input audio (e.g. en-US, zh-CN). Adds locale context to the prompt.")
     parser.add_argument(
         "--chain-steps",
         dest="chain_steps",
@@ -388,6 +389,7 @@ async def main() -> None:
                         prompt_template,
                         segment_transcription,
                         chain_steps,
+                        locale=args.locale,
                     )
 
                     failure_reasons: list[str] = []

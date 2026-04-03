@@ -60,6 +60,7 @@ def parse_args() -> argparse.Namespace:
     )
     add_common_runtime_cli_arguments(parser)
     add_model_mismatch_retries_cli_argument(parser)
+    parser.add_argument("--locale", dest="locale", default=None, help="Locale of the input audio (e.g. en-US, zh-CN). Adds locale context to the prompt.")
     parser.add_argument("--list-models-only", dest="list_models_only", action="store_true")
     parser.add_argument("--print-models", dest="print_models", action="store_true")
     parser.add_argument(
@@ -389,6 +390,7 @@ async def main():
                             prompt_template,
                             segment_transcription,
                             chain_steps,
+                            locale=args.locale,
                         )
 
                         failure_reasons: list[str] = []
