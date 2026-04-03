@@ -1,11 +1,13 @@
 import asyncio
 import argparse
 import ast
+import builtins
 import csv
 import difflib
 import json
 import math
 import re
+import sys
 import unicodedata
 from collections import Counter
 from collections.abc import Awaitable, Callable
@@ -66,6 +68,49 @@ DEFAULT_AOAI_ENDPOINT = "https://adaptationdev-resource.openai.azure.com/"
 DEFAULT_AOAI_API_VERSION = "2025-01-01-preview"
 DEFAULT_AOAI_DEPLOYMENT = "gpt-5-chat"
 DEFAULT_COPILOT_MODEL = "gpt-5.2"
+
+
+_ORIGINAL_PRINT = builtins.print
+_SAFE_PRINT_INSTALLED = False
+
+
+def install_safe_console_output() -> None:
+    """Make console logging robust on Windows code pages that cannot encode Unicode."""
+    global _SAFE_PRINT_INSTALLED
+    if _SAFE_PRINT_INSTALLED:
+        return
+
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="backslashreplace")
+            except Exception:
+                pass
+
+    def _safe_print(*args, **kwargs) -> None:
+        try:
+            _ORIGINAL_PRINT(*args, **kwargs)
+            return
+        except UnicodeEncodeError:
+            pass
+
+        sep = kwargs.get("sep", " ")
+        end = kwargs.get("end", "\n")
+        target_stream = kwargs.get("file", sys.stdout)
+        flush = kwargs.get("flush", False)
+
+        try:
+            raw_text = sep.join(str(arg) for arg in args)
+        except Exception:
+            raw_text = " ".join(repr(arg) for arg in args)
+
+        encoding = getattr(target_stream, "encoding", None) or "utf-8"
+        safe_text = raw_text.encode(encoding, errors="backslashreplace").decode(encoding, errors="ignore")
+        _ORIGINAL_PRINT(safe_text, end=end, file=target_stream, flush=flush)
+
+    builtins.print = _safe_print
+    _SAFE_PRINT_INSTALLED = True
 
 
 _long_span_min_deleted_tokens = DEFAULT_LONG_SPAN_MIN_DELETED_TOKENS
@@ -153,6 +198,12 @@ def add_common_runtime_cli_arguments(
             "Resume from existing output text file (.txt or .tsv). "
             "Rows with non-empty existing output are skipped; non-empty input rows with empty output are retried."
         ),
+    )
+    parser.add_argument(
+        "--skip-jsonl-output",
+        dest="skip_jsonl_output",
+        action="store_true",
+        help="Skip writing incremental JSONL progress output (.jsonl).",
     )
 
 
@@ -2025,6 +2076,7 @@ def build_empty_payload() -> dict:
         "translation": "",
         "aggressiveness_level": "low",
         "speaker_scope": "unknown",
+        "no_touch_tokens": [],
     }
 
     for step_key in _STEP_CHAIN_KEYS:

@@ -21,6 +21,7 @@ from common import (
     is_all_uppercase_cased_input,
     normalize_all_uppercase_input,
     is_input_comment_line,
+    install_safe_console_output,
     load_patch_and_repair_templates,
     load_existing_output_text_lines,
     merge_segment_payloads,
@@ -71,6 +72,7 @@ def parse_args() -> argparse.Namespace:
 
 
 async def main():
+    install_safe_console_output()
     loop = asyncio.get_running_loop()
     shutdown_requested = asyncio.Event()
     installed_signal_handlers: list[tuple[signal.Signals, object]] = []
@@ -140,6 +142,7 @@ async def main():
     chain_steps = [step for step in (args.chain_steps or []) if isinstance(step, str) and step.strip()]
     active_step_keys = resolve_active_chain_step_keys(chain_steps)
     resume_from_output = bool(args.resume_from_output)
+    skip_jsonl_output = bool(args.skip_jsonl_output)
     progress_write_every_arg = args.progress_write_every
     if isinstance(progress_write_every_arg, int):
         progress_write_every = max(1, progress_write_every_arg)
@@ -161,6 +164,8 @@ async def main():
     if chain_steps:
         print(f"Chain step selector count: {len(chain_steps)}")
     print(f"Resolved active chain: {format_resolved_chain_steps(chain_steps)}")
+    if skip_jsonl_output:
+        print("JSONL progress output: disabled (--skip-jsonl-output)")
     print_common_runtime_settings(
         prompt_template_path,
         repair_prompt_template_path,
@@ -202,7 +207,11 @@ async def main():
         progress_write_lock = asyncio.Lock()
         pending_progress_writes = 0
         resume_progress_write_every = base_progress_write_every
-        output_jsonl_path = prepare_jsonl_output_path(output_file_value, resume_mode=resume_from_output)
+        output_jsonl_path = (
+            None
+            if skip_jsonl_output
+            else prepare_jsonl_output_path(output_file_value, resume_mode=resume_from_output)
+        )
         streamed_jsonl_slots: set[int] = set()
         pending_jsonl_slots: list[int] = []
 
