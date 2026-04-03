@@ -28,6 +28,7 @@ def build_copilot_session_parameters(model_name: str) -> dict[str, Any]:
         "tools": [],
         "streaming": False,
         "system_message": STRICT_JSON_SYSTEM,
+        "response_format": {"type": "json_object"},
     }
     if model_name in ["gpt-5.2"]:
         session_parameters["reasoning_effort"] = "low"
