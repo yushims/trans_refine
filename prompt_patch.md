@@ -47,6 +47,7 @@ Current profile: Arabic (`ORIGINAL` in Arabic script)
 ### [ENGLISH_TRANSLATION]
 
 * Produce a faithful English reference translation.
+* If `ORIGINAL` is already in English, produce a corrected English version as the translation; do NOT translate into any other language.
 * Keep names, numbers, and protected spans unchanged.
 * This is a **reference artifact only**; it does not trigger schema changes.
 
