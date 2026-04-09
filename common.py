@@ -67,6 +67,7 @@ DEFAULT_HALLUCINATION_MAX_INSERTED_TOKENS = 3
 DEFAULT_AOAI_ENDPOINT = "https://adaptationdev-resource.openai.azure.com/"
 DEFAULT_AOAI_API_VERSION = "2025-01-01-preview"
 DEFAULT_AOAI_DEPLOYMENT = "gpt-5-chat"
+DEFAULT_AOAI_BATCH_DEPLOYMENT = "gpt-4.1-3-batch"
 DEFAULT_COPILOT_MODEL = "gpt-5.2"
 
 
@@ -2782,6 +2783,102 @@ def normalize_char_based_spacing_input(transcription: str) -> tuple[str, bool]:
     return "".join(normalized_parts), True
 
 
+# ---------------------------------------------------------------------------
+# Deterministic preprocessing: noise-tag removal & decorative quote stripping
+# ---------------------------------------------------------------------------
+
+# Noise / non-speech tokens whose removal is always safe.
+# Sourced from the Databricks batch translation pipeline.
+_PREPROCESSING_NOISE_TOKENS: set[str] = {t.lower() for t in [
+    "_bg noise_", "Bg Noise_", "_B.G. noise_", "_BG Noise_", "_BG speech",
+    "[/CNON]", "[CNON]", "[/CNPS]", "[CNPS]", "[/CSPN]", "[CSPN]", "_CSPN_",
+    "[FILL/]", "[hmm]", "_hmm_", "_mouth noise_", "_Mouth_noise_",
+    "__Mouth Noise__", "_Mouth_Noise_", "[noise]", "_/noise_", "_noise_",
+    "__noise__", "@Noise@", "_Noise_", "@NOISE@", "[NOISE/]",
+    "[non/]", "[non]", "[NON/]", "[/NPS]", "[NPS]", "[S/]", "[SN/]",
+    "[Speaker Noise]", "_Speaker Noise_", "_Speaker_Noise_",
+    "[SPN/]", "[unin/]", "_noise_noise_", "_bg_noise_", "[_noise_]",
+    "_NS_NOISE_", "_/click_",
+]}
+
+# Build a regex that matches any noise token (case-insensitive, longest first).
+_PREPROCESSING_NOISE_PATTERN = re.compile(
+    "|".join(
+        re.escape(token)
+        for token in sorted(_PREPROCESSING_NOISE_TOKENS, key=len, reverse=True)
+    ),
+    flags=re.IGNORECASE,
+)
+
+# Decorative quotation marks to strip (locale-aware variants).
+_DECORATIVE_QUOTE_CHARS = set('""\u201c\u201d\u00ab\u00bb')
+
+
+def preprocess_remove_noise_tags(text: str) -> tuple[str, bool]:
+    """Remove known ASR noise/non-speech tags from *text*.
+
+    Returns ``(cleaned_text, changed)``.
+    """
+    if not isinstance(text, str) or not text:
+        return text, False
+
+    cleaned = _PREPROCESSING_NOISE_PATTERN.sub("", text)
+    # Collapse multiple spaces left by removals.
+    cleaned = re.sub(r" {2,}", " ", cleaned).strip()
+    return cleaned, cleaned != text.strip()
+
+
+def preprocess_strip_decorative_quotes(text: str) -> tuple[str, bool]:
+    """Remove decorative/wrapping quotation marks without changing meaning.
+
+    Only strips quotes at word boundaries (start/end of text, or around
+    whitespace-separated tokens).  Does not touch quotes that appear
+    mid-word (e.g. contractions).
+
+    Returns ``(cleaned_text, changed)``.
+    """
+    if not isinstance(text, str) or not text:
+        return text, False
+
+    # Strip leading/trailing decorative quotes.
+    stripped = text.strip()
+    if len(stripped) >= 2 and stripped[0] in _DECORATIVE_QUOTE_CHARS and stripped[-1] in _DECORATIVE_QUOTE_CHARS:
+        stripped = stripped[1:-1].strip()
+
+    # Remove remaining standalone decorative quotes (surrounded by space or at boundaries).
+    cleaned = re.sub(
+        r'(?<=\s)["""\u201c\u201d\u00ab\u00bb](?=\s)|^["""\u201c\u201d\u00ab\u00bb](?=\s)|(?<=\s)["""\u201c\u201d\u00ab\u00bb]$',
+        "",
+        stripped,
+    )
+    cleaned = re.sub(r" {2,}", " ", cleaned).strip()
+    return cleaned, cleaned != text.strip()
+
+
+def preprocess_transcription(text: str) -> tuple[str, bool]:
+    """Apply all deterministic preprocessing steps to a transcription.
+
+    Steps (in order):
+    1. Remove known noise/non-speech tags.
+    2. Strip decorative quotation marks.
+
+    Returns ``(preprocessed_text, any_change_applied)``.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return text, False
+
+    result = text
+    changed = False
+
+    result, noise_changed = preprocess_remove_noise_tags(result)
+    changed = changed or noise_changed
+
+    result, quote_changed = preprocess_strip_decorative_quotes(result)
+    changed = changed or quote_changed
+
+    return result, changed
+
+
 def normalize_all_uppercase_input(transcription: str) -> tuple[str, bool]:
     """Convert all-uppercase sentence-like input to lowercase before prompting."""
     if not isinstance(transcription, str):
@@ -3495,8 +3592,13 @@ def write_output_artifacts(
         output_path = resolve_path(output_file_value)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        output_json_path = output_path.with_suffix(".json")
-        output_json_path.write_text(output_content, encoding="utf-8")
+        # Write JSONL (one payload per line) as the default structured output.
+        output_jsonl_path = output_path.with_suffix(".jsonl")
+        with output_jsonl_path.open("w", encoding="utf-8", newline="") as jsonl_file:
+            for sanitized_payload in sanitized_payloads:
+                line = json.dumps(sanitized_payload, ensure_ascii=False, separators=(",", ":"))
+                jsonl_file.write(line)
+                jsonl_file.write("\n")
 
         if is_tsv_output:
             output_tsv_path = output_path.with_suffix(".tsv")
@@ -3525,7 +3627,8 @@ def write_output_artifacts(
             output_text_path.parent.mkdir(parents=True, exist_ok=True)
             output_text_path.write_text(text_output_content, encoding="utf-8")
     else:
-        print(output_content)
+        for sanitized_payload in sanitized_payloads:
+            print(json.dumps(sanitized_payload, ensure_ascii=False, separators=(",", ":")))
 
 
 def sanitize_output_string(value: str) -> str:
