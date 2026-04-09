@@ -1,13 +1,20 @@
 import asyncio
 import json
+import os
 import random
+import tempfile
+import time
 from collections.abc import Callable
 
 from common import (
+    DEFAULT_MAX_INPUT_CHARS_PER_CALL,
     extract_retry_after_seconds,
     extract_text_content,
     get_patch_payload_with_repair_generic,
+    merge_segment_payloads,
+    parse_validate_and_apply_text_fixes,
     run_with_timeout_retry,
+    take_next_transcription_segment_for_llm,
 )
 
 
@@ -177,3 +184,482 @@ async def get_patch_payload_with_repair(
         repair_timeout_message="Repair returned empty output or timed out.",
         repair_empty_message="Repair returned empty output or timed out.",
     )
+
+
+# ---------------------------------------------------------------------------
+# Batch API helpers
+# ---------------------------------------------------------------------------
+
+BATCH_DEFAULT_SIZE = 10000  # 1000: ~2-5MB, 5000: ~10-25 MB, 10000: ~20-50 MB, 20000: ~40-100 MB, 50000: 100+ MB
+BATCH_POLL_INTERVAL_SECONDS = 30
+
+
+def build_batch_jsonl_requests(
+    items: list[tuple[int, str]],
+    deployment: str,
+    prompt_template: str,
+    chain_steps: list[str] | None,
+    locale: str | None,
+    schema: dict,
+    temperature: float,
+    top_p: float,
+    build_patch_prompt_fn: Callable,
+) -> list[str]:
+    """Build JSONL lines for the Azure OpenAI Batch API.
+
+    Each *item* is ``(index, transcription)`` where *index* is its position
+    in the input list (0-based).
+    """
+    lines: list[str] = []
+    for idx, transcription in items:
+        prompt = build_patch_prompt_fn(prompt_template, transcription, chain_steps, locale=locale)
+        request = {
+            "custom_id": f"idx-{idx}",
+            "method": "POST",
+            "url": "/chat/completions",
+            "body": {
+                "model": deployment,
+                "messages": [{"role": "user", "content": prompt}],
+                "response_format": {
+                    "type": "json_object",
+                },
+                "temperature": temperature,
+                "top_p": top_p,
+            },
+        }
+        lines.append(json.dumps(request, ensure_ascii=False))
+    return lines
+
+
+def _call_with_retry(func, *args, retries: int = 5, **kwargs):
+    """Call *func* with simple retry logic and linear backoff."""
+    last_error: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            return func(*args, **kwargs)
+        except Exception as exc:
+            last_error = exc
+            if attempt == retries:
+                break
+            delay = min(2 ** attempt, 30)
+            print(f"  Retry {attempt}/{retries} after error: {exc}  (backoff {delay}s)")
+            time.sleep(delay)
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Call failed without exception details.")
+
+
+async def submit_batch_and_wait(
+    client,
+    jsonl_lines: list[str],
+    batch_label: str = "",
+) -> dict[int, str]:
+    """Submit a Batch API job and poll until completion.
+
+    Returns a mapping ``{index: raw_content}`` for each successfully
+    completed request.
+    """
+    file_ids: list[str] = []
+    tmp_path: str | None = None
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".jsonl", delete=False, encoding="utf-8",
+        ) as fh:
+            fh.write("\n".join(jsonl_lines))
+            tmp_path = fh.name
+
+        print(f"[batch{batch_label}] Uploading {len(jsonl_lines)} requests …")
+        batch_file = _call_with_retry(
+            client.files.create, file=open(tmp_path, "rb"), purpose="batch",
+        )
+        file_ids.append(batch_file.id)
+
+        batch_job = _call_with_retry(
+            client.batches.create,
+            input_file_id=batch_file.id,
+            endpoint="/chat/completions",
+            completion_window="24h",
+        )
+        print(f"[batch{batch_label}] Submitted job {batch_job.id}")
+
+        while True:
+            status = await asyncio.to_thread(
+                _call_with_retry, client.batches.retrieve, batch_job.id,
+            )
+            print(f"[batch{batch_label}] Status: {status.status}")
+            if status.status in ("completed", "failed", "cancelled", "expired"):
+                break
+            await asyncio.sleep(BATCH_POLL_INTERVAL_SECONDS)
+
+        if status.output_file_id:
+            file_ids.append(status.output_file_id)
+        if status.error_file_id:
+            file_ids.append(status.error_file_id)
+
+        if status.status != "completed":
+            print(f"[batch{batch_label}] Job ended with status: {status.status}")
+            if status.error_file_id:
+                try:
+                    err_text = _call_with_retry(
+                        client.files.content, status.error_file_id,
+                    ).text
+                    print(f"[batch{batch_label}] Error details:\n{err_text[:2000]}")
+                except Exception:
+                    pass
+            return {}
+
+        result_text = await asyncio.to_thread(
+            lambda: _call_with_retry(client.files.content, status.output_file_id).text,
+        )
+
+        results: dict[int, str] = {}
+        for line in result_text.strip().split("\n"):
+            if not line:
+                continue
+            row = json.loads(line)
+            idx = int(row["custom_id"].split("-", 1)[1])
+            try:
+                content = row["response"]["body"]["choices"][0]["message"]["content"]
+                results[idx] = content
+            except (KeyError, IndexError, TypeError) as exc:
+                print(f"[batch{batch_label}] Could not extract content for idx {idx}: {exc}")
+        return results
+
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        for fid in file_ids:
+            try:
+                _call_with_retry(client.files.delete, fid)
+            except Exception:
+                pass
+
+
+async def run_batch_pipeline(
+    client,
+    deployment: str,
+    transcriptions: list[str],
+    prompt_template: str,
+    chain_steps: list[str] | None,
+    locale: str | None,
+    schema: dict,
+    temperature: float,
+    top_p: float,
+    batch_size: int,
+    build_patch_prompt_fn: Callable,
+    skip_first_token_casing_preservation_flags: list[bool],
+    active_step_keys: set[str] | None = None,
+    max_retry_passes: int = 2,
+    max_input_chars_per_call: int = DEFAULT_MAX_INPUT_CHARS_PER_CALL,
+    retry_temperature_jitter: float = 0.08,
+) -> list[dict | None]:
+    """Run the full batch pipeline: partition, submit, parse results.
+
+    Failed items are collected and resubmitted in up to *max_retry_passes*
+    follow-up batches with temperature jitter and input segmentation for
+    long transcriptions.  Returns a list parallel to *transcriptions* with
+    parsed payloads (or ``None`` for items that still failed).
+    """
+    total = len(transcriptions)
+    payloads: list[dict | None] = [None] * total
+
+    # Build (index, transcription) items for non-empty inputs.
+    items: list[tuple[int, str]] = []
+    for idx, text in enumerate(transcriptions):
+        if text.strip():
+            items.append((idx, text))
+        else:
+            from common import build_empty_payload
+            payloads[idx] = build_empty_payload()
+            payloads[idx]["source_text"] = text
+
+    if not items:
+        return payloads
+
+    pending_items = list(items)
+
+    for pass_num in range(1, max_retry_passes + 2):  # pass 1 = initial, 2..N+1 = retries
+        if not pending_items:
+            break
+
+        is_retry = pass_num > 1
+        pass_label = "" if not is_retry else f" (retry {pass_num - 1})"
+
+        # Apply temperature jitter on retries.
+        pass_temperature = temperature
+        if is_retry and retry_temperature_jitter > 0:
+            pass_temperature = max(
+                0.0,
+                min(1.0, temperature + random.uniform(0.0, retry_temperature_jitter)),
+            )
+            print(f"Batch mode{pass_label}: temperature jitter applied: {pass_temperature:.3f}")
+
+        # On retries, segment failed items by halving their input length.
+        # Pass 1: use max_input_chars_per_call for very long inputs.
+        # Retry 1: half the input length. Retry 2: quarter, etc.
+        # batch_entries: list of (custom_key, original_idx, text_to_send)
+        batch_entries: list[tuple[str, int, str]] = []
+        # segment_groups tracks which original items were split.
+        segment_groups: dict[int, list[tuple[str, str]]] = {}
+
+        for idx, transcription in pending_items:
+            if is_retry:
+                # Halve progressively: retry 1 = len/2, retry 2 = len/4, etc.
+                retry_segment_limit = max(1, len(transcription) // (2 ** pass_num - 1))
+            elif max_input_chars_per_call > 0 and len(transcription) > max_input_chars_per_call:
+                retry_segment_limit = max_input_chars_per_call
+            else:
+                retry_segment_limit = 0
+
+            should_segment = retry_segment_limit > 0 and len(transcription) > retry_segment_limit
+
+            if should_segment:
+                segments: list[str] = []
+                start_offset = 0
+                while start_offset < len(transcription):
+                    seg, _ = take_next_transcription_segment_for_llm(
+                        transcription, start_offset, retry_segment_limit,
+                    )
+                    if not seg:
+                        seg = transcription[start_offset:start_offset + 1]
+                    segments.append(seg)
+                    start_offset += len(seg)
+
+                if len(segments) > 1:
+                    seg_keys: list[tuple[str, str]] = []
+                    for seg_num, seg_text in enumerate(segments):
+                        custom_key = f"{idx}_s{seg_num}"
+                        batch_entries.append((custom_key, idx, seg_text))
+                        seg_keys.append((custom_key, seg_text))
+                    segment_groups[idx] = seg_keys
+                    print(
+                        f"  [{idx + 1}/{total}] Segmented into {len(segments)} parts "
+                        f"(limit={retry_segment_limit}, input={len(transcription)} chars)"
+                    )
+                    continue
+
+            # Single item (no segmentation).
+            custom_key = str(idx)
+            batch_entries.append((custom_key, idx, transcription))
+
+        # Build JSONL request lines with custom keys.
+        all_jsonl_lines: list[str] = []
+        for custom_key, _orig_idx, text in batch_entries:
+            prompt = build_patch_prompt_fn(prompt_template, text, chain_steps, locale=locale)
+            request = {
+                "custom_id": f"idx-{custom_key}",
+                "method": "POST",
+                "url": "/chat/completions",
+                "body": {
+                    "model": deployment,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "response_format": {
+                        "type": "json_object",
+                    },
+                    "temperature": pass_temperature,
+                    "top_p": top_p,
+                },
+            }
+            all_jsonl_lines.append(json.dumps(request, ensure_ascii=False))
+
+        # Submit in partitions and collect all results.
+        all_raw_results: dict[str, str] = {}
+
+        partition_starts = list(range(0, len(all_jsonl_lines), batch_size))
+        num_partitions = len(partition_starts)
+
+        print(
+            f"Batch mode{pass_label}: {len(pending_items)} items "
+            f"({len(batch_entries)} requests) in {num_partitions} partition(s)"
+        )
+
+        for part_num, start in enumerate(partition_starts, 1):
+            batch_label = f" {part_num}/{num_partitions}{pass_label}"
+            part_lines = all_jsonl_lines[start : start + batch_size]
+
+            raw_results = await _submit_batch_and_wait_keyed(
+                client, part_lines, batch_label,
+            )
+            print(f"[batch{batch_label}] Received {len(raw_results)}/{len(part_lines)} results")
+            all_raw_results.update(raw_results)
+
+        # Process non-segmented items.
+        for custom_key, orig_idx, text in batch_entries:
+            if orig_idx in segment_groups:
+                continue  # Handle below.
+
+            raw_content = all_raw_results.get(custom_key)
+            if raw_content is None:
+                print(f"  [{orig_idx + 1}/{total}] No response from batch API; skipping.")
+                continue
+
+            payload, validation_error, _ = parse_validate_and_apply_text_fixes(
+                raw_content,
+                text,
+                processing_id=f"{orig_idx + 1}/{total}",
+                skip_first_token_casing_preservation=skip_first_token_casing_preservation_flags[orig_idx],
+                active_step_keys=active_step_keys,
+            )
+
+            if payload is not None:
+                corrected_text = payload.get("corrected_text")
+                if isinstance(corrected_text, str) and corrected_text.strip():
+                    payloads[orig_idx] = payload
+                else:
+                    print(f"  [{orig_idx + 1}/{total}] Empty corrected_text; skipping.")
+            else:
+                print(f"  [{orig_idx + 1}/{total}] Validation failed: {validation_error}")
+
+        # Process segmented items: parse each segment, then merge.
+        for orig_idx, seg_entries in segment_groups.items():
+            seg_payloads: list[dict] = []
+            seg_sources: list[str] = []
+            all_segments_ok = True
+
+            for custom_key, seg_source in seg_entries:
+                raw_content = all_raw_results.get(custom_key)
+                if raw_content is None:
+                    print(
+                        f"  [{orig_idx + 1}/{total}] Segment {custom_key}: "
+                        "no response from batch API."
+                    )
+                    all_segments_ok = False
+                    break
+
+                seg_payload, validation_error, _ = parse_validate_and_apply_text_fixes(
+                    raw_content,
+                    seg_source,
+                    processing_id=f"{orig_idx + 1}/{total} seg",
+                    skip_first_token_casing_preservation=skip_first_token_casing_preservation_flags[orig_idx],
+                    active_step_keys=active_step_keys,
+                )
+
+                if seg_payload is not None:
+                    corrected = seg_payload.get("corrected_text")
+                    if isinstance(corrected, str) and corrected.strip():
+                        seg_payloads.append(seg_payload)
+                        seg_sources.append(seg_source)
+                    else:
+                        print(
+                            f"  [{orig_idx + 1}/{total}] Segment {custom_key}: "
+                            "empty corrected_text."
+                        )
+                        all_segments_ok = False
+                        break
+                else:
+                    print(
+                        f"  [{orig_idx + 1}/{total}] Segment {custom_key}: "
+                        f"validation failed: {validation_error}"
+                    )
+                    all_segments_ok = False
+                    break
+
+            if all_segments_ok and seg_payloads:
+                merged = merge_segment_payloads(seg_payloads, seg_sources)
+                if merged is not None:
+                    payloads[orig_idx] = merged
+                    print(f"  [{orig_idx + 1}/{total}] Merged {len(seg_payloads)} segments successfully.")
+                else:
+                    print(f"  [{orig_idx + 1}/{total}] Segment merge failed.")
+
+        # Collect failed items for retry.
+        failed_items = [(idx, text) for idx, text in pending_items if payloads[idx] is None]
+        if not failed_items:
+            break
+
+        if pass_num > max_retry_passes:
+            print(f"Batch mode: {len(failed_items)} items still failed after {max_retry_passes} retry pass(es).")
+            break
+
+        print(f"Batch mode: {len(failed_items)} failed items; scheduling retry pass {pass_num}...")
+        pending_items = failed_items
+
+    return payloads
+
+
+async def _submit_batch_and_wait_keyed(
+    client,
+    jsonl_lines: list[str],
+    batch_label: str = "",
+) -> dict[str, str]:
+    """Like submit_batch_and_wait but returns results keyed by the custom_id
+    suffix (the part after 'idx-') as a string, supporting non-integer keys
+    like '3_s0' for segmented items.
+    """
+    file_ids: list[str] = []
+    tmp_path: str | None = None
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".jsonl", delete=False, encoding="utf-8",
+        ) as fh:
+            fh.write("\n".join(jsonl_lines))
+            tmp_path = fh.name
+
+        print(f"[batch{batch_label}] Uploading {len(jsonl_lines)} requests \u2026")
+        batch_file = _call_with_retry(
+            client.files.create, file=open(tmp_path, "rb"), purpose="batch",
+        )
+        file_ids.append(batch_file.id)
+
+        batch_job = _call_with_retry(
+            client.batches.create,
+            input_file_id=batch_file.id,
+            endpoint="/chat/completions",
+            completion_window="24h",
+        )
+        print(f"[batch{batch_label}] Submitted job {batch_job.id}")
+
+        while True:
+            status = await asyncio.to_thread(
+                _call_with_retry, client.batches.retrieve, batch_job.id,
+            )
+            print(f"[batch{batch_label}] Status: {status.status}")
+            if status.status in ("completed", "failed", "cancelled", "expired"):
+                break
+            await asyncio.sleep(BATCH_POLL_INTERVAL_SECONDS)
+
+        if status.output_file_id:
+            file_ids.append(status.output_file_id)
+        if status.error_file_id:
+            file_ids.append(status.error_file_id)
+
+        if status.status != "completed":
+            print(f"[batch{batch_label}] Job ended with status: {status.status}")
+            if status.error_file_id:
+                try:
+                    err_text = _call_with_retry(
+                        client.files.content, status.error_file_id,
+                    ).text
+                    print(f"[batch{batch_label}] Error details:\n{err_text[:2000]}")
+                except Exception:
+                    pass
+            return {}
+
+        result_text = await asyncio.to_thread(
+            lambda: _call_with_retry(client.files.content, status.output_file_id).text,
+        )
+
+        results: dict[str, str] = {}
+        for line in result_text.strip().split("\n"):
+            if not line:
+                continue
+            row = json.loads(line)
+            custom_id = row["custom_id"]
+            key = custom_id.split("idx-", 1)[1] if "idx-" in custom_id else custom_id
+            try:
+                content = row["response"]["body"]["choices"][0]["message"]["content"]
+                results[key] = content
+            except (KeyError, IndexError, TypeError) as exc:
+                print(f"[batch{batch_label}] Could not extract content for {key}: {exc}")
+        return results
+
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        for fid in file_ids:
+            try:
+                _call_with_retry(client.files.delete, fid)
+            except Exception:
+                pass

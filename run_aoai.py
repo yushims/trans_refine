@@ -37,7 +37,7 @@ from common import (
     take_next_transcription_segment_for_llm,
     write_fallback_text_output,
 )
-from common_aoai import get_patch_payload_with_repair
+from common_aoai import get_patch_payload_with_repair, run_batch_pipeline, BATCH_DEFAULT_SIZE
 
 PATCH_SCHEMA = build_patch_response_format_schema()
 
@@ -70,6 +70,20 @@ def parse_args() -> argparse.Namespace:
         dest="chain_steps",
         action="append",
         help="Repeatable active-chain selector (ids 1-8 or step names like COMBINE, NO_TOUCH).",
+    )
+    parser.add_argument(
+        "--batch",
+        dest="batch_mode",
+        action="store_true",
+        default=False,
+        help="Use the Azure OpenAI Batch API instead of real-time calls.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        dest="batch_size",
+        type=int,
+        default=BATCH_DEFAULT_SIZE,
+        help=f"Number of items per Batch API partition (default: {BATCH_DEFAULT_SIZE}).",
     )
     return parser.parse_args()
 
@@ -200,6 +214,69 @@ async def main() -> None:
         api_version=api_version,
     )
 
+    # -----------------------------------------------------------------------
+    #  Batch API mode
+    # -----------------------------------------------------------------------
+    if args.batch_mode:
+        from common import DEFAULT_AOAI_BATCH_DEPLOYMENT
+        batch_deployment = DEFAULT_AOAI_BATCH_DEPLOYMENT
+        print(f"Batch mode enabled (deployment={batch_deployment}, batch_size={args.batch_size})")
+
+        # Pre-compute per-item casing flags.
+        skip_casing_flags: list[bool] = []
+        batch_transcriptions: list[str] = []
+        for t in transcriptions:
+            prompt_t, _ = normalize_all_uppercase_input(t)
+            batch_transcriptions.append(prompt_t)
+            skip_casing_flags.append(
+                is_all_uppercase_cased_input(t) or is_all_lowercase_cased_input(t)
+            )
+
+        payloads_batch = await run_batch_pipeline(
+            client=client,
+            deployment=batch_deployment,
+            transcriptions=batch_transcriptions,
+            prompt_template=prompt_template,
+            chain_steps=chain_steps,
+            locale=args.locale,
+            schema=PATCH_SCHEMA,
+            temperature=temperature,
+            top_p=top_p,
+            batch_size=args.batch_size,
+            build_patch_prompt_fn=build_patch_prompt,
+            skip_first_token_casing_preservation_flags=skip_casing_flags,
+            active_step_keys=active_step_keys,
+            max_input_chars_per_call=max_input_chars_per_call,
+            retry_temperature_jitter=retry_temperature_jitter,
+        )
+
+        # Attach source metadata and build text output lines.
+        text_lines_batch: list[str] = [""] * len(transcriptions)
+        for idx, payload in enumerate(payloads_batch):
+            if payload is None:
+                payload = build_empty_payload()
+                payloads_batch[idx] = payload
+            payload["source_text"] = transcriptions[idx]
+            source_fn = source_filenames[idx] if idx < len(source_filenames) else None
+            if isinstance(source_fn, str) and source_fn:
+                payload["source_filename"] = source_fn
+            corrected = payload.get("corrected_text")
+            text_lines_batch[idx] = corrected if isinstance(corrected, str) else ""
+
+        finalize_payloads_and_write(
+            payloads_batch,
+            output_file_value,
+            text_lines_batch,
+            source_filenames,
+            source_rows,
+            output_as_tsv,
+            active_step_keys,
+        )
+        return
+
+    # -----------------------------------------------------------------------
+    #  Real-time mode (default)
+    # -----------------------------------------------------------------------
     payloads: list[dict | None] = [None] * len(transcriptions)
     text_output_lines: list[str] = [""] * len(transcriptions)
     if resume_from_output:
