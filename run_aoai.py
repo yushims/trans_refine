@@ -22,7 +22,6 @@ from common import (
     configure_long_span_preservation_guard,
     finalize_payloads_and_write,
     format_resolved_chain_steps,
-    insert_spaces_at_script_boundaries,
     is_all_lowercase_cased_input,
     is_all_uppercase_cased_input,
     normalize_all_uppercase_input,
@@ -222,7 +221,6 @@ async def main() -> None:
         for idx, t in enumerate(transcriptions):
             stripped_t, _ = strip_emojis(t)
             prompt_t, _ = normalize_all_uppercase_input(stripped_t)
-            prompt_t, _ = insert_spaces_at_script_boundaries(prompt_t)
             batch_transcriptions.append(prompt_t)
             skip_casing_flags.append(
                 is_all_uppercase_cased_input(t) or is_all_lowercase_cased_input(t)
@@ -479,7 +477,6 @@ async def main() -> None:
 
         stripped_transcription, _ = strip_emojis(transcription)
         prompt_transcription, case_normalized = normalize_all_uppercase_input(stripped_transcription)
-        prompt_transcription, _ = insert_spaces_at_script_boundaries(prompt_transcription)
         source_was_all_uppercase = is_all_uppercase_cased_input(transcription)
         source_was_all_lowercase = is_all_lowercase_cased_input(transcription)
         skip_first_token_casing_preservation = source_was_all_uppercase or source_was_all_lowercase
