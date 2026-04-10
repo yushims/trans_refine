@@ -35,6 +35,7 @@ from common import (
     resolve_active_chain_step_keys,
     resolve_patch_and_repair_template_paths,
     run_transcriptions_with_concurrency,
+    strip_emojis,
     take_next_transcription_segment_for_llm,
     write_fallback_text_output,
 )
@@ -252,7 +253,8 @@ async def main() -> None:
         batch_transcriptions: list[str] = []
         pre_resolved_indices: set[int] = set()
         for idx, t in enumerate(transcriptions):
-            prompt_t, _ = normalize_all_uppercase_input(t)
+            stripped_t, _ = strip_emojis(t)
+            prompt_t, _ = normalize_all_uppercase_input(stripped_t)
             batch_transcriptions.append(prompt_t)
             skip_casing_flags.append(
                 is_all_uppercase_cased_input(t) or is_all_lowercase_cased_input(t)
@@ -508,7 +510,8 @@ async def main() -> None:
                 return
             await reset_resume_progress_write_interval()
 
-        prompt_transcription, case_normalized = normalize_all_uppercase_input(transcription)
+        stripped_transcription, _ = strip_emojis(transcription)
+        prompt_transcription, case_normalized = normalize_all_uppercase_input(stripped_transcription)
         source_was_all_uppercase = is_all_uppercase_cased_input(transcription)
         source_was_all_lowercase = is_all_lowercase_cased_input(transcription)
         skip_first_token_casing_preservation = source_was_all_uppercase or source_was_all_lowercase
