@@ -219,9 +219,37 @@ async def main() -> None:
     # -----------------------------------------------------------------------
     if use_chunked:
         from common import DEFAULT_AOAI_BATCH_DEPLOYMENT, sanitize_output_string
+        import csv as _csv
         batch_deployment = DEFAULT_AOAI_BATCH_DEPLOYMENT
         chunk_size = args.batch_size * concurrency
         print(f"Chunked batch mode (deployment={batch_deployment}, chunk_size={chunk_size:,}, batch_size={args.batch_size:,}, concurrency={concurrency})")
+
+        def _sanitize_tsv_cell(value: str) -> str:
+            """Strip only characters that break TSV structure, preserving content."""
+            if not isinstance(value, str):
+                return ""
+            return value.replace("\t", " ").replace("\n", " ").replace("\r", " ")
+
+        def _build_output_line(
+            corrected_text: str,
+            source_row: list[str] | None,
+            filename: str | None,
+        ) -> str:
+            """Build a single output line, preserving all source columns for multi-column input.
+
+            Only the last column (corrected_text) is fully sanitized.
+            Prefix columns are kept as-is except for tab/newline characters
+            that would break TSV structure.
+            """
+            ct = sanitize_output_string(corrected_text)
+            if isinstance(source_row, list) and source_row:
+                # Preserve prefix columns exactly, only sanitize TSV-breaking chars.
+                rebuilt = [_sanitize_tsv_cell(v) for v in source_row[:-1]]
+                rebuilt.append(ct)
+                return "\t".join(rebuilt)
+            if isinstance(filename, str) and filename:
+                return f"{_sanitize_tsv_cell(filename)}\t{ct}"
+            return ct
 
         # Load resume lines if output file exists.
         resume_lines: list[str] | None = None
@@ -229,10 +257,16 @@ async def main() -> None:
             from common import resolve_path as _resolve_path
             _out_path = _resolve_path(output_file_value)
             _out_text_path = _out_path.with_suffix(".tsv") if output_as_tsv else _out_path.with_suffix(".txt")
+            if not _out_text_path.exists():
+                # Try the other extension (multi-column .txt input writes .tsv).
+                _alt_path = _out_path.with_suffix(".txt") if output_as_tsv else _out_path.with_suffix(".tsv")
+                if _alt_path.exists():
+                    _out_text_path = _alt_path
             if _out_text_path.exists():
                 try:
                     _raw = _out_text_path.read_text(encoding="utf-8")
-                    if output_as_tsv:
+                    _is_tsv_resume = _out_text_path.suffix.lower() == ".tsv"
+                    if _is_tsv_resume:
                         # For TSV, extract only the last column (transcription).
                         import csv as _csv
                         resume_lines = []
@@ -263,7 +297,7 @@ async def main() -> None:
         # Each entry: (global_idx, preprocessed_text, original_text, filename, skip_casing_flag)
         all_failed_items: list[tuple[int, str, str, str | None, bool]] = []
 
-        for global_offset, chunk_transcriptions, chunk_filenames in iter_transcription_chunks(
+        for global_offset, chunk_transcriptions, chunk_filenames, chunk_source_rows in iter_transcription_chunks(
             input_file_value, chunk_size
         ):
             chunk_len = len(chunk_transcriptions)
@@ -285,17 +319,15 @@ async def main() -> None:
                     chunks_completed_in_resume += 1
                     # Write to output.
                     if out_text_path:
-                        if output_as_tsv and chunk_filenames:
-                            assert len(chunk_filenames) == len(chunk_output_lines), (
-                                f"Resume chunk alignment error: filenames={len(chunk_filenames)} vs output={len(chunk_output_lines)}"
+                        out_lines = [
+                            _build_output_line(
+                                text,
+                                chunk_source_rows[i] if i < len(chunk_source_rows) else None,
+                                chunk_filenames[i] if i < len(chunk_filenames) else None,
                             )
-                            tsv_lines = [
-                                f"{sanitize_output_string(fn if isinstance(fn, str) else '')}\t{sanitize_output_string(text)}"
-                                for fn, text in zip(chunk_filenames, chunk_output_lines, strict=True)
-                            ]
-                            content = "\n".join(tsv_lines) + "\n"
-                        else:
-                            content = "\n".join(sanitize_output_string(l) for l in chunk_output_lines) + "\n"
+                            for i, text in enumerate(chunk_output_lines)
+                        ]
+                        content = "\n".join(out_lines) + "\n"
                         if first_write:
                             out_text_path.write_text(content, encoding="utf-8")
                             first_write = False
@@ -382,17 +414,15 @@ async def main() -> None:
                 f"Output alignment error: expected {chunk_len} lines, got {len(chunk_output_lines)}"
             )
             if out_text_path:
-                if output_as_tsv and chunk_filenames:
-                    assert len(chunk_filenames) == len(chunk_output_lines), (
-                        f"TSV alignment error: filenames={len(chunk_filenames)} vs output={len(chunk_output_lines)}"
+                out_lines = [
+                    _build_output_line(
+                        text,
+                        chunk_source_rows[i] if i < len(chunk_source_rows) else None,
+                        chunk_filenames[i] if i < len(chunk_filenames) else None,
                     )
-                    tsv_lines = [
-                        f"{sanitize_output_string(fn if isinstance(fn, str) else '')}\t{sanitize_output_string(text)}"
-                        for fn, text in zip(chunk_filenames, chunk_output_lines, strict=True)
-                    ]
-                    content = "\n".join(tsv_lines) + "\n"
-                else:
-                    content = "\n".join(sanitize_output_string(l) for l in chunk_output_lines) + "\n"
+                    for i, text in enumerate(chunk_output_lines)
+                ]
+                content = "\n".join(out_lines) + "\n"
 
                 if first_write:
                     out_text_path.write_text(content, encoding="utf-8")
@@ -482,10 +512,12 @@ async def main() -> None:
                         output_lines.pop()
                     for global_idx, ct in patched_lines.items():
                         if global_idx < len(output_lines):
-                            if output_as_tsv:
-                                parts = output_lines[global_idx].split("\t", 1)
-                                fn = parts[0] if parts else ""
-                                output_lines[global_idx] = f"{fn}\t{sanitize_output_string(ct)}"
+                            line = output_lines[global_idx]
+                            if "\t" in line:
+                                # Replace only the last column (transcription),
+                                # preserving all leading columns.
+                                prefix, _old_text = line.rsplit("\t", 1)
+                                output_lines[global_idx] = f"{prefix}\t{sanitize_output_string(ct)}"
                             else:
                                 output_lines[global_idx] = sanitize_output_string(ct)
                     out_text_path.write_text("\n".join(output_lines) + "\n", encoding="utf-8")

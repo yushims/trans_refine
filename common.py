@@ -3342,11 +3342,13 @@ def count_input_lines(input_file_value: str) -> int:
 def iter_transcription_chunks(
     input_file_value: str,
     chunk_size: int,
-) -> Iterator[tuple[int, list[str], list[str | None]]]:
-    """Yield (global_offset, transcriptions, source_filenames) chunks from a TSV/text file.
+) -> Iterator[tuple[int, list[str], list[str | None], list[list[str] | None]]]:
+    """Yield (global_offset, transcriptions, source_filenames, source_rows) chunks.
 
     Reads the file in a single bulk read, then yields slices of chunk_size.
-    Each chunk is a contiguous slice of the file. source_rows are not stored.
+    Each chunk is a contiguous slice of the file.
+    ``source_rows`` preserves the full original row (all columns) for TSV
+    reconstruction so that leading columns are not lost in the output.
     """
     input_path = resolve_path(input_file_value)
 
@@ -3386,6 +3388,7 @@ def iter_transcription_chunks(
     # Parse lines and yield chunks as they fill up — no need to store the whole file.
     chunk_transcriptions: list[str] = []
     chunk_filenames: list[str | None] = []
+    chunk_source_rows: list[list[str] | None] = []
     global_offset = 0
 
     if input_path.suffix.lower() == ".tsv":
@@ -3409,14 +3412,17 @@ def iter_transcription_chunks(
             if len(row) >= 2:
                 chunk_filenames.append(_select_source_identifier(row))
                 chunk_transcriptions.append(last_cell)
+                chunk_source_rows.append(list(row))
             else:
                 chunk_filenames.append(None)
                 chunk_transcriptions.append(first_cell)
+                chunk_source_rows.append(None)
             if len(chunk_transcriptions) >= chunk_size:
-                yield (global_offset, chunk_transcriptions, chunk_filenames)
+                yield (global_offset, chunk_transcriptions, chunk_filenames, chunk_source_rows)
                 global_offset += len(chunk_transcriptions)
                 chunk_transcriptions = []
                 chunk_filenames = []
+                chunk_source_rows = []
         del lines
     else:
         lines = raw_text.splitlines()
@@ -3428,19 +3434,22 @@ def iter_transcription_chunks(
                 parts = stripped_line.split("\t")
                 chunk_filenames.append(_select_source_identifier(parts))
                 chunk_transcriptions.append(parts[-1].strip())
+                chunk_source_rows.append(parts)
             else:
                 chunk_filenames.append(None)
                 chunk_transcriptions.append(stripped_line)
+                chunk_source_rows.append(None)
             if len(chunk_transcriptions) >= chunk_size:
-                yield (global_offset, chunk_transcriptions, chunk_filenames)
+                yield (global_offset, chunk_transcriptions, chunk_filenames, chunk_source_rows)
                 global_offset += len(chunk_transcriptions)
                 chunk_transcriptions = []
                 chunk_filenames = []
+                chunk_source_rows = []
         del lines
 
     # Yield remaining items.
     if chunk_transcriptions:
-        yield (global_offset, chunk_transcriptions, chunk_filenames)
+        yield (global_offset, chunk_transcriptions, chunk_filenames, chunk_source_rows)
 
 
 def load_existing_output_text_lines(
@@ -3455,8 +3464,16 @@ def load_existing_output_text_lines(
     output_path = resolve_path(output_file_value)
     output_text_path = output_path.with_suffix(".tsv") if output_as_tsv else output_path.with_suffix(".txt")
     if not output_text_path.exists():
-        print(f"Resume requested but output file does not exist: {output_text_path}")
-        return None
+        # If the preferred extension doesn't exist, try the other one.
+        # This handles cases where multi-column .txt input was auto-detected
+        # and written as .tsv.
+        alt_path = output_path.with_suffix(".txt") if output_as_tsv else output_path.with_suffix(".tsv")
+        if alt_path.exists():
+            output_text_path = alt_path
+            output_as_tsv = alt_path.suffix.lower() == ".tsv"
+        else:
+            print(f"Resume requested but output file does not exist: {output_text_path}")
+            return None
 
     try:
         raw_text = output_text_path.read_text(encoding="utf-8")
@@ -3611,7 +3628,9 @@ def write_fallback_text_output(
         sanitize_output_string(line if isinstance(line, str) else "")
         for line in text_lines
     ]
-    is_tsv_output = (
+
+    # Determine file extension: follow caller's explicit setting or input extension.
+    is_tsv_extension = (
         output_as_tsv
         if isinstance(output_as_tsv, bool)
         else bool(
@@ -3620,37 +3639,42 @@ def write_fallback_text_output(
         )
     )
 
-    if is_tsv_output and source_filenames is not None and len(source_filenames) == len(normalized_text_lines):
-        fallback_lines = [
-                f"{sanitize_output_string(filename if isinstance(filename, str) else '')}\t{text}"
-            for filename, text in zip(source_filenames, normalized_text_lines)
-        ]
-    else:
-        fallback_lines = normalized_text_lines
-
+    # Build output lines preserving all source columns when available.
+    # This applies regardless of the file extension — a .txt file can contain
+    # tab-separated columns.
     fallback_rows: list[list[str]] | None = None
     if source_rows is not None and len(source_rows) == len(normalized_text_lines):
         fallback_rows = []
         for original_row, corrected_text in zip(source_rows, normalized_text_lines):
             if isinstance(original_row, list) and original_row:
-                rebuilt_row = [sanitize_output_string(value) for value in original_row]
-                rebuilt_row[-1] = corrected_text
+                # Preserve prefix columns exactly; only strip TSV-breaking chars.
+                rebuilt_row = [
+                    v.replace("\t", " ").replace("\n", " ").replace("\r", " ")
+                    if isinstance(v, str) else ""
+                    for v in original_row[:-1]
+                ]
+                rebuilt_row.append(corrected_text)
                 fallback_rows.append(rebuilt_row)
             else:
                 fallback_rows.append([corrected_text])
+
+    if fallback_rows is not None:
+        fallback_lines = ["\t".join(row) for row in fallback_rows]
+    elif is_tsv_extension and source_filenames is not None and len(source_filenames) == len(normalized_text_lines):
+        fallback_lines = [
+            f"{sanitize_output_string(filename if isinstance(filename, str) else '')}\t{text}"
+            for filename, text in zip(source_filenames, normalized_text_lines)
+        ]
+    else:
+        fallback_lines = normalized_text_lines
 
     fallback_content = "\n".join(fallback_lines)
 
     if output_file_value:
         output_path = resolve_path(output_file_value)
-        output_text_path = output_path.with_suffix(".tsv") if is_tsv_output else output_path.with_suffix(".txt")
+        output_text_path = output_path.with_suffix(".tsv") if is_tsv_extension else output_path.with_suffix(".txt")
         output_text_path.parent.mkdir(parents=True, exist_ok=True)
-        if is_tsv_output and fallback_rows is not None:
-            with output_text_path.open("w", encoding="utf-8", newline="") as output_file:
-                writer = csv.writer(output_file, delimiter="\t", lineterminator="\n")
-                writer.writerows(fallback_rows)
-        else:
-            output_text_path.write_text(fallback_content, encoding="utf-8")
+        output_text_path.write_text(fallback_content, encoding="utf-8")
         if reason:
             print(f"{reason}; wrote fallback text output to: {output_text_path}")
         else:
@@ -4008,7 +4032,12 @@ def write_output_artifacts(
     output_as_tsv: bool | None = None,
     active_step_keys: set[str] | None = None,
 ) -> None:
-    is_tsv_output = (
+    # The authoritative row count is text_output_lines (one per input item).
+    # payloads may be shorter (filtered to dicts only by the caller).
+    expected_row_count = len(text_output_lines) if text_output_lines is not None else len(payloads)
+
+    # File extension follows caller's setting (input extension).
+    is_tsv_extension = (
         output_as_tsv
         if isinstance(output_as_tsv, bool)
         else bool(
@@ -4048,18 +4077,8 @@ def write_output_artifacts(
             sanitize_output_string(line if isinstance(line, str) else "")
             for line in text_output_lines
         ]
-    text_output_content = "\n".join(normalized_text_lines)
 
-    normalized_source_filenames: list[str] = [""] * len(normalized_text_lines)
-    if source_filenames is not None:
-        if len(source_filenames) != len(normalized_text_lines):
-            print("WARNING: source filename count does not match output line count; omitting TSV filename column.")
-        else:
-            normalized_source_filenames = [
-                sanitize_output_string(value if isinstance(value, str) else "")
-                for value in source_filenames
-            ]
-
+    # Build output lines preserving all source columns when available.
     normalized_source_rows: list[list[str] | None] | None = None
     if source_rows is not None:
         if len(source_rows) != len(normalized_text_lines):
@@ -4068,11 +4087,44 @@ def write_output_artifacts(
             normalized_source_rows = []
             for row in source_rows:
                 if isinstance(row, list):
-                    normalized_source_rows.append([sanitize_output_string(value) for value in row])
+                    # Preserve prefix columns exactly; only strip TSV-breaking chars.
+                    normalized_source_rows.append([
+                        v.replace("\t", " ").replace("\n", " ").replace("\r", " ")
+                        if isinstance(v, str) else ""
+                        for v in row
+                    ])
                 else:
                     normalized_source_rows.append(None)
 
-    output_content = json.dumps(output_payload, ensure_ascii=False, indent=2)
+    # Build final text lines: use full source rows when available, else filename+text or text-only.
+    final_text_lines: list[str] = []
+    for row_index, corrected_text in enumerate(normalized_text_lines):
+        if (
+            normalized_source_rows is not None
+            and row_index < len(normalized_source_rows)
+            and isinstance(normalized_source_rows[row_index], list)
+            and normalized_source_rows[row_index]
+        ):
+            row = list(normalized_source_rows[row_index])
+            row[-1] = corrected_text
+            final_text_lines.append("\t".join(row))
+        elif is_tsv_extension:
+            normalized_source_filenames = [""] * len(normalized_text_lines)
+            if source_filenames is not None and len(source_filenames) == len(normalized_text_lines):
+                normalized_source_filenames = [
+                    sanitize_output_string(value if isinstance(value, str) else "")
+                    for value in source_filenames
+                ]
+            filename = (
+                normalized_source_filenames[row_index]
+                if row_index < len(normalized_source_filenames)
+                else ""
+            )
+            final_text_lines.append(f"{filename}\t{corrected_text}")
+        else:
+            final_text_lines.append(corrected_text)
+    text_output_content = "\n".join(final_text_lines)
+
     if output_file_value:
         output_path = resolve_path(output_file_value)
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -4085,32 +4137,10 @@ def write_output_artifacts(
                 jsonl_file.write(line)
                 jsonl_file.write("\n")
 
-        if is_tsv_output:
-            output_tsv_path = output_path.with_suffix(".tsv")
-            with output_tsv_path.open("w", encoding="utf-8", newline="") as output_file:
-                writer = csv.writer(output_file, delimiter="\t", lineterminator="\n")
-                for row_index, corrected_text in enumerate(normalized_text_lines):
-                    if (
-                        normalized_source_rows is not None
-                        and row_index < len(normalized_source_rows)
-                        and isinstance(normalized_source_rows[row_index], list)
-                        and normalized_source_rows[row_index]
-                    ):
-                        row = list(normalized_source_rows[row_index])
-                        row[-1] = corrected_text
-                        writer.writerow(row)
-                        continue
-
-                    filename = (
-                        normalized_source_filenames[row_index]
-                        if row_index < len(normalized_source_filenames)
-                        else ""
-                    )
-                    writer.writerow([filename, corrected_text])
-        else:
-            output_text_path = output_path.with_suffix(".txt")
-            output_text_path.parent.mkdir(parents=True, exist_ok=True)
-            output_text_path.write_text(text_output_content, encoding="utf-8")
+        # Write text output (.txt or .tsv depending on input extension).
+        output_text_path = output_path.with_suffix(".tsv") if is_tsv_extension else output_path.with_suffix(".txt")
+        output_text_path.parent.mkdir(parents=True, exist_ok=True)
+        output_text_path.write_text(text_output_content, encoding="utf-8")
     else:
         for sanitized_payload in sanitized_payloads:
             print(json.dumps(sanitized_payload, ensure_ascii=False, separators=(",", ":")))
