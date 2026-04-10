@@ -3339,14 +3339,31 @@ def count_input_lines(input_file_value: str) -> int:
     return count
 
 
+def _estimate_segments(text: str, max_input_chars: int) -> int:
+    """Estimate how many segments a transcription will produce."""
+    if max_input_chars <= 0 or not text:
+        return 1
+    text_len = len(text)
+    if text_len <= max_input_chars:
+        return 1
+    # Use ceiling division; matches the segmentation loop in run_batch_pipeline.
+    return -(-text_len // max_input_chars)
+
+
 def iter_transcription_chunks(
     input_file_value: str,
     chunk_size: int,
+    max_input_chars_per_call: int = 0,
 ) -> Iterator[tuple[int, list[str], list[str | None], list[list[str] | None]]]:
     """Yield (global_offset, transcriptions, source_filenames, source_rows) chunks.
 
-    Reads the file in a single bulk read, then yields slices of chunk_size.
-    Each chunk is a contiguous slice of the file.
+    Reads the file in a single bulk read, then yields slices of *chunk_size*
+    estimated segments.  When *max_input_chars_per_call* > 0, each line's
+    estimated segment count (``ceil(len / max_chars)``) is accumulated and a
+    chunk is yielded once the total reaches *chunk_size*.  When
+    *max_input_chars_per_call* is 0 (no segmentation), *chunk_size* counts
+    lines (1 segment per line).
+
     ``source_rows`` preserves the full original row (all columns) for TSV
     reconstruction so that leading columns are not lost in the output.
     """
@@ -3389,6 +3406,7 @@ def iter_transcription_chunks(
     chunk_transcriptions: list[str] = []
     chunk_filenames: list[str | None] = []
     chunk_source_rows: list[list[str] | None] = []
+    chunk_estimated_segments = 0
     global_offset = 0
 
     if input_path.suffix.lower() == ".tsv":
@@ -3413,16 +3431,19 @@ def iter_transcription_chunks(
                 chunk_filenames.append(_select_source_identifier(row))
                 chunk_transcriptions.append(last_cell)
                 chunk_source_rows.append(list(row))
+                chunk_estimated_segments += _estimate_segments(last_cell, max_input_chars_per_call)
             else:
                 chunk_filenames.append(None)
                 chunk_transcriptions.append(first_cell)
                 chunk_source_rows.append(None)
-            if len(chunk_transcriptions) >= chunk_size:
+                chunk_estimated_segments += _estimate_segments(first_cell, max_input_chars_per_call)
+            if chunk_estimated_segments >= chunk_size:
                 yield (global_offset, chunk_transcriptions, chunk_filenames, chunk_source_rows)
                 global_offset += len(chunk_transcriptions)
                 chunk_transcriptions = []
                 chunk_filenames = []
                 chunk_source_rows = []
+                chunk_estimated_segments = 0
         del lines
     else:
         lines = raw_text.splitlines()
@@ -3433,18 +3454,22 @@ def iter_transcription_chunks(
             if "\t" in stripped_line:
                 parts = stripped_line.split("\t")
                 chunk_filenames.append(_select_source_identifier(parts))
-                chunk_transcriptions.append(parts[-1].strip())
+                text = parts[-1].strip()
+                chunk_transcriptions.append(text)
                 chunk_source_rows.append(parts)
+                chunk_estimated_segments += _estimate_segments(text, max_input_chars_per_call)
             else:
                 chunk_filenames.append(None)
                 chunk_transcriptions.append(stripped_line)
                 chunk_source_rows.append(None)
-            if len(chunk_transcriptions) >= chunk_size:
+                chunk_estimated_segments += _estimate_segments(stripped_line, max_input_chars_per_call)
+            if chunk_estimated_segments >= chunk_size:
                 yield (global_offset, chunk_transcriptions, chunk_filenames, chunk_source_rows)
                 global_offset += len(chunk_transcriptions)
                 chunk_transcriptions = []
                 chunk_filenames = []
                 chunk_source_rows = []
+                chunk_estimated_segments = 0
         del lines
 
     # Yield remaining items.

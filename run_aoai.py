@@ -65,7 +65,7 @@ def parse_args() -> argparse.Namespace:
         dest="batch_size",
         type=int,
         default=BATCH_DEFAULT_SIZE,
-        help=f"Number of items per Batch API partition (default: {BATCH_DEFAULT_SIZE}).",
+        help=f"Max segments (API requests) per Batch API partition upload (default: {BATCH_DEFAULT_SIZE}). One input line may produce multiple segments when segmentation is active.",
     )
     parser.add_argument(
         "--batch-max-retries",
@@ -221,8 +221,18 @@ async def main() -> None:
         from common import DEFAULT_AOAI_BATCH_DEPLOYMENT, sanitize_output_string
         import csv as _csv
         batch_deployment = DEFAULT_AOAI_BATCH_DEPLOYMENT
+        # batch_size = number of segments (API requests) per partition upload.
+        # chunk_size = target estimated segments per iteration before submitting.
+        # iter_transcription_chunks accumulates lines until their estimated
+        # segment count reaches chunk_size, so we load exactly the right
+        # number of lines to fill batch_size * concurrency segments.
         chunk_size = args.batch_size * concurrency
-        print(f"Chunked batch mode (deployment={batch_deployment}, chunk_size={chunk_size:,}, batch_size={args.batch_size:,}, concurrency={concurrency})")
+        print(
+            f"Chunked batch mode (deployment={batch_deployment}, "
+            f"chunk_size={chunk_size:,} segments, "
+            f"batch_size={args.batch_size:,} segments/partition, "
+            f"concurrency={concurrency})"
+        )
 
         def _sanitize_tsv_cell(value: str) -> str:
             """Strip only characters that break TSV structure, preserving content."""
@@ -298,7 +308,7 @@ async def main() -> None:
         all_failed_items: list[tuple[int, str, str, str | None, bool]] = []
 
         for global_offset, chunk_transcriptions, chunk_filenames, chunk_source_rows in iter_transcription_chunks(
-            input_file_value, chunk_size
+            input_file_value, chunk_size, max_input_chars_per_call=max_input_chars_per_call
         ):
             chunk_len = len(chunk_transcriptions)
             chunk_end = global_offset + chunk_len
