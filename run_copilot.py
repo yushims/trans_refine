@@ -7,6 +7,7 @@ from copilot import CopilotClient  # pyright: ignore[reportMissingImports]
 from common import (
     DEFAULT_COPILOT_MODEL,
     add_common_runtime_cli_arguments,
+    add_run_pipeline_cli_arguments,
     add_model_mismatch_retries_cli_argument,
     append_payload_jsonl_record,
     assign_payload_or_emit_empty,
@@ -42,33 +43,12 @@ from common_copilot import (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input-file", dest="input_file")
-    parser.add_argument("--output-file", dest="output_file")
-    parser.add_argument("--patch-prompt-file", dest="patch_prompt_file")
-    parser.add_argument("--repair-prompt-file", dest="repair_prompt_file")
+    add_run_pipeline_cli_arguments(parser)
     parser.add_argument("--model", dest="model", default=DEFAULT_COPILOT_MODEL)
-    parser.add_argument(
-        "--progress-write-every",
-        dest="progress_write_every",
-        type=int,
-        default=None,
-        help=(
-            "Write incremental text snapshot (.txt/.tsv) and JSONL progress (.jsonl) "
-            "every N completed items "
-            "(default: 1, or 100 when --resume-from-output is enabled)."
-        ),
-    )
     add_common_runtime_cli_arguments(parser)
     add_model_mismatch_retries_cli_argument(parser)
-    parser.add_argument("--locale", dest="locale", default=None, help="Locale of the input audio (e.g. en-US, zh-CN). Adds locale context to the prompt.")
     parser.add_argument("--list-models-only", dest="list_models_only", action="store_true")
     parser.add_argument("--print-models", dest="print_models", action="store_true")
-    parser.add_argument(
-        "--chain-steps",
-        dest="chain_steps",
-        action="append",
-        help="Repeatable active-chain selector (ids 1-8 or step names like COMBINE, NO_TOUCH).",
-    )
     return parser.parse_args()
 
 

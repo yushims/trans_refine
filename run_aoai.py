@@ -46,33 +46,12 @@ PATCH_SCHEMA = build_patch_response_format_schema()
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input-file", dest="input_file")
-    parser.add_argument("--output-file", dest="output_file")
-    parser.add_argument("--patch-prompt-file", dest="patch_prompt_file")
-    parser.add_argument("--repair-prompt-file", dest="repair_prompt_file")
+    add_run_pipeline_cli_arguments(parser)
     parser.add_argument("--deployment", dest="deployment", default=DEFAULT_AOAI_DEPLOYMENT)
     parser.add_argument("--endpoint", dest="endpoint", default=DEFAULT_AOAI_ENDPOINT)
     parser.add_argument("--api-version", dest="api_version", default=DEFAULT_AOAI_API_VERSION)
-    parser.add_argument(
-        "--progress-write-every",
-        dest="progress_write_every",
-        type=int,
-        default=None,
-        help=(
-            "Write incremental text snapshot (.txt/.tsv) and JSONL progress (.jsonl) "
-            "every N completed items "
-            "(default: 1, or 100 when --resume-from-output is enabled)."
-        ),
-    )
     add_common_runtime_cli_arguments(parser)
     add_aoai_sampling_cli_arguments(parser)
-    parser.add_argument("--locale", dest="locale", default=None, help="Locale of the input audio (e.g. en-US, zh-CN). Adds locale context to the prompt.")
-    parser.add_argument(
-        "--chain-steps",
-        dest="chain_steps",
-        action="append",
-        help="Repeatable active-chain selector (ids 1-8 or step names like COMBINE, NO_TOUCH).",
-    )
     parser.add_argument(
         "--batch",
         dest="batch_mode",
@@ -86,13 +65,6 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=BATCH_DEFAULT_SIZE,
         help=f"Number of items per Batch API partition (default: {BATCH_DEFAULT_SIZE}).",
-    )
-    parser.add_argument(
-        "--apply-safe-edits",
-        dest="apply_safe_edits",
-        action="store_true",
-        default=False,
-        help="Apply character-level diff post-processing to accept only safe edits (punctuation/casing) and reject word-content changes.",
     )
     return parser.parse_args()
 

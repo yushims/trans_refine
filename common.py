@@ -222,6 +222,46 @@ def add_chain_steps_cli_argument(
     parser.add_argument("--chain-steps", dest="chain_steps", default=default)
 
 
+def add_run_pipeline_cli_arguments(
+    parser: argparse.ArgumentParser,
+) -> None:
+    """Add CLI arguments shared by run_aoai.py and run_copilot.py."""
+    parser.add_argument("--input-file", dest="input_file")
+    parser.add_argument("--output-file", dest="output_file")
+    parser.add_argument("--patch-prompt-file", dest="patch_prompt_file")
+    parser.add_argument("--repair-prompt-file", dest="repair_prompt_file")
+    parser.add_argument(
+        "--progress-write-every",
+        dest="progress_write_every",
+        type=int,
+        default=None,
+        help=(
+            "Write incremental text snapshot (.txt/.tsv) and JSONL progress (.jsonl) "
+            "every N completed items "
+            "(default: 1, or 100 when --resume-from-output is enabled)."
+        ),
+    )
+    parser.add_argument(
+        "--locale",
+        dest="locale",
+        default=None,
+        help="Locale of the input audio (e.g. en-US, zh-CN). Adds locale context to the prompt.",
+    )
+    parser.add_argument(
+        "--chain-steps",
+        dest="chain_steps",
+        action="append",
+        help="Repeatable active-chain selector (ids 1-8 or step names like COMBINE, NO_TOUCH).",
+    )
+    parser.add_argument(
+        "--apply-safe-edits",
+        dest="apply_safe_edits",
+        action="store_true",
+        default=False,
+        help="Apply character-level diff post-processing to accept only safe edits (punctuation/casing) and reject word-content changes.",
+    )
+
+
 def add_aoai_sampling_cli_arguments(
     parser: argparse.ArgumentParser,
     temperature_default: float = DEFAULT_TEMPERATURE,
