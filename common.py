@@ -2041,6 +2041,7 @@ def parse_validate_and_apply_text_fixes(
             no_touch_tokens,
         )
     corrected_text, spacing_normalized = normalize_char_based_spacing_input(corrected_text)
+    corrected_text, script_spacing_inserted = insert_spaces_between_scripts(corrected_text)
     # Only revert terminal punctuation when seg_end is not "high" (LLM shouldn't have changed it).
     seg_end_value = payload.get("seg_end") if isinstance(payload, dict) else None
     punctuation_normalized = False
@@ -2058,6 +2059,7 @@ def parse_validate_and_apply_text_fixes(
     if (
         casing_normalized
         or spacing_normalized
+        or script_spacing_inserted
         or punctuation_normalized
         # or sentence_casing_normalized
     ) and isinstance(payload, dict):
@@ -2692,6 +2694,7 @@ def parse_transcriptions_from_file(
         return re.sub(r"</?\s*(?:b|strong|em|i)\b[^>]*>", "", text, flags=re.IGNORECASE)
 
     raw_text = input_path.read_text(encoding="utf-8")
+    raw_text = unicodedata.normalize("NFC", raw_text)
     if raw_text == "":
         return [], [], []
 
@@ -2839,6 +2842,46 @@ def strip_emojis(text: str) -> tuple[str, bool]:
     cleaned = _EMOJI_PATTERN.sub("", text)
     cleaned = re.sub(r" {2,}", " ", cleaned).strip()
     return cleaned, cleaned != text.strip()
+
+
+def insert_spaces_between_scripts(text: str) -> tuple[str, bool]:
+    """Insert a space at boundaries between Latin and non-Latin letter segments.
+
+    E.g. "hello你好world" -> "hello 你好 world", "test" -> "test" (no change).
+    Does NOT insert spaces between digits/punctuation and letters — only between
+    letters of different script families.
+    """
+    if not isinstance(text, str) or len(text) < 2:
+        return text, False
+
+    parts: list[str] = []
+    changed = False
+    prev_is_non_latin: bool | None = None  # None = previous char was not a letter
+
+    for ch in text:
+        if ch.isspace():
+            parts.append(ch)
+            prev_is_non_latin = None
+            continue
+
+        # Only classify letters; digits/punct/symbols are neutral.
+        if not ch.isalpha():
+            parts.append(ch)
+            # Keep prev_is_non_latin as-is so "abc123你" still triggers.
+            continue
+
+        cur_is_non_latin = _is_non_latin_letter(ch)
+        if prev_is_non_latin is not None and cur_is_non_latin != prev_is_non_latin:
+            # Script boundary — insert space if one isn't already there.
+            if parts and not parts[-1][-1:].isspace():
+                parts.append(" ")
+                changed = True
+        parts.append(ch)
+        prev_is_non_latin = cur_is_non_latin
+
+    if not changed:
+        return text, False
+    return "".join(parts), True
 
 
 def normalize_char_based_spacing_input(transcription: str) -> tuple[str, bool]:

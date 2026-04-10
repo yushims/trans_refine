@@ -1,6 +1,7 @@
 import asyncio
 import json
 import random
+import unicodedata
 from collections.abc import Callable
 from typing import Any
 
@@ -156,7 +157,7 @@ async def send_copilot_once(
             if event_type == "assistant.message":
                 content = extract_text_content(getattr(data, "content", None)).strip()
                 if content:
-                    latest_content = content
+                    latest_content = unicodedata.normalize("NFC", content)
 
             if event_type == "assistant.message_delta":
                 delta = extract_text_content(
@@ -177,7 +178,7 @@ async def send_copilot_once(
                 if latest_content:
                     return latest_content
                 if delta_parts:
-                    combined = "".join(delta_parts).strip()
+                    combined = unicodedata.normalize("NFC", "".join(delta_parts).strip())
                     if combined:
                         return combined
 

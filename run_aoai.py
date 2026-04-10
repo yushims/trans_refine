@@ -39,7 +39,7 @@ from common import (
     take_next_transcription_segment_for_llm,
     write_fallback_text_output,
 )
-from common_aoai import get_patch_payload_with_repair, run_batch_pipeline, BATCH_DEFAULT_SIZE, BATCH_POLL_INTERVAL_SECONDS
+from common_aoai import get_patch_payload_with_repair, run_batch_pipeline, BATCH_DEFAULT_SIZE
 
 PATCH_SCHEMA = build_patch_response_format_schema()
 
@@ -86,13 +86,6 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=BATCH_DEFAULT_SIZE,
         help=f"Number of items per Batch API partition (default: {BATCH_DEFAULT_SIZE}).",
-    )
-    parser.add_argument(
-        "--batch-poll-interval",
-        dest="batch_poll_interval",
-        type=int,
-        default=BATCH_POLL_INTERVAL_SECONDS,
-        help=f"Seconds between batch status checks (default: {BATCH_POLL_INTERVAL_SECONDS}).",
     )
     parser.add_argument(
         "--apply-safe-edits",
@@ -308,7 +301,6 @@ async def main() -> None:
             max_input_chars_per_call=max_input_chars_per_call,
             retry_temperature_jitter=retry_temperature_jitter,
             concurrency=concurrency,
-            poll_interval_seconds=args.batch_poll_interval,
             pre_resolved_indices=pre_resolved_indices,
             on_pass_complete=_on_batch_pass_complete,
         )

@@ -4,6 +4,7 @@ import os
 import random
 import tempfile
 import time
+import unicodedata
 from collections.abc import Callable
 
 from common import (
@@ -53,7 +54,7 @@ async def aoai_send_once(
         return ""
 
     content = getattr(message, "content", "")
-    return extract_text_content(content).strip()
+    return unicodedata.normalize("NFC", extract_text_content(content).strip())
 
 
 def is_aoai_rate_limited_error(error: Exception) -> bool:
@@ -191,7 +192,8 @@ async def get_patch_payload_with_repair(
 # ---------------------------------------------------------------------------
 
 BATCH_DEFAULT_SIZE = 10000  # 1000: ~2-5MB, 5000: ~10-25 MB, 10000: ~20-50 MB, 20000: ~40-100 MB, 50000: 100+ MB
-BATCH_POLL_INTERVAL_SECONDS = 600  # 10 minutes
+BATCH_POLL_INTERVAL_SECONDS = 30   # poll API every 30 seconds
+BATCH_STATUS_PRINT_INTERVAL = 1800  # print status every 30 minutes (even if unchanged)
 
 
 def _call_with_retry(func, *args, retries: int = 5, **kwargs):
@@ -560,13 +562,24 @@ async def _submit_batch_and_wait_keyed(
         )
         print(f"[batch{batch_label}] Submitted job {batch_job.id}")
 
+        prev_status: str | None = None
+        last_print_time: float = 0.0
         while True:
             status = await asyncio.to_thread(
                 _call_with_retry, client.batches.retrieve, batch_job.id,
             )
-            print(f"[batch{batch_label}] Status: {status.status}")
+            now = time.monotonic()
+            changed = status.status != prev_status
+            elapsed = now - last_print_time
+            if changed or elapsed >= BATCH_STATUS_PRINT_INTERVAL:
+                print(f"[batch{batch_label}] Status: {status.status}")
+                last_print_time = now
+            prev_status = status.status
             if status.status in ("completed", "failed", "cancelled", "expired"):
                 break
+            if changed:
+                # status just changed to a non-terminal state; move on immediately
+                continue
             await asyncio.sleep(poll_interval_seconds)
 
         if status.output_file_id:
@@ -599,7 +612,7 @@ async def _submit_batch_and_wait_keyed(
             key = custom_id.split("idx-", 1)[1] if "idx-" in custom_id else custom_id
             try:
                 content = row["response"]["body"]["choices"][0]["message"]["content"]
-                results[key] = content
+                results[key] = unicodedata.normalize("NFC", content)
             except (KeyError, IndexError, TypeError) as exc:
                 print(f"[batch{batch_label}] Could not extract content for {key}: {exc}")
         return results
