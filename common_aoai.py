@@ -214,40 +214,6 @@ def _call_with_retry(func, *args, retries: int = 5, **kwargs):
     raise RuntimeError("Call failed without exception details.")
 
 
-def cleanup_stale_batch_resources(client) -> None:
-    """Cancel non-terminal batch jobs and delete all uploaded files.
-
-    Call this before starting a new batch run to avoid orphan resources
-    from previously crashed runs.
-    """
-    terminal_statuses = {"completed", "failed", "expired", "cancelled"}
-
-    # Cancel pending batch jobs.
-    try:
-        for batch in client.batches.list():
-            status = getattr(batch, "status", None)
-            if status in terminal_statuses:
-                continue
-            try:
-                resp = client.batches.cancel(batch.id)
-                print(f"  Cancelled stale batch job: {batch.id} (was {status}, now {resp.status})")
-            except Exception as exc:
-                print(f"  Could not cancel batch {batch.id}: {exc}")
-    except Exception as exc:
-        print(f"  Could not list batch jobs for cleanup: {exc}")
-
-    # Delete orphan files.
-    try:
-        for f in client.files.list():
-            try:
-                deleted = client.files.delete(f.id)
-                print(f"  Deleted file: {f.id} (deleted={getattr(deleted, 'deleted', True)})")
-            except Exception as exc:
-                print(f"  Could not delete file {f.id}: {exc}")
-    except Exception as exc:
-        print(f"  Could not list files for cleanup: {exc}")
-
-
 async def run_batch_pipeline(
     client,
     deployment: str,
@@ -262,9 +228,7 @@ async def run_batch_pipeline(
     build_patch_prompt_fn: Callable,
     skip_first_token_casing_preservation_flags: list[bool],
     active_step_keys: set[str] | None = None,
-    max_retry_passes: int = 2,
     max_input_chars_per_call: int = DEFAULT_MAX_INPUT_CHARS_PER_CALL,
-    retry_temperature_jitter: float = 0.08,
     concurrency: int = 1,
     poll_interval_seconds: int = BATCH_POLL_INTERVAL_SECONDS,
     pre_resolved_indices: set[int] | None = None,
@@ -272,18 +236,12 @@ async def run_batch_pipeline(
 ) -> list[dict | None]:
     """Run the full batch pipeline: partition, submit, parse results.
 
-    Failed items are collected and resubmitted in up to *max_retry_passes*
-    follow-up batches with temperature jitter and input segmentation for
-    long transcriptions.  Returns a list parallel to *transcriptions* with
-    parsed payloads (or ``None`` for items that still failed).
+    Returns a list parallel to *transcriptions* with parsed payloads
+    (or ``None`` for items that failed).
     """
     total = len(transcriptions)
     payloads: list[dict | None] = [None] * total
     resolved_indices = set(pre_resolved_indices) if pre_resolved_indices else set()
-
-    # Clean up stale batch jobs and orphan files from previous runs.
-    print("Batch mode: cleaning up stale resources...")
-    await asyncio.to_thread(cleanup_stale_batch_resources, client)
 
     # Build (index, transcription) items for non-empty inputs.
     items: list[tuple[int, str]] = []
@@ -302,227 +260,195 @@ async def run_batch_pipeline(
 
     pending_items = list(items)
 
-    for pass_num in range(1, max_retry_passes + 2):  # pass 1 = initial, 2..N+1 = retries
-        if not pending_items:
-            break
+    # batch_entries: list of (custom_key, original_idx, text_to_send, prev_ctx, next_ctx)
+    batch_entries: list[tuple[str, int, str, str, str]] = []
+    # segment_groups tracks which original items were split.
+    segment_groups: dict[int, list[tuple[str, str]]] = {}
 
-        is_retry = pass_num > 1
-        pass_label = "" if not is_retry else f" (retry {pass_num - 1})"
+    for idx, transcription in pending_items:
+        if max_input_chars_per_call > 0 and len(transcription) > max_input_chars_per_call:
+            segment_limit = max_input_chars_per_call
+        else:
+            segment_limit = 0
 
-        # Apply temperature jitter on retries.
-        pass_temperature = temperature
-        if is_retry and retry_temperature_jitter > 0:
-            pass_temperature = max(
-                0.0,
-                min(1.0, temperature + random.uniform(0.0, retry_temperature_jitter)),
-            )
-            print(f"Batch mode{pass_label}: temperature jitter applied: {pass_temperature:.3f}")
-
-        # On retries, segment failed items by halving their input length.
-        # Pass 1: use max_input_chars_per_call for very long inputs.
-        # Retry 1: half the input length. Retry 2: quarter, etc.
-        # batch_entries: list of (custom_key, original_idx, text_to_send, prev_ctx, next_ctx)
-        batch_entries: list[tuple[str, int, str, str, str]] = []
-        # segment_groups tracks which original items were split.
-        segment_groups: dict[int, list[tuple[str, str]]] = {}
-
-        for idx, transcription in pending_items:
-            if is_retry:
-                # Halve progressively: retry 1 = len/2, retry 2 = len/4, etc.
-                retry_segment_limit = max(1, len(transcription) // (2 ** (pass_num - 1)))
-            elif max_input_chars_per_call > 0 and len(transcription) > max_input_chars_per_call:
-                retry_segment_limit = max_input_chars_per_call
-            else:
-                retry_segment_limit = 0
-
-            should_segment = retry_segment_limit > 0 and len(transcription) > retry_segment_limit
-
-            if should_segment:
-                segments: list[str] = []
-                start_offset = 0
-                while start_offset < len(transcription):
-                    seg, _ = take_next_transcription_segment_for_llm(
-                        transcription, start_offset, retry_segment_limit,
-                    )
-                    if not seg:
-                        seg = transcription[start_offset:start_offset + 1]
-                    segments.append(seg)
-                    start_offset += len(seg)
-
-                if len(segments) > 1:
-                    _CTX_SNIPPET_LEN = 50
-                    seg_keys: list[tuple[str, str]] = []
-                    for seg_num, seg_text in enumerate(segments):
-                        custom_key = f"{idx}_s{seg_num}"
-                        prev_ctx = segments[seg_num - 1][-_CTX_SNIPPET_LEN:] if seg_num > 0 else ""
-                        next_ctx = segments[seg_num + 1][:_CTX_SNIPPET_LEN] if seg_num < len(segments) - 1 else ""
-                        batch_entries.append((custom_key, idx, seg_text, prev_ctx, next_ctx))
-                        seg_keys.append((custom_key, seg_text))
-                    segment_groups[idx] = seg_keys
-                    print(
-                        f"  [{idx + 1}/{total}] Segmented into {len(segments)} parts "
-                        f"(limit={retry_segment_limit}, input={len(transcription)} chars)"
-                    )
-                    continue
-
-            # Single item (no segmentation).
-            custom_key = str(idx)
-            batch_entries.append((custom_key, idx, transcription, "", ""))
-
-        # Build JSONL request lines with custom keys.
-        all_jsonl_lines: list[str] = []
-        for custom_key, _orig_idx, text, prev_ctx, next_ctx in batch_entries:
-            prompt = build_patch_prompt_fn(
-                prompt_template, text, chain_steps, locale=locale,
-                prev_context=prev_ctx if prev_ctx else None,
-                next_context=next_ctx if next_ctx else None,
-            )
-            request = {
-                "custom_id": f"idx-{custom_key}",
-                "method": "POST",
-                "url": "/chat/completions",
-                "body": {
-                    "model": deployment,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "response_format": {
-                        "type": "json_object",
-                    },
-                    "temperature": pass_temperature,
-                    "top_p": top_p,
-                },
-            }
-            all_jsonl_lines.append(json.dumps(request, ensure_ascii=False))
-
-        # Submit in partitions and collect all results.
-        all_raw_results: dict[str, str] = {}
-
-        partition_starts = list(range(0, len(all_jsonl_lines), batch_size))
-        num_partitions = len(partition_starts)
-
-        print(
-            f"Batch mode{pass_label}: {len(pending_items)} items "
-            f"({len(batch_entries)} requests) in {num_partitions} partition(s) "
-            f"(concurrency={concurrency})"
-        )
-
-        # Submit partitions with controlled concurrency.
-        semaphore = asyncio.Semaphore(max(1, concurrency))
-        results_lock = asyncio.Lock()
-
-        async def _submit_partition(part_num: int, start: int) -> None:
-            async with semaphore:
-                batch_label = f" {part_num}/{num_partitions}{pass_label}"
-                part_lines = all_jsonl_lines[start : start + batch_size]
-
-                raw_results = await _submit_batch_and_wait_keyed(
-                    client, part_lines, batch_label, poll_interval_seconds,
+        if segment_limit > 0:
+            segments: list[str] = []
+            start_offset = 0
+            while start_offset < len(transcription):
+                seg, _ = take_next_transcription_segment_for_llm(
+                    transcription, start_offset, segment_limit,
                 )
-                print(f"[batch{batch_label}] Received {len(raw_results)}/{len(part_lines)} results")
-                async with results_lock:
-                    all_raw_results.update(raw_results)
+                if not seg:
+                    seg = transcription[start_offset:start_offset + 1]
+                segments.append(seg)
+                start_offset += len(seg)
 
-        await asyncio.gather(*[
-            _submit_partition(part_num, start)
-            for part_num, start in enumerate(partition_starts, 1)
-        ])
-
-        # Process non-segmented items.
-        for custom_key, orig_idx, text, _prev_ctx, _next_ctx in batch_entries:
-            if orig_idx in segment_groups:
-                continue  # Handle below.
-
-            raw_content = all_raw_results.get(custom_key)
-            if raw_content is None:
-                print(f"  [{orig_idx + 1}/{total}] No response from batch API; skipping.")
+            if len(segments) > 1:
+                _CTX_SNIPPET_LEN = 50
+                seg_keys: list[tuple[str, str]] = []
+                for seg_num, seg_text in enumerate(segments):
+                    custom_key = f"{idx}_s{seg_num}"
+                    prev_ctx = segments[seg_num - 1][-_CTX_SNIPPET_LEN:] if seg_num > 0 else ""
+                    next_ctx = segments[seg_num + 1][:_CTX_SNIPPET_LEN] if seg_num < len(segments) - 1 else ""
+                    batch_entries.append((custom_key, idx, seg_text, prev_ctx, next_ctx))
+                    seg_keys.append((custom_key, seg_text))
+                segment_groups[idx] = seg_keys
+                print(
+                    f"  [{idx + 1}/{total}] Segmented into {len(segments)} parts "
+                    f"(limit={segment_limit}, input={len(transcription)} chars)"
+                )
                 continue
 
-            payload, validation_error, _ = parse_validate_and_apply_text_fixes(
+        # Single item (no segmentation).
+        custom_key = str(idx)
+        batch_entries.append((custom_key, idx, transcription, "", ""))
+
+    # Build JSONL request lines with custom keys.
+    all_jsonl_lines: list[str] = []
+    for custom_key, _orig_idx, text, prev_ctx, next_ctx in batch_entries:
+        prompt = build_patch_prompt_fn(
+            prompt_template, text, chain_steps, locale=locale,
+            prev_context=prev_ctx if prev_ctx else None,
+            next_context=next_ctx if next_ctx else None,
+        )
+        request = {
+            "custom_id": f"idx-{custom_key}",
+            "method": "POST",
+            "url": "/chat/completions",
+            "body": {
+                "model": deployment,
+                "messages": [{"role": "user", "content": prompt}],
+                "response_format": {
+                    "type": "json_object",
+                },
+                "temperature": temperature,
+                "top_p": top_p,
+            },
+        }
+        all_jsonl_lines.append(json.dumps(request, ensure_ascii=False))
+
+    # Submit in partitions and collect all results.
+    all_raw_results: dict[str, str] = {}
+
+    partition_starts = list(range(0, len(all_jsonl_lines), batch_size))
+    num_partitions = len(partition_starts)
+
+    print(
+        f"Batch mode: {len(pending_items)} items "
+        f"({len(batch_entries)} requests) in {num_partitions} partition(s) "
+        f"(concurrency={concurrency})"
+    )
+
+    # Submit partitions with controlled concurrency.
+    semaphore = asyncio.Semaphore(max(1, concurrency))
+    results_lock = asyncio.Lock()
+
+    async def _submit_partition(part_num: int, start: int) -> None:
+        async with semaphore:
+            batch_label = f" {part_num}/{num_partitions}"
+            part_lines = all_jsonl_lines[start : start + batch_size]
+            raw_results = await _submit_batch_and_wait_keyed(
+                client, part_lines, batch_label, poll_interval_seconds,
+            )
+            print(f"[batch{batch_label}] Received {len(raw_results)}/{len(part_lines)} results")
+            async with results_lock:
+                all_raw_results.update(raw_results)
+
+    await asyncio.gather(*[
+        _submit_partition(part_num, start)
+        for part_num, start in enumerate(partition_starts, 1)
+    ])
+
+    # Process non-segmented items.
+    for custom_key, orig_idx, text, _prev_ctx, _next_ctx in batch_entries:
+        if orig_idx in segment_groups:
+            continue  # Handle below.
+
+        raw_content = all_raw_results.get(custom_key)
+        if raw_content is None:
+            print(f"  [{orig_idx + 1}/{total}] No response from batch API; skipping.")
+            continue
+
+        payload, validation_error, _ = parse_validate_and_apply_text_fixes(
+            raw_content,
+            text,
+            processing_id=f"{orig_idx + 1}/{total}",
+            skip_first_token_casing_preservation=skip_first_token_casing_preservation_flags[orig_idx],
+            active_step_keys=active_step_keys,
+        )
+
+        if payload is not None:
+            corrected_text = payload.get("corrected_text")
+            if isinstance(corrected_text, str) and corrected_text.strip():
+                payloads[orig_idx] = payload
+            else:
+                print(f"  [{orig_idx + 1}/{total}] Empty corrected_text; skipping.")
+        else:
+            print(f"  [{orig_idx + 1}/{total}] Validation failed: {validation_error}")
+
+    # Process segmented items: parse each segment, then merge.
+    for orig_idx, seg_entries in segment_groups.items():
+        seg_payloads: list[dict] = []
+        seg_sources: list[str] = []
+        all_segments_ok = True
+
+        for custom_key, seg_source in seg_entries:
+            raw_content = all_raw_results.get(custom_key)
+            if raw_content is None:
+                print(
+                    f"  [{orig_idx + 1}/{total}] Segment {custom_key}: "
+                    "no response from batch API."
+                )
+                all_segments_ok = False
+                break
+
+            seg_payload, validation_error, _ = parse_validate_and_apply_text_fixes(
                 raw_content,
-                text,
-                processing_id=f"{orig_idx + 1}/{total}",
+                seg_source,
+                processing_id=f"{orig_idx + 1}/{total} seg",
                 skip_first_token_casing_preservation=skip_first_token_casing_preservation_flags[orig_idx],
                 active_step_keys=active_step_keys,
             )
 
-            if payload is not None:
-                corrected_text = payload.get("corrected_text")
-                if isinstance(corrected_text, str) and corrected_text.strip():
-                    payloads[orig_idx] = payload
+            if seg_payload is not None:
+                corrected = seg_payload.get("corrected_text")
+                if isinstance(corrected, str) and corrected.strip():
+                    seg_payloads.append(seg_payload)
+                    seg_sources.append(seg_source)
                 else:
-                    print(f"  [{orig_idx + 1}/{total}] Empty corrected_text; skipping.")
+                    print(
+                        f"  [{orig_idx + 1}/{total}] Segment {custom_key}: "
+                        "empty corrected_text."
+                    )
+                    all_segments_ok = False
+                    break
             else:
-                print(f"  [{orig_idx + 1}/{total}] Validation failed: {validation_error}")
-
-        # Process segmented items: parse each segment, then merge.
-        for orig_idx, seg_entries in segment_groups.items():
-            seg_payloads: list[dict] = []
-            seg_sources: list[str] = []
-            all_segments_ok = True
-
-            for custom_key, seg_source in seg_entries:
-                raw_content = all_raw_results.get(custom_key)
-                if raw_content is None:
-                    print(
-                        f"  [{orig_idx + 1}/{total}] Segment {custom_key}: "
-                        "no response from batch API."
-                    )
-                    all_segments_ok = False
-                    break
-
-                seg_payload, validation_error, _ = parse_validate_and_apply_text_fixes(
-                    raw_content,
-                    seg_source,
-                    processing_id=f"{orig_idx + 1}/{total} seg",
-                    skip_first_token_casing_preservation=skip_first_token_casing_preservation_flags[orig_idx],
-                    active_step_keys=active_step_keys,
+                print(
+                    f"  [{orig_idx + 1}/{total}] Segment {custom_key}: "
+                    f"validation failed: {validation_error}"
                 )
+                all_segments_ok = False
+                break
 
-                if seg_payload is not None:
-                    corrected = seg_payload.get("corrected_text")
-                    if isinstance(corrected, str) and corrected.strip():
-                        seg_payloads.append(seg_payload)
-                        seg_sources.append(seg_source)
-                    else:
-                        print(
-                            f"  [{orig_idx + 1}/{total}] Segment {custom_key}: "
-                            "empty corrected_text."
-                        )
-                        all_segments_ok = False
-                        break
-                else:
-                    print(
-                        f"  [{orig_idx + 1}/{total}] Segment {custom_key}: "
-                        f"validation failed: {validation_error}"
-                    )
-                    all_segments_ok = False
-                    break
+        if all_segments_ok and seg_payloads:
+            merged = merge_segment_payloads(seg_payloads, seg_sources)
+            if merged is not None:
+                payloads[orig_idx] = merged
+                print(f"  [{orig_idx + 1}/{total}] Merged {len(seg_payloads)} segments successfully.")
+            else:
+                print(f"  [{orig_idx + 1}/{total}] Segment merge failed.")
 
-            if all_segments_ok and seg_payloads:
-                merged = merge_segment_payloads(seg_payloads, seg_sources)
-                if merged is not None:
-                    payloads[orig_idx] = merged
-                    print(f"  [{orig_idx + 1}/{total}] Merged {len(seg_payloads)} segments successfully.")
-                else:
-                    print(f"  [{orig_idx + 1}/{total}] Segment merge failed.")
+    # Write progress snapshot so resume can pick up from here.
+    if on_pass_complete is not None:
+        try:
+            on_pass_complete(payloads)
+        except Exception as cb_err:
+            print(f"Batch mode: progress snapshot error: {cb_err}")
 
-        # Write progress snapshot so resume can pick up from here.
-        if on_pass_complete is not None:
-            try:
-                on_pass_complete(payloads)
-            except Exception as cb_err:
-                print(f"Batch mode: progress snapshot error: {cb_err}")
-
-        # Collect failed items for retry.
-        failed_items = [(idx, text) for idx, text in pending_items if payloads[idx] is None]
-        if not failed_items:
-            break
-
-        if pass_num > max_retry_passes:
-            print(f"Batch mode: {len(failed_items)} items still failed after {max_retry_passes} retry pass(es).")
-            break
-
-        print(f"Batch mode: {len(failed_items)} failed items; scheduling retry pass {pass_num}...")
-        pending_items = failed_items
+    # Report any failed items.
+    failed_items = [(idx, text) for idx, text in pending_items if payloads[idx] is None]
+    if failed_items:
+        print(f"Batch mode: {len(failed_items)} items failed.")
 
     return payloads
 

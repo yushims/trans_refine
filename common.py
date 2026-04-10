@@ -5,12 +5,13 @@ import builtins
 import csv
 import difflib
 import json
-import math
 import re
+import shutil
 import sys
+import tempfile
 import unicodedata
 from collections import Counter
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
 
 
@@ -63,7 +64,7 @@ DEFAULT_TOP_P = 1.0
 DEFAULT_RETRY_TEMPERATURE_JITTER = 0.08
 DEFAULT_RETRY_TOP_P_JITTER = 0.03
 DEFAULT_MODEL_MISMATCH_RETRIES = 1
-DEFAULT_MAX_INPUT_CHARS_PER_CALL = 500
+DEFAULT_MAX_INPUT_CHARS_PER_CALL = 300
 DEFAULT_LONG_SPAN_MIN_DELETED_TOKENS = 3
 DEFAULT_HALLUCINATION_MAX_INSERTED_TOKENS = 3
 DEFAULT_AOAI_ENDPOINT = "https://adaptationdev-resource.openai.azure.com/"
@@ -238,7 +239,7 @@ def add_run_pipeline_cli_arguments(
         help=(
             "Write incremental text snapshot (.txt/.tsv) and JSONL progress (.jsonl) "
             "every N completed items "
-            "(default: 1, or 100 when --resume-from-output is enabled)."
+            "(default: 1, or 100 when resume is active)."
         ),
     )
     parser.add_argument(
@@ -2733,19 +2734,68 @@ def parse_transcriptions_from_file(
             return text
         return re.sub(r"</?\s*(?:b|strong|em|i)\b[^>]*>", "", text, flags=re.IGNORECASE)
 
-    raw_text = input_path.read_text(encoding="utf-8")
-    raw_text = unicodedata.normalize("NFC", raw_text)
-    if raw_text == "":
+    # For OneDrive/network paths, copy to a local temp file first for fast I/O.
+    effective_path = input_path
+    _temp_copy: Path | None = None
+    input_str = str(input_path).lower()
+    if "onedrive" in input_str or "sharepoint" in input_str:
+        suffix = input_path.suffix or ".tmp"
+        fd, tmp_str = tempfile.mkstemp(suffix=suffix, prefix="_data_cleanup_")
+        import os as _os
+        _os.close(fd)
+        _temp_copy = Path(tmp_str)
+        print(f"Copying input from OneDrive to local temp: {_temp_copy}")
+        shutil.copy2(input_path, _temp_copy)
+        effective_path = _temp_copy
+
+    # Detect encoding: try UTF-8 first, fall back to common legacy encodings.
+    # Single bulk read is fastest for OneDrive/network-backed filesystems.
+    _encoding = "utf-8"
+    try:
+        raw_text = effective_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        raw_text = None
+        for candidate in ("utf-8-sig", "cp1250", "cp1252", "latin-1"):
+            try:
+                raw_text = effective_path.read_text(encoding=candidate)
+                _encoding = candidate
+                print(f"Input file is not UTF-8; using fallback encoding: {candidate}")
+                break
+            except (UnicodeDecodeError, LookupError):
+                continue
+        if raw_text is None:
+            print(f"Could not decode input file with any supported encoding: {input_path}")
+            return [], [], []
+
+    if not raw_text:
         return [], [], []
+
+    # Clean up temp copy now that data is in memory.
+    if _temp_copy is not None:
+        try:
+            _temp_copy.unlink(missing_ok=True)
+        except Exception:
+            pass
 
     if input_path.suffix.lower() == ".tsv":
         transcriptions: list[str] = []
         source_filenames: list[str | None] = []
-        source_rows: list[list[str] | None] = []
 
-        reader = csv.reader(raw_text.splitlines(), delimiter="\t")
+        print(f"Parsing TSV ({len(raw_text):,} chars)...")
         first_row_is_header = False
+        lines = raw_text.splitlines()
+        del raw_text  # Free memory before building the row list.
+        total_lines = len(lines)
+        # Skip source_rows for large files to save memory (~50% reduction).
+        _store_source_rows = total_lines <= 500_000
+        source_rows: list[list[str] | None] = [] if _store_source_rows else [None] * 0
+        if not _store_source_rows:
+            print(f"  Large file ({total_lines:,} lines): skipping per-row storage to save memory.")
+        reader = csv.reader(lines, delimiter="\t")
         for row_index, row in enumerate(reader):
+            if row_index > 0 and row_index % 1_000_000 == 0:
+                print(f"  Parsed {row_index:,}/{total_lines:,} rows...")
+            row = [unicodedata.normalize("NFC", cell) for cell in row]
             if not row or not any(cell.strip() for cell in row):
                 continue
 
@@ -2781,36 +2831,54 @@ def parse_transcriptions_from_file(
                 segment = _strip_emphasis_tags(first_cell)
             transcriptions.append(segment)
             source_filenames.append(filename)
-            source_rows.append(list(row))
+            if _store_source_rows:
+                source_rows.append(list(row))
+
+        # Free the lines list now that parsing is done.
+        del lines
 
         if first_row_is_header and not transcriptions:
             print("TSV input contains only header and no data rows.")
 
+        if not _store_source_rows:
+            source_rows = [None] * len(transcriptions)
+
         return transcriptions, source_filenames, source_rows
 
+    # Non-TSV: try JSON first, then plain text line-by-line (all in-memory).
     stripped = raw_text.strip()
+    is_json = stripped[:1] in ("{", "[")
 
-    try:
-        parsed = json.loads(stripped)
-    except json.JSONDecodeError:
-        parsed = None
-
-    if isinstance(parsed, list):
-        transcriptions = [_strip_emphasis_tags(item.strip()) for item in parsed if isinstance(item, str)]
-        return transcriptions, [None] * len(transcriptions), [None] * len(transcriptions)
-
-    if isinstance(parsed, dict):
-        items = parsed.get("transcriptions")
-        if isinstance(items, list):
-            transcriptions = [_strip_emphasis_tags(item.strip()) for item in items if isinstance(item, str)]
+    if is_json:
+        raw_text = unicodedata.normalize("NFC", raw_text)
+        stripped = raw_text.strip()
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, list):
+            transcriptions = [_strip_emphasis_tags(item.strip()) for item in parsed if isinstance(item, str)]
             return transcriptions, [None] * len(transcriptions), [None] * len(transcriptions)
+        if isinstance(parsed, dict):
+            items = parsed.get("transcriptions")
+            if isinstance(items, list):
+                transcriptions = [_strip_emphasis_tags(item.strip()) for item in items if isinstance(item, str)]
+                return transcriptions, [None] * len(transcriptions), [None] * len(transcriptions)
 
+    # Plain text: process from in-memory raw_text, apply NFC per-line.
+    print(f"Parsing plain text ({len(raw_text):,} chars)...")
     transcriptions: list[str] = []
     source_filenames: list[str | None] = []
     source_rows: list[list[str] | None] = []
-    for line in raw_text.splitlines():
+    lines = raw_text.splitlines()
+    del raw_text
+    total_lines = len(lines)
+    for line_index, raw_line in enumerate(lines):
+        if line_index > 0 and line_index % 1_000_000 == 0:
+            print(f"  Parsed {line_index:,}/{total_lines:,} lines...")
+        line = unicodedata.normalize("NFC", raw_line)
+
         if line.lstrip().startswith("#"):
-            # Preserve comment lines verbatim so they can be emitted unchanged.
             transcriptions.append(line)
             source_filenames.append(None)
             source_rows.append(None)
@@ -2829,6 +2897,7 @@ def parse_transcriptions_from_file(
         transcriptions.append(_strip_emphasis_tags(stripped_line))
         source_filenames.append(None)
         source_rows.append(None)
+    del lines
     return transcriptions, source_filenames, source_rows
 
 
@@ -3253,6 +3322,125 @@ def collect_transcriptions_from_input(
         return None
 
     return transcriptions, source_filenames, source_rows
+
+
+_LARGE_FILE_THRESHOLD = 500_000
+
+
+def count_input_lines(input_file_value: str) -> int:
+    """Fast line count without loading the entire file."""
+    input_path = resolve_path(input_file_value)
+    if not input_path.exists():
+        return 0
+    count = 0
+    with open(input_path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            count += chunk.count(b"\n")
+    return count
+
+
+def iter_transcription_chunks(
+    input_file_value: str,
+    chunk_size: int,
+) -> Iterator[tuple[int, list[str], list[str | None]]]:
+    """Yield (global_offset, transcriptions, source_filenames) chunks from a TSV/text file.
+
+    Reads the file in a single bulk read, then yields slices of chunk_size.
+    Each chunk is a contiguous slice of the file. source_rows are not stored.
+    """
+    input_path = resolve_path(input_file_value)
+
+    # Detect encoding (single bulk read — fast even on OneDrive).
+    _encoding = "utf-8"
+    try:
+        raw_text = input_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        raw_text = None
+        for candidate in ("utf-8-sig", "cp1250", "cp1252", "latin-1"):
+            try:
+                raw_text = input_path.read_text(encoding=candidate)
+                _encoding = candidate
+                print(f"Input file is not UTF-8; using fallback encoding: {candidate}")
+                break
+            except (UnicodeDecodeError, LookupError):
+                continue
+        if raw_text is None:
+            print(f"Could not decode input file: {input_path}")
+            return
+
+    if not raw_text:
+        return
+
+    def _select_source_identifier(cells: list[str]) -> str | None:
+        if not cells or len(cells) < 2:
+            return None
+        preferred = cells[-2].strip()
+        if preferred:
+            return preferred
+        for value in reversed(cells[:-1]):
+            candidate = value.strip()
+            if candidate:
+                return candidate
+        return None
+
+    # Parse lines and yield chunks as they fill up — no need to store the whole file.
+    chunk_transcriptions: list[str] = []
+    chunk_filenames: list[str | None] = []
+    global_offset = 0
+
+    if input_path.suffix.lower() == ".tsv":
+        lines = raw_text.splitlines()
+        del raw_text
+        reader = csv.reader(lines, delimiter="\t")
+        for row_index, row in enumerate(reader):
+            row = [unicodedata.normalize("NFC", cell) for cell in row]
+            if not row or not any(cell.strip() for cell in row):
+                continue
+            first_cell = row[0].strip() if row else ""
+            last_cell = row[-1].strip() if row else ""
+            # Skip header.
+            if row_index == 0:
+                fl = first_cell.lower().replace(" ", "_")
+                ll = last_cell.lower().replace(" ", "_")
+                if (fl in {"filename", "file", "file_name"} and ll in {"input", "input_segment", "segment", "transcription", "text"}):
+                    continue
+                if len(row) == 1 and fl in {"input", "input_segment", "segment", "transcription", "text"}:
+                    continue
+            if len(row) >= 2:
+                chunk_filenames.append(_select_source_identifier(row))
+                chunk_transcriptions.append(last_cell)
+            else:
+                chunk_filenames.append(None)
+                chunk_transcriptions.append(first_cell)
+            if len(chunk_transcriptions) >= chunk_size:
+                yield (global_offset, chunk_transcriptions, chunk_filenames)
+                global_offset += len(chunk_transcriptions)
+                chunk_transcriptions = []
+                chunk_filenames = []
+        del lines
+    else:
+        lines = raw_text.splitlines()
+        del raw_text
+        for raw_line in lines:
+            line = unicodedata.normalize("NFC", raw_line)
+            stripped_line = line.strip()
+            if "\t" in stripped_line:
+                parts = stripped_line.split("\t")
+                chunk_filenames.append(_select_source_identifier(parts))
+                chunk_transcriptions.append(parts[-1].strip())
+            else:
+                chunk_filenames.append(None)
+                chunk_transcriptions.append(stripped_line)
+            if len(chunk_transcriptions) >= chunk_size:
+                yield (global_offset, chunk_transcriptions, chunk_filenames)
+                global_offset += len(chunk_transcriptions)
+                chunk_transcriptions = []
+                chunk_filenames = []
+        del lines
+
+    # Yield remaining items.
+    if chunk_transcriptions:
+        yield (global_offset, chunk_transcriptions, chunk_filenames)
 
 
 def load_existing_output_text_lines(

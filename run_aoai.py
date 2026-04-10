@@ -67,6 +67,13 @@ def parse_args() -> argparse.Namespace:
         default=BATCH_DEFAULT_SIZE,
         help=f"Number of items per Batch API partition (default: {BATCH_DEFAULT_SIZE}).",
     )
+    parser.add_argument(
+        "--batch-max-retries",
+        dest="batch_max_retries",
+        type=int,
+        default=2,
+        help="Maximum retry passes for failed items after all chunks complete (default: 2, 0 disables retries).",
+    )
     return parser.parse_args()
 
 
@@ -109,10 +116,21 @@ async def main() -> None:
     output_file_value = args.output_file
     output_as_tsv = bool(input_file_value and str(input_file_value).lower().endswith(".tsv"))
 
-    input_data = collect_transcriptions_from_input(input_file_value)
-    if input_data is None:
-        return
-    transcriptions, source_filenames, source_rows = input_data
+    # In batch mode, always use chunked processing for consistent behavior.
+    from common import count_input_lines, iter_transcription_chunks
+    use_chunked = False
+    if args.batch_mode and input_file_value:
+        use_chunked = True
+
+    if use_chunked:
+        # Chunked batch mode: process batch_size * concurrency lines at a time.
+        pass  # Will be handled after client setup below.
+
+    if not use_chunked:
+        input_data = collect_transcriptions_from_input(input_file_value)
+        if input_data is None:
+            return
+        transcriptions, source_filenames, source_rows = input_data
 
     endpoint = args.endpoint
     deployment = args.deployment
@@ -197,137 +215,289 @@ async def main() -> None:
     )
 
     # -----------------------------------------------------------------------
-    #  Batch API mode
+    #  Chunked batch mode (large files)
     # -----------------------------------------------------------------------
-    if args.batch_mode:
-        from common import DEFAULT_AOAI_BATCH_DEPLOYMENT
+    if use_chunked:
+        from common import DEFAULT_AOAI_BATCH_DEPLOYMENT, sanitize_output_string
         batch_deployment = DEFAULT_AOAI_BATCH_DEPLOYMENT
-        print(f"Batch mode enabled (deployment={batch_deployment}, batch_size={args.batch_size})")
+        chunk_size = args.batch_size * concurrency
+        print(f"Chunked batch mode (deployment={batch_deployment}, chunk_size={chunk_size:,}, batch_size={args.batch_size:,}, concurrency={concurrency})")
 
-        # Load existing output for resume support.
-        batch_resume_lines: list[str] | None = None
-        if resume_from_output:
-            batch_resume_lines = load_existing_output_text_lines(
-                output_file_value,
-                len(transcriptions),
-                output_as_tsv,
-            )
+        # Load resume lines if output file exists.
+        resume_lines: list[str] | None = None
+        if resume_from_output and output_file_value:
+            from common import resolve_path as _resolve_path
+            _out_path = _resolve_path(output_file_value)
+            _out_text_path = _out_path.with_suffix(".tsv") if output_as_tsv else _out_path.with_suffix(".txt")
+            if _out_text_path.exists():
+                try:
+                    _raw = _out_text_path.read_text(encoding="utf-8")
+                    if output_as_tsv:
+                        # For TSV, extract only the last column (transcription).
+                        import csv as _csv
+                        resume_lines = []
+                        for row in _csv.reader(_raw.splitlines(), delimiter="\t"):
+                            resume_lines.append(sanitize_output_string(row[-1]) if row else "")
+                    else:
+                        resume_lines = [sanitize_output_string(line) for line in _raw.splitlines()]
+                    non_empty = sum(1 for l in resume_lines if l.strip())
+                    print(f"Loaded resume output: {non_empty:,} non-empty lines.")
+                except Exception as e:
+                    print(f"Could not load resume file: {e}")
 
-        # Pre-compute per-item preprocessing and casing flags.
-        # Mark already-completed items so the batch pipeline can skip them.
-        skip_casing_flags: list[bool] = []
-        batch_transcriptions: list[str] = []
-        pre_resolved_indices: set[int] = set()
-        for idx, t in enumerate(transcriptions):
-            stripped_t, _ = strip_emojis(t)
-            prompt_t, _ = normalize_all_uppercase_input(stripped_t)
-            batch_transcriptions.append(prompt_t)
-            skip_casing_flags.append(
-                is_all_uppercase_cased_input(t) or is_all_lowercase_cased_input(t)
-            )
-            # Skip comment lines (e.g. "# zh-CN") — treat as pre-resolved.
-            if is_input_comment_line(t):
-                pre_resolved_indices.add(idx)
-                continue
-            # If resume has a non-empty line for this index, mark it pre-resolved.
-            if batch_resume_lines is not None:
-                existing = batch_resume_lines[idx] if idx < len(batch_resume_lines) else ""
-                if isinstance(existing, str) and existing.strip():
-                    pre_resolved_indices.add(idx)
+        # Open output file in append mode for incremental writes.
+        from common import resolve_path as _resolve_path
+        out_path = _resolve_path(output_file_value) if output_file_value else None
+        out_text_path = None
+        if out_path:
+            out_text_path = out_path.with_suffix(".tsv") if output_as_tsv else out_path.with_suffix(".txt")
+            out_text_path.parent.mkdir(parents=True, exist_ok=True)
 
-        if pre_resolved_indices:
-            print(f"Batch mode: resuming — {len(pre_resolved_indices)} items already completed, skipping them.")
+        # Determine how many chunks were already fully written in a previous run.
+        # On resume, we rewrite the entire output file from scratch to avoid
+        # duplicates from partial appends.
+        chunks_completed_in_resume = 0
+        total_written = 0
+        first_write = True
+        # Track failed items across all chunks for end-of-run retry.
+        # Each entry: (global_idx, preprocessed_text, original_text, filename, skip_casing_flag)
+        all_failed_items: list[tuple[int, str, str, str | None, bool]] = []
 
-        def _on_batch_pass_complete(payloads_snapshot: list[dict | None]) -> None:
-            """Write a progress text snapshot after each batch pass."""
-            if not output_file_value:
-                return
-            progress_lines: list[str] = [""] * len(transcriptions)
-            for i, p in enumerate(payloads_snapshot):
-                if isinstance(p, dict):
-                    ct = p.get("corrected_text")
-                    progress_lines[i] = ct if isinstance(ct, str) else ""
-                elif batch_resume_lines is not None and i < len(batch_resume_lines):
-                    progress_lines[i] = batch_resume_lines[i] or ""
-            write_fallback_text_output(
-                output_file_value,
-                progress_lines,
-                source_filenames,
-                source_rows,
-                output_as_tsv=output_as_tsv,
-            )
+        for global_offset, chunk_transcriptions, chunk_filenames in iter_transcription_chunks(
+            input_file_value, chunk_size
+        ):
+            chunk_len = len(chunk_transcriptions)
+            chunk_end = global_offset + chunk_len
+            print(f"\n--- Chunk [{global_offset + 1:,}..{chunk_end:,}] ({chunk_len:,} items) ---")
 
-        payloads_batch = await run_batch_pipeline(
-            client=client,
-            deployment=batch_deployment,
-            transcriptions=batch_transcriptions,
-            prompt_template=prompt_template,
-            chain_steps=chain_steps,
-            locale=args.locale,
-            schema=PATCH_SCHEMA,
-            temperature=temperature,
-            top_p=top_p,
-            batch_size=args.batch_size,
-            build_patch_prompt_fn=build_patch_prompt,
-            skip_first_token_casing_preservation_flags=skip_casing_flags,
-            active_step_keys=active_step_keys,
-            max_input_chars_per_call=max_input_chars_per_call,
-            retry_temperature_jitter=retry_temperature_jitter,
-            concurrency=concurrency,
-            pre_resolved_indices=pre_resolved_indices,
-            on_pass_complete=_on_batch_pass_complete,
-        )
-
-        # Merge resume lines and comment lines into results.
-        if batch_resume_lines is not None:
-            for idx in pre_resolved_indices:
-                if payloads_batch[idx] is None and not is_input_comment_line(transcriptions[idx]):
-                    payloads_batch[idx] = build_empty_payload()
-                    payloads_batch[idx]["source_text"] = transcriptions[idx]
-                    payloads_batch[idx]["corrected_text"] = batch_resume_lines[idx]
-        for idx in pre_resolved_indices:
-            if is_input_comment_line(transcriptions[idx]) and payloads_batch[idx] is None:
-                payloads_batch[idx] = build_empty_payload()
-                payloads_batch[idx]["source_text"] = transcriptions[idx]
-                payloads_batch[idx]["corrected_text"] = transcriptions[idx]
-
-        # Post-processing: character-level diff merge to reject content changes.
-        if args.apply_safe_edits:
-            for idx, payload in enumerate(payloads_batch):
-                if not isinstance(payload, dict):
+            # Check resume: skip entire chunk if all lines are already resolved.
+            chunk_output_lines: list[str] | None = None
+            if resume_lines is not None:
+                chunk_resume = resume_lines[global_offset:chunk_end] if global_offset < len(resume_lines) else []
+                all_resolved = (
+                    len(chunk_resume) == chunk_len
+                    and all(isinstance(l, str) and l.strip() for l in chunk_resume)
+                )
+                if all_resolved:
+                    print(f"  Chunk already completed in resume output; skipping.")
+                    # Still write these lines to the output to maintain correct order.
+                    chunk_output_lines = list(chunk_resume)
+                    chunks_completed_in_resume += 1
+                    # Write to output.
+                    if out_text_path:
+                        if output_as_tsv and chunk_filenames:
+                            assert len(chunk_filenames) == len(chunk_output_lines), (
+                                f"Resume chunk alignment error: filenames={len(chunk_filenames)} vs output={len(chunk_output_lines)}"
+                            )
+                            tsv_lines = [
+                                f"{sanitize_output_string(fn if isinstance(fn, str) else '')}\t{sanitize_output_string(text)}"
+                                for fn, text in zip(chunk_filenames, chunk_output_lines, strict=True)
+                            ]
+                            content = "\n".join(tsv_lines) + "\n"
+                        else:
+                            content = "\n".join(sanitize_output_string(l) for l in chunk_output_lines) + "\n"
+                        if first_write:
+                            out_text_path.write_text(content, encoding="utf-8")
+                            first_write = False
+                        else:
+                            with out_text_path.open("a", encoding="utf-8") as fh:
+                                fh.write(content)
+                    total_written += chunk_len
                     continue
-                corrected = payload.get("corrected_text")
-                if not isinstance(corrected, str) or not corrected.strip():
-                    continue
-                original = transcriptions[idx]
-                if not isinstance(original, str) or not original.strip():
-                    continue
-                merged, _ = postprocess_apply_safe_edits(original, corrected)
-                if merged != corrected:
-                    payload["corrected_text"] = merged
 
-        # Attach source metadata and build text output lines.
-        text_lines_batch: list[str] = [""] * len(transcriptions)
-        for idx, payload in enumerate(payloads_batch):
-            if payload is None:
-                payload = build_empty_payload()
-                payloads_batch[idx] = payload
-            payload["source_text"] = transcriptions[idx]
-            source_fn = source_filenames[idx] if idx < len(source_filenames) else None
-            if isinstance(source_fn, str) and source_fn:
-                payload["source_filename"] = source_fn
-            corrected = payload.get("corrected_text")
-            text_lines_batch[idx] = corrected if isinstance(corrected, str) else ""
+            # Preprocess chunk.
+            skip_flags: list[bool] = []
+            batch_texts: list[str] = []
+            pre_resolved: set[int] = set()
+            for i, t in enumerate(chunk_transcriptions):
+                stripped_t, _ = strip_emojis(t)
+                prompt_t, _ = normalize_all_uppercase_input(stripped_t)
+                batch_texts.append(prompt_t)
+                skip_flags.append(
+                    is_all_uppercase_cased_input(t) or is_all_lowercase_cased_input(t)
+                )
+                if is_input_comment_line(t):
+                    pre_resolved.add(i)
+                elif resume_lines is not None:
+                    ri = global_offset + i
+                    if ri < len(resume_lines) and isinstance(resume_lines[ri], str) and resume_lines[ri].strip():
+                        pre_resolved.add(i)
 
-        finalize_payloads_and_write(
-            payloads_batch,
-            output_file_value,
-            text_lines_batch,
-            source_filenames,
-            source_rows,
-            output_as_tsv,
-            active_step_keys,
-        )
+            # Run batch pipeline for this chunk.
+            chunk_payloads = await run_batch_pipeline(
+                client=client,
+                deployment=batch_deployment,
+                transcriptions=batch_texts,
+                prompt_template=prompt_template,
+                chain_steps=chain_steps,
+                locale=args.locale,
+                schema=PATCH_SCHEMA,
+                temperature=temperature,
+                top_p=top_p,
+                batch_size=args.batch_size,
+                build_patch_prompt_fn=build_patch_prompt,
+                skip_first_token_casing_preservation_flags=skip_flags,
+                active_step_keys=active_step_keys,
+                max_input_chars_per_call=max_input_chars_per_call,
+                concurrency=concurrency,
+                pre_resolved_indices=pre_resolved,
+            )
+            assert len(chunk_payloads) == chunk_len, (
+                f"Batch pipeline alignment error: expected {chunk_len} payloads, got {len(chunk_payloads)}"
+            )
+            chunk_output_lines: list[str] = []
+            for i, payload in enumerate(chunk_payloads):
+                t = chunk_transcriptions[i]
+                if payload is None:
+                    if is_input_comment_line(t):
+                        chunk_output_lines.append(t)
+                    elif resume_lines is not None:
+                        ri = global_offset + i
+                        chunk_output_lines.append(resume_lines[ri] if ri < len(resume_lines) else "")
+                    else:
+                        chunk_output_lines.append("")
+                    # Track as failed for end-of-run retry (skip comments and pre-resolved).
+                    if i not in pre_resolved and not is_input_comment_line(t):
+                        fn = chunk_filenames[i] if chunk_filenames and i < len(chunk_filenames) else None
+                        all_failed_items.append((global_offset + i, batch_texts[i], t, fn, skip_flags[i]))
+                else:
+                    ct = payload.get("corrected_text")
+                    if isinstance(ct, str) and ct.strip():
+                        # Post-processing: character-level diff merge to reject content changes.
+                        if args.apply_safe_edits:
+                            original = chunk_transcriptions[i]
+                            if isinstance(original, str) and original.strip():
+                                merged, _ = postprocess_apply_safe_edits(original, ct)
+                                ct = merged
+                        chunk_output_lines.append(ct)
+                    else:
+                        # Payload present but corrected_text empty — treat as failed.
+                        chunk_output_lines.append("")
+                        if i not in pre_resolved and not is_input_comment_line(t):
+                            fn = chunk_filenames[i] if chunk_filenames and i < len(chunk_filenames) else None
+                            all_failed_items.append((global_offset + i, batch_texts[i], t, fn, skip_flags[i]))
+
+            # Write chunk results to output file.
+            assert len(chunk_output_lines) == chunk_len, (
+                f"Output alignment error: expected {chunk_len} lines, got {len(chunk_output_lines)}"
+            )
+            if out_text_path:
+                if output_as_tsv and chunk_filenames:
+                    assert len(chunk_filenames) == len(chunk_output_lines), (
+                        f"TSV alignment error: filenames={len(chunk_filenames)} vs output={len(chunk_output_lines)}"
+                    )
+                    tsv_lines = [
+                        f"{sanitize_output_string(fn if isinstance(fn, str) else '')}\t{sanitize_output_string(text)}"
+                        for fn, text in zip(chunk_filenames, chunk_output_lines, strict=True)
+                    ]
+                    content = "\n".join(tsv_lines) + "\n"
+                else:
+                    content = "\n".join(sanitize_output_string(l) for l in chunk_output_lines) + "\n"
+
+                if first_write:
+                    out_text_path.write_text(content, encoding="utf-8")
+                    first_write = False
+                else:
+                    with out_text_path.open("a", encoding="utf-8") as fh:
+                        fh.write(content)
+
+            total_written += chunk_len
+            print(f"  Chunk complete. Total written: {total_written:,}")
+
+        print(f"\nAll chunks done. Total: {total_written:,} items.")
+        if chunks_completed_in_resume > 0:
+            print(f"  ({chunks_completed_in_resume} chunks were already completed from resume.)")
+
+        # ---------------------------------------------------------------------
+        #  End-of-run retry for items that failed during chunk processing.
+        # ---------------------------------------------------------------------
+        batch_max_retries = getattr(args, "batch_max_retries", 0)
+        if all_failed_items and batch_max_retries > 0 and out_text_path and out_text_path.exists():
+            import random
+            retry_remaining = list(all_failed_items)
+            for retry_pass in range(1, batch_max_retries + 1):
+                if not retry_remaining:
+                    break
+                print(f"\n--- Retry pass {retry_pass}: {len(retry_remaining):,} failed items ---")
+
+                # Temperature jitter for retries.
+                pass_temperature = temperature
+                if retry_temperature_jitter > 0:
+                    pass_temperature = max(
+                        0.0,
+                        min(1.0, temperature + random.uniform(0.0, retry_temperature_jitter)),
+                    )
+                    print(f"  Temperature jitter applied: {pass_temperature:.3f}")
+
+                # Halve max_input_chars on each retry pass: pass1 = half, pass2 = quarter, ...
+                retry_max_chars = max(1, max_input_chars_per_call // (2 ** retry_pass)) if max_input_chars_per_call > 0 else 0
+
+                retry_texts = [item[1] for item in retry_remaining]
+                retry_skip_flags = [item[4] for item in retry_remaining]
+
+                retry_payloads = await run_batch_pipeline(
+                    client=client,
+                    deployment=batch_deployment,
+                    transcriptions=retry_texts,
+                    prompt_template=prompt_template,
+                    chain_steps=chain_steps,
+                    locale=args.locale,
+                    schema=PATCH_SCHEMA,
+                    temperature=pass_temperature,
+                    top_p=top_p,
+                    batch_size=args.batch_size,
+                    build_patch_prompt_fn=build_patch_prompt,
+                    skip_first_token_casing_preservation_flags=retry_skip_flags,
+                    active_step_keys=active_step_keys,
+                    max_input_chars_per_call=retry_max_chars,
+                    concurrency=concurrency,
+                )
+                assert len(retry_payloads) == len(retry_remaining), (
+                    f"Retry alignment error: expected {len(retry_remaining)} payloads, got {len(retry_payloads)}"
+                )
+
+                # Collect successful retries and patch output file.
+                patched_lines: dict[int, str] = {}  # global_idx -> corrected text
+                still_failed: list[tuple[int, str, str, str | None, bool]] = []
+                for item, payload in zip(retry_remaining, retry_payloads, strict=True):
+                    global_idx = item[0]
+                    if payload is not None:
+                        ct = payload.get("corrected_text", "")
+                        if isinstance(ct, str) and ct.strip():
+                            if args.apply_safe_edits:
+                                original = item[2]
+                                if isinstance(original, str) and original.strip():
+                                    merged, _ = postprocess_apply_safe_edits(original, ct)
+                                    ct = merged
+                            patched_lines[global_idx] = ct
+                        else:
+                            still_failed.append(item)
+                    else:
+                        still_failed.append(item)
+
+                if patched_lines:
+                    raw = out_text_path.read_text(encoding="utf-8")
+                    output_lines = raw.split("\n")
+                    if output_lines and output_lines[-1] == "":
+                        output_lines.pop()
+                    for global_idx, ct in patched_lines.items():
+                        if global_idx < len(output_lines):
+                            if output_as_tsv:
+                                parts = output_lines[global_idx].split("\t", 1)
+                                fn = parts[0] if parts else ""
+                                output_lines[global_idx] = f"{fn}\t{sanitize_output_string(ct)}"
+                            else:
+                                output_lines[global_idx] = sanitize_output_string(ct)
+                    out_text_path.write_text("\n".join(output_lines) + "\n", encoding="utf-8")
+                    print(f"  Patched {len(patched_lines):,} lines in output file.")
+
+                retry_remaining = still_failed
+
+            if retry_remaining:
+                print(f"\n{len(retry_remaining):,} items still failed after {batch_max_retries} retry pass(es).")
+        elif all_failed_items:
+            print(f"\n{len(all_failed_items):,} items failed (retries disabled).")
+
         return
 
     # -----------------------------------------------------------------------
