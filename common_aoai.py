@@ -191,7 +191,7 @@ async def get_patch_payload_with_repair(
 # ---------------------------------------------------------------------------
 
 BATCH_DEFAULT_SIZE = 10000  # 1000: ~2-5MB, 5000: ~10-25 MB, 10000: ~20-50 MB, 20000: ~40-100 MB, 50000: 100+ MB
-BATCH_POLL_INTERVAL_SECONDS = 1800  # 30 minutes
+BATCH_POLL_INTERVAL_SECONDS = 600  # 10 minutes
 
 
 def _call_with_retry(func, *args, retries: int = 5, **kwargs):
