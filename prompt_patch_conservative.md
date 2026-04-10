@@ -3,7 +3,7 @@
 ## 0. CRITICAL OUTPUT CONTRACT
 
 **Return exactly ONE JSON object (no markdown/prose) with these EXACT keys:**
-`tokenization`, `translation`, `aggressiveness_level`, `speaker_scope`, `ct_speaker`, `ct_combine`, `no_touch_tokens`, `ct_lexical`, `ct_disfluency`, `ct_format`, `ct_numeral`, `ct_punct`, `ct_casing`, `ct_remain_fix`.
+`tokenization`, `translation`, `aggressiveness_level`, `speaker_scope`, `seg_start`, `seg_end`, `ct_speaker`, `ct_combine`, `no_touch_tokens`, `ct_lexical`, `ct_disfluency`, `ct_format`, `ct_numeral`, `ct_punct`, `ct_casing`, `ct_remain_fix`.
 
 ---
 
@@ -71,6 +71,13 @@ Current profile: Arabic (`ORIGINAL` in Arabic script)
 * Output exactly `single` or `multi`.
 * Use `multi` only with explicit evidence of turn-taking; otherwise default to `single`.
 
+### [SEGMENT_BOUNDARY_PREDICTION]
+
+* Estimate the probability that `ORIGINAL` begins at a sentence start and ends at a sentence end.
+* If `ORIGINAL` already has display-format cues in the middle part of the segment, respect them and set the corresponding judgment to `high`.
+* Otherwise, use contextual clues: clause completeness, `ENGLISH_TRANSLATION` structure, and surrounding token patterns to make a best judgment.
+* Record your judgments as `seg_start` (`high`/`medium`/`low`) and `seg_end` (`high`/`medium`/`low`) in the output JSON.
+
 ---
 
 ## 3. GLOBAL CROSS-STEP POLICY
@@ -101,6 +108,7 @@ Current profile: Arabic (`ORIGINAL` in Arabic script)
 * Merge separated fragments (e.g., `10 0` → `100`).
 * Scope includes identifier/product/name/entity/number/currency/date/time/handle/multiplier fragments when split is purely a formatting artifact.
 * Only merge consecutive parts where whitespace creates a meaningless break in a single entity.
+* Do **NOT** merge letter-by-letter spellings; preserve the spaced-out form as-is.
 * Forbidden: no year expansion or numeral conversion (defer to `NUMERAL`).
 
 ### [NO_TOUCH]
@@ -132,6 +140,8 @@ Current profile: Arabic (`ORIGINAL` in Arabic script)
 ### [DISFLUENCY]
 
 * Remove fillers and false starts based on `AGGRESSIVENESS_LEVEL`.
+* Remove any known noise/non-speech tags (e.g., `[NOISE]`, `_bg noise_`, `[SPN/]`, `_hmm_`, `[unin/]`, `_Speaker Noise_`, and similar bracketed/underscored markers). Case-insensitive.
+* When removing tags, either delete them or replace only with punctuation strictly necessary for flow.
 * Do **NOT** delete long repeated spans (prevents audio-drift).
 * Only collapse repetitions when all of the following hold: (a) repetition is adjacent, (b) repeated unit is short (filler-like), and (c) no new lexical information appears between repeats.
 * Never reduce repeated long-span counts in one segment, even by 1.
@@ -144,6 +154,7 @@ Current profile: Arabic (`ORIGINAL` in Arabic script)
 ### [FORMAT]
 
 * Fix spacing artifacts in symbols/abbreviations.
+* Remove unnecessary quotation marks, including locale-specific quotation marks, without changing meaning, grammar, wording, language, script, or text order.
 * For English abbreviations/compact forms already present in `ORIGINAL`, follow `ENGLISH_TRANSLATION`-aligned formatting only when unambiguous; do **NOT** translate non-English forms.
 * Maintain compact forms for fixed compounds/markers when spacing change is purely formatting.
 * Keep technical brands in standard compact form; do not split lexicalized compounds.
@@ -178,17 +189,16 @@ Current profile: Arabic (`ORIGINAL` in Arabic script)
 * Conditional downgrade rule: if `ORIGINAL` is over-segmented (spurious full stops between tightly connected fragments of one thought), downgrade those specific sentence-ending marks to commas.
 * Do **NOT** downgrade true sentence boundaries; keep full-stop boundaries for complete thoughts, topic shifts, or boundaries supported by `ENGLISH_TRANSLATION`.
 * Do **NOT** insert punctuation adjacent to existing marks to avoid redundant or stacked punctuation.
-* At segment end, avoid changing terminal punctuation by default; allow change only when strongly supported by clear clause completion within the current segment.
+* At segment end, use `seg_end` from `[SEGMENT_BOUNDARY_PREDICTION]`: if `high`, ensure the segment ends with a sentence-ending mark; if `low`, prefer no terminal punctuation change.
 
 ### [CASING]
 
 * Capitalize sentence starts and proper nouns.
 * Without a sentence boundary, do **NOT** introduce mid-sentence capitalization except proper nouns/entities.
 * Use `AGGRESSIVENESS_LEVEL` strictly to scale casing intensity.
-* Standardize casing for technical platforms even if input is lowercase.
+* If `ENGLISH_TRANSLATION` capitalizes a token (proper noun, entity, or acronym), you **MUST** capitalize the corresponding token in the output regardless of its form in `ORIGINAL` and whether it is embedded in non-Latin scripts (applies only to tokens with case distinction).
 * Standardize casing for tokens in `NO_TOUCH`.
-* If `ENGLISH_TRANSLATION` capitalizes it, you **MUST** capitalize it here.
-* At segment start, avoid changing first-token casing by default; allow change only when sentence/clause start is clearly indicated within the current segment.
+* At segment start, use `seg_start` from `[SEGMENT_BOUNDARY_PREDICTION]`: if `high`, capitalize the first token as a sentence start; if `low`, preserve original casing.
 * Strictly no punctuation changes in this step; modify letter case only.
 
 ### [REMAIN_FIX]
@@ -196,7 +206,7 @@ Current profile: Arabic (`ORIGINAL` in Arabic script)
 * Final residual cleanup for misses in earlier **ACTIVE** steps only.
 * Prioritize conservative edits; if confidence is low, keep input unchanged.
 * Apply a residual fix only when explicit in `ORIGINAL` or strongly supported by `ENGLISH_TRANSLATION` structure.
-* Scope gate: `REMAIN_FIX` may only fix issues that belong to steps included in `{chain_steps}` and already executed earlier in this run.
+* Scope gate: `REMAIN_FIX` may only fix issues that belong to the active chain steps already executed earlier in this run.
 * `REMAIN_FIX` is forbidden from introducing edits that belong exclusively to any inactive step.
 * Preserve `NO_TOUCH` spans and legal/entity protections exactly.
 * Keep meaning unchanged: no semantic rewrites, paraphrases, reordering, style rewriting, or unsupported additions.
@@ -207,7 +217,7 @@ Current profile: Arabic (`ORIGINAL` in Arabic script)
 
 ## 5. EXECUTION DISCIPLINE
 
-1. **Chain Order:** `{chain_steps}`.
+1. **Chain Order:** Execute steps in the order listed in section 4.
 2. **Inactive Steps:** Must be pass-through: `{"edits": [], "result": <unchanged input-to-that-step>}`; if `NO_TOUCH` is inactive, `no_touch_tokens` must be `[]`.
 3. **Left-to-Right:** Process text exhaustively per step before moving to the next.
 4. **No Type-Creep:** Each step performs only its assigned edit type (except `REMAIN_FIX`).
@@ -215,27 +225,11 @@ Current profile: Arabic (`ORIGINAL` in Arabic script)
 5. **Completion Rule:** Emit each active step result only after exhaustively fixing all in-scope cases or explicitly leaving ambiguous cases unchanged.
 6. **Step-Translation Discipline:** Every active step must consult `ENGLISH_TRANSLATION` under global policy and its own step rules.
 7. **Edits Disambiguation:** Interpret each `[before, after]` left-to-right on the first unmatched occurrence in the current step input.
-8. **REMAIN_FIX Scope Lock:** `REMAIN_FIX` may repair only misses from earlier active steps in `{chain_steps}` and must not backfill edits from inactive steps.
+8. **REMAIN_FIX Scope Lock:** `REMAIN_FIX` may repair only misses from earlier active steps and must not backfill edits from inactive steps.
 
 ---
 
-## 6. OUTPUT FIELDS (ALWAYS PRESENT)
-
-* `ct_speaker` = `{"edits": [[before, after], ...], "result": text after SPEAKER}`
-* `ct_combine` = `{"edits": [[before, after], ...], "result": text after COMBINE}`
-* `no_touch_tokens` = unique exact substrings extracted in `NO_TOUCH` first-appearance order (or `[]` if inactive)
-* `ct_lexical` = `{"edits": [[before, after], ...], "result": text after LEXICAL}`
-* `ct_disfluency` = `{"edits": [[before, after], ...], "result": text after DISFLUENCY}`
-* `ct_format` = `{"edits": [[before, after], ...], "result": text after FORMAT}`
-* `ct_numeral` = `{"edits": [[before, after], ...], "result": text after NUMERAL}`
-* `ct_punct` = `{"edits": [[before, after], ...], "result": text after PUNCT}`
-* `ct_casing` = `{"edits": [[before, after], ...], "result": text after CASING}`
-* `ct_remain_fix` = `{"edits": [[before, after], ...], "result": text after REMAIN_FIX}`
-* Use `{"edits": [], "result": <unchanged>}` when no edits were made.
-
----
-
-## 7. DETERMINISM TARGET
+## 6. DETERMINISM TARGET
 
 * When multiple valid edits exist, prefer the option with:
   1. minimal lexical change
@@ -247,7 +241,7 @@ Current profile: Arabic (`ORIGINAL` in Arabic script)
 
 ---
 
-## 8. DATA & SCHEMA
+## 7. DATA & SCHEMA
 
 ### Output Schema
 
@@ -257,6 +251,8 @@ Current profile: Arabic (`ORIGINAL` in Arabic script)
   "translation": "string",
   "aggressiveness_level": "low/medium/high",
   "speaker_scope": "single/multi",
+  "seg_start": "high/medium/low",
+  "seg_end": "high/medium/low",
   "ct_speaker": {"edits": [[before, after]], "result": "string"},
   "ct_combine": {"edits": [], "result": "string"},
   "no_touch_tokens": [],
@@ -270,6 +266,27 @@ Current profile: Arabic (`ORIGINAL` in Arabic script)
 }
 
 ```
+
+### [RUNTIME_CHAIN_POLICY]
+
+- Active chain IDs: {active_chain_ids}
+- Active payload step keys: {active_step_keys}
+- Inactive payload step keys: {inactive_step_keys}
+- For every inactive payload step key, edits MUST be [] and result MUST be pass-through unchanged.
+- If any inactive payload step has non-empty edits, the output is invalid and will be retried.
+- If NO_TOUCH is inactive, no_touch_tokens MUST be [].
+
+### [LOCALE]
+
+- The input audio locale is: {locale}
+- If known, use the locale information to guide language-specific editing decisions.
+
+### [CONTEXT]
+
+- Previous segment ending: `{prev_context}`
+- Next segment starting: `{next_context}`
+- If context is empty, no neighboring segments are available; rely on `[SEGMENT_BOUNDARY_PREDICTION]` for boundary decisions.
+- Use context only for boundary decisions (casing, punctuation). Do NOT edit or reference context content in the output.
 
 ### Input Transcript
 

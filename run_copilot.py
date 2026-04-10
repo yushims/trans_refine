@@ -142,7 +142,7 @@ async def main():
     model_mismatch_retries = max(0, args.model_mismatch_retries)
     chain_steps = [step for step in (args.chain_steps or []) if isinstance(step, str) and step.strip()]
     active_step_keys = resolve_active_chain_step_keys(chain_steps)
-    resume_from_output = bool(args.resume_from_output)
+    resume_from_output = not bool(args.no_resume)
     skip_jsonl_output = bool(args.skip_jsonl_output)
     progress_write_every_arg = args.progress_write_every
     if isinstance(progress_write_every_arg, int):

@@ -191,44 +191,7 @@ async def get_patch_payload_with_repair(
 # ---------------------------------------------------------------------------
 
 BATCH_DEFAULT_SIZE = 10000  # 1000: ~2-5MB, 5000: ~10-25 MB, 10000: ~20-50 MB, 20000: ~40-100 MB, 50000: 100+ MB
-BATCH_POLL_INTERVAL_SECONDS = 30
-
-
-def build_batch_jsonl_requests(
-    items: list[tuple[int, str]],
-    deployment: str,
-    prompt_template: str,
-    chain_steps: list[str] | None,
-    locale: str | None,
-    schema: dict,
-    temperature: float,
-    top_p: float,
-    build_patch_prompt_fn: Callable,
-) -> list[str]:
-    """Build JSONL lines for the Azure OpenAI Batch API.
-
-    Each *item* is ``(index, transcription)`` where *index* is its position
-    in the input list (0-based).
-    """
-    lines: list[str] = []
-    for idx, transcription in items:
-        prompt = build_patch_prompt_fn(prompt_template, transcription, chain_steps, locale=locale)
-        request = {
-            "custom_id": f"idx-{idx}",
-            "method": "POST",
-            "url": "/chat/completions",
-            "body": {
-                "model": deployment,
-                "messages": [{"role": "user", "content": prompt}],
-                "response_format": {
-                    "type": "json_object",
-                },
-                "temperature": temperature,
-                "top_p": top_p,
-            },
-        }
-        lines.append(json.dumps(request, ensure_ascii=False))
-    return lines
+BATCH_POLL_INTERVAL_SECONDS = 1800  # 30 minutes
 
 
 def _call_with_retry(func, *args, retries: int = 5, **kwargs):
@@ -249,91 +212,38 @@ def _call_with_retry(func, *args, retries: int = 5, **kwargs):
     raise RuntimeError("Call failed without exception details.")
 
 
-async def submit_batch_and_wait(
-    client,
-    jsonl_lines: list[str],
-    batch_label: str = "",
-) -> dict[int, str]:
-    """Submit a Batch API job and poll until completion.
+def cleanup_stale_batch_resources(client) -> None:
+    """Cancel non-terminal batch jobs and delete all uploaded files.
 
-    Returns a mapping ``{index: raw_content}`` for each successfully
-    completed request.
+    Call this before starting a new batch run to avoid orphan resources
+    from previously crashed runs.
     """
-    file_ids: list[str] = []
-    tmp_path: str | None = None
+    terminal_statuses = {"completed", "failed", "expired", "cancelled"}
 
+    # Cancel pending batch jobs.
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".jsonl", delete=False, encoding="utf-8",
-        ) as fh:
-            fh.write("\n".join(jsonl_lines))
-            tmp_path = fh.name
-
-        print(f"[batch{batch_label}] Uploading {len(jsonl_lines)} requests …")
-        batch_file = _call_with_retry(
-            client.files.create, file=open(tmp_path, "rb"), purpose="batch",
-        )
-        file_ids.append(batch_file.id)
-
-        batch_job = _call_with_retry(
-            client.batches.create,
-            input_file_id=batch_file.id,
-            endpoint="/chat/completions",
-            completion_window="24h",
-        )
-        print(f"[batch{batch_label}] Submitted job {batch_job.id}")
-
-        while True:
-            status = await asyncio.to_thread(
-                _call_with_retry, client.batches.retrieve, batch_job.id,
-            )
-            print(f"[batch{batch_label}] Status: {status.status}")
-            if status.status in ("completed", "failed", "cancelled", "expired"):
-                break
-            await asyncio.sleep(BATCH_POLL_INTERVAL_SECONDS)
-
-        if status.output_file_id:
-            file_ids.append(status.output_file_id)
-        if status.error_file_id:
-            file_ids.append(status.error_file_id)
-
-        if status.status != "completed":
-            print(f"[batch{batch_label}] Job ended with status: {status.status}")
-            if status.error_file_id:
-                try:
-                    err_text = _call_with_retry(
-                        client.files.content, status.error_file_id,
-                    ).text
-                    print(f"[batch{batch_label}] Error details:\n{err_text[:2000]}")
-                except Exception:
-                    pass
-            return {}
-
-        result_text = await asyncio.to_thread(
-            lambda: _call_with_retry(client.files.content, status.output_file_id).text,
-        )
-
-        results: dict[int, str] = {}
-        for line in result_text.strip().split("\n"):
-            if not line:
+        for batch in client.batches.list():
+            status = getattr(batch, "status", None)
+            if status in terminal_statuses:
                 continue
-            row = json.loads(line)
-            idx = int(row["custom_id"].split("-", 1)[1])
             try:
-                content = row["response"]["body"]["choices"][0]["message"]["content"]
-                results[idx] = content
-            except (KeyError, IndexError, TypeError) as exc:
-                print(f"[batch{batch_label}] Could not extract content for idx {idx}: {exc}")
-        return results
+                resp = client.batches.cancel(batch.id)
+                print(f"  Cancelled stale batch job: {batch.id} (was {status}, now {resp.status})")
+            except Exception as exc:
+                print(f"  Could not cancel batch {batch.id}: {exc}")
+    except Exception as exc:
+        print(f"  Could not list batch jobs for cleanup: {exc}")
 
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            os.unlink(tmp_path)
-        for fid in file_ids:
+    # Delete orphan files.
+    try:
+        for f in client.files.list():
             try:
-                _call_with_retry(client.files.delete, fid)
-            except Exception:
-                pass
+                deleted = client.files.delete(f.id)
+                print(f"  Deleted file: {f.id} (deleted={getattr(deleted, 'deleted', True)})")
+            except Exception as exc:
+                print(f"  Could not delete file {f.id}: {exc}")
+    except Exception as exc:
+        print(f"  Could not list files for cleanup: {exc}")
 
 
 async def run_batch_pipeline(
@@ -353,6 +263,10 @@ async def run_batch_pipeline(
     max_retry_passes: int = 2,
     max_input_chars_per_call: int = DEFAULT_MAX_INPUT_CHARS_PER_CALL,
     retry_temperature_jitter: float = 0.08,
+    concurrency: int = 1,
+    poll_interval_seconds: int = BATCH_POLL_INTERVAL_SECONDS,
+    pre_resolved_indices: set[int] | None = None,
+    on_pass_complete: Callable[[list], None] | None = None,
 ) -> list[dict | None]:
     """Run the full batch pipeline: partition, submit, parse results.
 
@@ -363,10 +277,17 @@ async def run_batch_pipeline(
     """
     total = len(transcriptions)
     payloads: list[dict | None] = [None] * total
+    resolved_indices = set(pre_resolved_indices) if pre_resolved_indices else set()
+
+    # Clean up stale batch jobs and orphan files from previous runs.
+    print("Batch mode: cleaning up stale resources...")
+    await asyncio.to_thread(cleanup_stale_batch_resources, client)
 
     # Build (index, transcription) items for non-empty inputs.
     items: list[tuple[int, str]] = []
     for idx, text in enumerate(transcriptions):
+        if idx in resolved_indices:
+            continue  # Skip items already completed from resume.
         if text.strip():
             items.append((idx, text))
         else:
@@ -398,15 +319,15 @@ async def run_batch_pipeline(
         # On retries, segment failed items by halving their input length.
         # Pass 1: use max_input_chars_per_call for very long inputs.
         # Retry 1: half the input length. Retry 2: quarter, etc.
-        # batch_entries: list of (custom_key, original_idx, text_to_send)
-        batch_entries: list[tuple[str, int, str]] = []
+        # batch_entries: list of (custom_key, original_idx, text_to_send, prev_ctx, next_ctx)
+        batch_entries: list[tuple[str, int, str, str, str]] = []
         # segment_groups tracks which original items were split.
         segment_groups: dict[int, list[tuple[str, str]]] = {}
 
         for idx, transcription in pending_items:
             if is_retry:
                 # Halve progressively: retry 1 = len/2, retry 2 = len/4, etc.
-                retry_segment_limit = max(1, len(transcription) // (2 ** pass_num - 1))
+                retry_segment_limit = max(1, len(transcription) // (2 ** (pass_num - 1)))
             elif max_input_chars_per_call > 0 and len(transcription) > max_input_chars_per_call:
                 retry_segment_limit = max_input_chars_per_call
             else:
@@ -427,10 +348,13 @@ async def run_batch_pipeline(
                     start_offset += len(seg)
 
                 if len(segments) > 1:
+                    _CTX_SNIPPET_LEN = 50
                     seg_keys: list[tuple[str, str]] = []
                     for seg_num, seg_text in enumerate(segments):
                         custom_key = f"{idx}_s{seg_num}"
-                        batch_entries.append((custom_key, idx, seg_text))
+                        prev_ctx = segments[seg_num - 1][-_CTX_SNIPPET_LEN:] if seg_num > 0 else ""
+                        next_ctx = segments[seg_num + 1][:_CTX_SNIPPET_LEN] if seg_num < len(segments) - 1 else ""
+                        batch_entries.append((custom_key, idx, seg_text, prev_ctx, next_ctx))
                         seg_keys.append((custom_key, seg_text))
                     segment_groups[idx] = seg_keys
                     print(
@@ -441,12 +365,16 @@ async def run_batch_pipeline(
 
             # Single item (no segmentation).
             custom_key = str(idx)
-            batch_entries.append((custom_key, idx, transcription))
+            batch_entries.append((custom_key, idx, transcription, "", ""))
 
         # Build JSONL request lines with custom keys.
         all_jsonl_lines: list[str] = []
-        for custom_key, _orig_idx, text in batch_entries:
-            prompt = build_patch_prompt_fn(prompt_template, text, chain_steps, locale=locale)
+        for custom_key, _orig_idx, text, prev_ctx, next_ctx in batch_entries:
+            prompt = build_patch_prompt_fn(
+                prompt_template, text, chain_steps, locale=locale,
+                prev_context=prev_ctx if prev_ctx else None,
+                next_context=next_ctx if next_ctx else None,
+            )
             request = {
                 "custom_id": f"idx-{custom_key}",
                 "method": "POST",
@@ -471,21 +399,33 @@ async def run_batch_pipeline(
 
         print(
             f"Batch mode{pass_label}: {len(pending_items)} items "
-            f"({len(batch_entries)} requests) in {num_partitions} partition(s)"
+            f"({len(batch_entries)} requests) in {num_partitions} partition(s) "
+            f"(concurrency={concurrency})"
         )
 
-        for part_num, start in enumerate(partition_starts, 1):
-            batch_label = f" {part_num}/{num_partitions}{pass_label}"
-            part_lines = all_jsonl_lines[start : start + batch_size]
+        # Submit partitions with controlled concurrency.
+        semaphore = asyncio.Semaphore(max(1, concurrency))
+        results_lock = asyncio.Lock()
 
-            raw_results = await _submit_batch_and_wait_keyed(
-                client, part_lines, batch_label,
-            )
-            print(f"[batch{batch_label}] Received {len(raw_results)}/{len(part_lines)} results")
-            all_raw_results.update(raw_results)
+        async def _submit_partition(part_num: int, start: int) -> None:
+            async with semaphore:
+                batch_label = f" {part_num}/{num_partitions}{pass_label}"
+                part_lines = all_jsonl_lines[start : start + batch_size]
+
+                raw_results = await _submit_batch_and_wait_keyed(
+                    client, part_lines, batch_label, poll_interval_seconds,
+                )
+                print(f"[batch{batch_label}] Received {len(raw_results)}/{len(part_lines)} results")
+                async with results_lock:
+                    all_raw_results.update(raw_results)
+
+        await asyncio.gather(*[
+            _submit_partition(part_num, start)
+            for part_num, start in enumerate(partition_starts, 1)
+        ])
 
         # Process non-segmented items.
-        for custom_key, orig_idx, text in batch_entries:
+        for custom_key, orig_idx, text, _prev_ctx, _next_ctx in batch_entries:
             if orig_idx in segment_groups:
                 continue  # Handle below.
 
@@ -563,6 +503,13 @@ async def run_batch_pipeline(
                 else:
                     print(f"  [{orig_idx + 1}/{total}] Segment merge failed.")
 
+        # Write progress snapshot so resume can pick up from here.
+        if on_pass_complete is not None:
+            try:
+                on_pass_complete(payloads)
+            except Exception as cb_err:
+                print(f"Batch mode: progress snapshot error: {cb_err}")
+
         # Collect failed items for retry.
         failed_items = [(idx, text) for idx, text in pending_items if payloads[idx] is None]
         if not failed_items:
@@ -582,6 +529,7 @@ async def _submit_batch_and_wait_keyed(
     client,
     jsonl_lines: list[str],
     batch_label: str = "",
+    poll_interval_seconds: int = BATCH_POLL_INTERVAL_SECONDS,
 ) -> dict[str, str]:
     """Like submit_batch_and_wait but returns results keyed by the custom_id
     suffix (the part after 'idx-') as a string, supporting non-integer keys
@@ -598,9 +546,10 @@ async def _submit_batch_and_wait_keyed(
             tmp_path = fh.name
 
         print(f"[batch{batch_label}] Uploading {len(jsonl_lines)} requests \u2026")
-        batch_file = _call_with_retry(
-            client.files.create, file=open(tmp_path, "rb"), purpose="batch",
-        )
+        with open(tmp_path, "rb") as upload_fh:
+            batch_file = _call_with_retry(
+                client.files.create, file=upload_fh, purpose="batch",
+            )
         file_ids.append(batch_file.id)
 
         batch_job = _call_with_retry(
@@ -618,7 +567,7 @@ async def _submit_batch_and_wait_keyed(
             print(f"[batch{batch_label}] Status: {status.status}")
             if status.status in ("completed", "failed", "cancelled", "expired"):
                 break
-            await asyncio.sleep(BATCH_POLL_INTERVAL_SECONDS)
+            await asyncio.sleep(poll_interval_seconds)
 
         if status.output_file_id:
             file_ids.append(status.output_file_id)
