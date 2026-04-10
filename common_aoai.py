@@ -340,7 +340,7 @@ async def run_batch_pipeline(
     )
 
     # Submit partitions with controlled concurrency.
-    semaphore = asyncio.Semaphore(max(1, concurrency))
+    semaphore = asyncio.Semaphore(max(1, concurrency, num_partitions))
     results_lock = asyncio.Lock()
 
     async def _submit_partition(part_num: int, start: int) -> None:
