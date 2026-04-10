@@ -2081,7 +2081,6 @@ def parse_validate_and_apply_text_fixes(
             no_touch_tokens,
         )
     corrected_text, spacing_normalized = normalize_char_based_spacing_input(corrected_text)
-    corrected_text, script_spacing_inserted = insert_spaces_between_scripts(corrected_text)
     # Only revert terminal punctuation when seg_end is not "high" (LLM shouldn't have changed it).
     seg_end_value = payload.get("seg_end") if isinstance(payload, dict) else None
     punctuation_normalized = False
@@ -2099,7 +2098,6 @@ def parse_validate_and_apply_text_fixes(
     if (
         casing_normalized
         or spacing_normalized
-        or script_spacing_inserted
         or punctuation_normalized
         # or sentence_casing_normalized
     ) and isinstance(payload, dict):
@@ -2884,40 +2882,47 @@ def strip_emojis(text: str) -> tuple[str, bool]:
     return cleaned, cleaned != text.strip()
 
 
-def insert_spaces_between_scripts(text: str) -> tuple[str, bool]:
-    """Insert a space at boundaries between Latin and non-Latin letter segments.
+def insert_spaces_at_script_boundaries(text: str) -> tuple[str, bool]:
+    """Insert a space at boundaries between different script/digit categories.
 
-    E.g. "hello你好world" -> "hello 你好 world", "test" -> "test" (no change).
-    Does NOT insert spaces between digits/punctuation and letters — only between
-    letters of different script families.
+    Handles three boundary types:
+      1) Latin ↔ non-Latin letters
+      2) digit ↔ non-Latin letters
+      3) digit ↔ Latin letters
+
+    Punctuation, symbols, and decimal points reset the boundary tracker
+    so no spaces are inserted around them.
+    E.g. "hello你好world" -> "hello 你好 world",
+         "abc123def" -> "abc 123 def",
+         "123你好" -> "123 你好",
+         "abc.123" -> "abc.123",  (dot resets, both sides are same-cat after reset)
+         "abc,你好" -> "abc,你好".  (comma resets)
     """
     if not isinstance(text, str) or len(text) < 2:
         return text, False
 
     parts: list[str] = []
     changed = False
-    prev_is_non_latin: bool | None = None  # None = previous char was not a letter
+    # Categories: "latin", "nonlatin", "digit", or None (space/punct/symbol)
+    prev_cat: str | None = None
 
     for ch in text:
-        if ch.isspace():
+        if ch.isdigit():
+            cur_cat = "digit"
+        elif ch.isalpha():
+            cur_cat = "nonlatin" if _is_non_latin_letter(ch) else "latin"
+        else:
+            # Spaces, punctuation, symbols, decimal points — reset category.
             parts.append(ch)
-            prev_is_non_latin = None
+            prev_cat = None
             continue
 
-        # Only classify letters; digits/punct/symbols are neutral.
-        if not ch.isalpha():
-            parts.append(ch)
-            # Keep prev_is_non_latin as-is so "abc123你" still triggers.
-            continue
-
-        cur_is_non_latin = _is_non_latin_letter(ch)
-        if prev_is_non_latin is not None and cur_is_non_latin != prev_is_non_latin:
-            # Script boundary — insert space if one isn't already there.
+        if prev_cat is not None and cur_cat != prev_cat:
             if parts and not parts[-1][-1:].isspace():
                 parts.append(" ")
                 changed = True
         parts.append(ch)
-        prev_is_non_latin = cur_is_non_latin
+        prev_cat = cur_cat
 
     if not changed:
         return text, False

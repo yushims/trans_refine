@@ -18,6 +18,7 @@ from common import (
     configure_long_span_preservation_guard,
     finalize_payloads_and_write,
     format_resolved_chain_steps,
+    insert_spaces_at_script_boundaries,
     is_all_lowercase_cased_input,
     is_all_uppercase_cased_input,
     normalize_all_uppercase_input,
@@ -319,6 +320,7 @@ async def main():
                 await reset_resume_progress_write_interval()
 
             prompt_transcription, case_normalized = normalize_all_uppercase_input(transcription)
+            prompt_transcription, _ = insert_spaces_at_script_boundaries(prompt_transcription)
             source_was_all_uppercase = is_all_uppercase_cased_input(transcription)
             source_was_all_lowercase = is_all_lowercase_cased_input(transcription)
             skip_first_token_casing_preservation = source_was_all_uppercase or source_was_all_lowercase
