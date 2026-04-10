@@ -11,6 +11,7 @@ from common import (
     DEFAULT_AOAI_ENDPOINT,
     add_aoai_sampling_cli_arguments,
     add_common_runtime_cli_arguments,
+    add_run_pipeline_cli_arguments,
     append_payload_jsonl_record,
     assign_payload_or_emit_empty,
     build_patch_prompt,
