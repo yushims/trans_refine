@@ -92,6 +92,9 @@ def install_safe_console_output() -> None:
                 pass
 
     def _safe_print(*args, **kwargs) -> None:
+        # Default to flush=True so output is visible immediately when redirected to a file.
+        if "flush" not in kwargs:
+            kwargs["flush"] = True
         try:
             _ORIGINAL_PRINT(*args, **kwargs)
             return
