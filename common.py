@@ -2081,6 +2081,7 @@ def parse_validate_and_apply_text_fixes(
             no_touch_tokens,
         )
     corrected_text, spacing_normalized = normalize_char_based_spacing_input(corrected_text)
+    corrected_text, script_spacing_inserted = insert_spaces_at_script_boundaries(corrected_text)
     # Only revert terminal punctuation when seg_end is not "high" (LLM shouldn't have changed it).
     seg_end_value = payload.get("seg_end") if isinstance(payload, dict) else None
     punctuation_normalized = False
@@ -2098,6 +2099,7 @@ def parse_validate_and_apply_text_fixes(
     if (
         casing_normalized
         or spacing_normalized
+        or script_spacing_inserted
         or punctuation_normalized
         # or sentence_casing_normalized
     ) and isinstance(payload, dict):
