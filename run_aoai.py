@@ -30,6 +30,7 @@ from common import (
     load_existing_output_text_lines,
     merge_segment_payloads,
     prepare_jsonl_output_path,
+    postprocess_apply_safe_edits,
     print_common_runtime_settings,
     resolve_active_chain_step_keys,
     resolve_patch_and_repair_template_paths,
@@ -37,7 +38,7 @@ from common import (
     take_next_transcription_segment_for_llm,
     write_fallback_text_output,
 )
-from common_aoai import get_patch_payload_with_repair, run_batch_pipeline, BATCH_DEFAULT_SIZE
+from common_aoai import get_patch_payload_with_repair, run_batch_pipeline, BATCH_DEFAULT_SIZE, BATCH_POLL_INTERVAL_SECONDS
 
 PATCH_SCHEMA = build_patch_response_format_schema()
 
@@ -84,6 +85,20 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=BATCH_DEFAULT_SIZE,
         help=f"Number of items per Batch API partition (default: {BATCH_DEFAULT_SIZE}).",
+    )
+    parser.add_argument(
+        "--batch-poll-interval",
+        dest="batch_poll_interval",
+        type=int,
+        default=BATCH_POLL_INTERVAL_SECONDS,
+        help=f"Seconds between batch status checks (default: {BATCH_POLL_INTERVAL_SECONDS}).",
+    )
+    parser.add_argument(
+        "--apply-safe-edits",
+        dest="apply_safe_edits",
+        action="store_true",
+        default=False,
+        help="Apply character-level diff post-processing to accept only safe edits (punctuation/casing) and reject word-content changes.",
     )
     return parser.parse_args()
 
@@ -157,7 +172,7 @@ async def main() -> None:
     retry_top_p_jitter = max(0.0, args.retry_top_p_jitter)
     chain_steps = [step for step in (args.chain_steps or []) if isinstance(step, str) and step.strip()]
     active_step_keys = resolve_active_chain_step_keys(chain_steps)
-    resume_from_output = bool(args.resume_from_output)
+    resume_from_output = not bool(args.no_resume)
     skip_jsonl_output = bool(args.skip_jsonl_output)
     progress_write_every_arg = args.progress_write_every
     if isinstance(progress_write_every_arg, int):
@@ -222,14 +237,56 @@ async def main() -> None:
         batch_deployment = DEFAULT_AOAI_BATCH_DEPLOYMENT
         print(f"Batch mode enabled (deployment={batch_deployment}, batch_size={args.batch_size})")
 
-        # Pre-compute per-item casing flags.
+        # Load existing output for resume support.
+        batch_resume_lines: list[str] | None = None
+        if resume_from_output:
+            batch_resume_lines = load_existing_output_text_lines(
+                output_file_value,
+                len(transcriptions),
+                output_as_tsv,
+            )
+
+        # Pre-compute per-item preprocessing and casing flags.
+        # Mark already-completed items so the batch pipeline can skip them.
         skip_casing_flags: list[bool] = []
         batch_transcriptions: list[str] = []
-        for t in transcriptions:
+        pre_resolved_indices: set[int] = set()
+        for idx, t in enumerate(transcriptions):
             prompt_t, _ = normalize_all_uppercase_input(t)
             batch_transcriptions.append(prompt_t)
             skip_casing_flags.append(
                 is_all_uppercase_cased_input(t) or is_all_lowercase_cased_input(t)
+            )
+            # Skip comment lines (e.g. "# zh-CN") — treat as pre-resolved.
+            if is_input_comment_line(t):
+                pre_resolved_indices.add(idx)
+                continue
+            # If resume has a non-empty line for this index, mark it pre-resolved.
+            if batch_resume_lines is not None:
+                existing = batch_resume_lines[idx] if idx < len(batch_resume_lines) else ""
+                if isinstance(existing, str) and existing.strip():
+                    pre_resolved_indices.add(idx)
+
+        if pre_resolved_indices:
+            print(f"Batch mode: resuming — {len(pre_resolved_indices)} items already completed, skipping them.")
+
+        def _on_batch_pass_complete(payloads_snapshot: list[dict | None]) -> None:
+            """Write a progress text snapshot after each batch pass."""
+            if not output_file_value:
+                return
+            progress_lines: list[str] = [""] * len(transcriptions)
+            for i, p in enumerate(payloads_snapshot):
+                if isinstance(p, dict):
+                    ct = p.get("corrected_text")
+                    progress_lines[i] = ct if isinstance(ct, str) else ""
+                elif batch_resume_lines is not None and i < len(batch_resume_lines):
+                    progress_lines[i] = batch_resume_lines[i] or ""
+            write_fallback_text_output(
+                output_file_value,
+                progress_lines,
+                source_filenames,
+                source_rows,
+                output_as_tsv=output_as_tsv,
             )
 
         payloads_batch = await run_batch_pipeline(
@@ -248,7 +305,39 @@ async def main() -> None:
             active_step_keys=active_step_keys,
             max_input_chars_per_call=max_input_chars_per_call,
             retry_temperature_jitter=retry_temperature_jitter,
+            concurrency=concurrency,
+            poll_interval_seconds=args.batch_poll_interval,
+            pre_resolved_indices=pre_resolved_indices,
+            on_pass_complete=_on_batch_pass_complete,
         )
+
+        # Merge resume lines and comment lines into results.
+        if batch_resume_lines is not None:
+            for idx in pre_resolved_indices:
+                if payloads_batch[idx] is None and not is_input_comment_line(transcriptions[idx]):
+                    payloads_batch[idx] = build_empty_payload()
+                    payloads_batch[idx]["source_text"] = transcriptions[idx]
+                    payloads_batch[idx]["corrected_text"] = batch_resume_lines[idx]
+        for idx in pre_resolved_indices:
+            if is_input_comment_line(transcriptions[idx]) and payloads_batch[idx] is None:
+                payloads_batch[idx] = build_empty_payload()
+                payloads_batch[idx]["source_text"] = transcriptions[idx]
+                payloads_batch[idx]["corrected_text"] = transcriptions[idx]
+
+        # Post-processing: character-level diff merge to reject content changes.
+        if args.apply_safe_edits:
+            for idx, payload in enumerate(payloads_batch):
+                if not isinstance(payload, dict):
+                    continue
+                corrected = payload.get("corrected_text")
+                if not isinstance(corrected, str) or not corrected.strip():
+                    continue
+                original = transcriptions[idx]
+                if not isinstance(original, str) or not original.strip():
+                    continue
+                merged, _ = postprocess_apply_safe_edits(original, corrected)
+                if merged != corrected:
+                    payload["corrected_text"] = merged
 
         # Attach source metadata and build text output lines.
         text_lines_batch: list[str] = [""] * len(transcriptions)
@@ -462,11 +551,19 @@ async def main() -> None:
                     if source_length > len(segment_transcription):
                         print(f"[{segment_processing_id}] Processing segment ({len(segment_transcription)} chars).")
 
+                    # Compute context snippets for boundary decisions.
+                    _CTX_LEN = 50
+                    seg_prev_ctx = segment_sources[-1][-_CTX_LEN:] if segment_sources else None
+                    seg_next_end = start_offset + len(segment_transcription)
+                    seg_next_ctx = prompt_transcription[seg_next_end:seg_next_end + _CTX_LEN] if seg_next_end < source_length else None
+
                     prompt = build_patch_prompt(
                         prompt_template,
                         segment_transcription,
                         chain_steps,
                         locale=args.locale,
+                        prev_context=seg_prev_ctx,
+                        next_context=seg_next_ctx,
                     )
 
                     failure_reasons: list[str] = []
@@ -549,6 +646,12 @@ async def main() -> None:
                     resolved_payload["source_filename"] = source_filename
                 resolved_payload["source_text"] = transcription
                 corrected_text = resolved_payload.get("corrected_text")
+                # Post-processing: character-level diff merge to reject content changes.
+                if args.apply_safe_edits and isinstance(corrected_text, str) and corrected_text.strip() and transcription.strip():
+                    merged, _ = postprocess_apply_safe_edits(transcription, corrected_text)
+                    if merged != corrected_text:
+                        resolved_payload["corrected_text"] = merged
+                        corrected_text = merged
                 text_output_lines[slot] = corrected_text if isinstance(corrected_text, str) else ""
             await maybe_write_progress_snapshot(slot=slot)
         except asyncio.CancelledError:

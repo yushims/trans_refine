@@ -31,6 +31,8 @@ _REQUIRED_TOP_LEVEL_KEY_ORDER = (
     "translation",
     "aggressiveness_level",
     "speaker_scope",
+    "seg_start",
+    "seg_end",
     "ct_speaker",
     "ct_combine",
     "no_touch_tokens",
@@ -192,12 +194,14 @@ def add_common_runtime_cli_arguments(
         ),
     )
     parser.add_argument(
-        "--resume-from-output",
-        dest="resume_from_output",
+        "--no-resume",
+        dest="no_resume",
         action="store_true",
+        default=False,
         help=(
-            "Resume from existing output text file (.txt or .tsv). "
-            "Rows with non-empty existing output are skipped; non-empty input rows with empty output are retried."
+            "Disable automatic resume from existing output. "
+            "By default, if an output text file (.txt or .tsv) exists, "
+            "rows with non-empty output are skipped and only empty rows are retried."
         ),
     )
     parser.add_argument(
@@ -292,6 +296,14 @@ def build_patch_payload_schema() -> dict:
         "speaker_scope": {
             "type": "string",
             "enum": ["single", "multi", "unknown"],
+        },
+        "seg_start": {
+            "type": "string",
+            "enum": ["high", "medium", "low"],
+        },
+        "seg_end": {
+            "type": "string",
+            "enum": ["high", "medium", "low"],
         },
     }
 
@@ -1756,6 +1768,20 @@ def validate_patch_payload(payload: dict) -> tuple[bool, str]:
         if speaker_scope not in {"single", "multi", "unknown"}:
             return False, 'speaker_scope must be one of "single", "multi", "unknown"'
 
+    seg_start = payload.get("seg_start")
+    if seg_start is not None:
+        if not isinstance(seg_start, str):
+            return False, 'seg_start must be one of "high", "medium", "low"'
+        if seg_start not in {"high", "medium", "low"}:
+            return False, 'seg_start must be one of "high", "medium", "low"'
+
+    seg_end = payload.get("seg_end")
+    if seg_end is not None:
+        if not isinstance(seg_end, str):
+            return False, 'seg_end must be one of "high", "medium", "low"'
+        if seg_end not in {"high", "medium", "low"}:
+            return False, 'seg_end must be one of "high", "medium", "low"'
+
     no_touch_tokens = payload.get("no_touch_tokens")
     if not isinstance(no_touch_tokens, list) or not all(isinstance(token, str) for token in no_touch_tokens):
         return False, "no_touch_tokens must be an array of strings"
@@ -1999,17 +2025,27 @@ def parse_validate_and_apply_text_fixes(
 
     casing_normalized = False
     spacing_normalized = False
-    if not skip_first_token_casing_preservation:
+    # Only revert first-token casing when seg_start is not "high" (LLM shouldn't have changed it).
+    seg_start_value = payload.get("seg_start") if isinstance(payload, dict) else None
+    should_preserve_casing = (
+        not skip_first_token_casing_preservation
+        and seg_start_value != "high"
+    )
+    if should_preserve_casing:
         corrected_text, casing_normalized = preserve_first_token_casing(
             corrected_text,
             source_text,
             no_touch_tokens,
         )
     corrected_text, spacing_normalized = normalize_char_based_spacing_input(corrected_text)
-    corrected_text, punctuation_normalized = preserve_terminal_punctuation(
-        corrected_text,
-        source_text,
-    )
+    # Only revert terminal punctuation when seg_end is not "high" (LLM shouldn't have changed it).
+    seg_end_value = payload.get("seg_end") if isinstance(payload, dict) else None
+    punctuation_normalized = False
+    if seg_end_value != "high":
+        corrected_text, punctuation_normalized = preserve_terminal_punctuation(
+            corrected_text,
+            source_text,
+        )
     # Disable this as it calls _looks_like_dot_abbreviation_at which is too heuristic.
     # corrected_text, sentence_casing_normalized = preserve_sentence_start_casing(
     #     corrected_text,
@@ -2077,6 +2113,8 @@ def build_empty_payload() -> dict:
         "translation": "",
         "aggressiveness_level": "low",
         "speaker_scope": "unknown",
+        "seg_start": "medium",
+        "seg_end": "medium",
         "no_touch_tokens": [],
     }
 
@@ -2567,6 +2605,13 @@ def merge_segment_payloads(
     else:
         merged_payload["speaker_scope"] = "unknown"
 
+    # For merged segments: use first segment's start prediction, last segment's end prediction.
+    if segment_payloads:
+        first_starts = segment_payloads[0].get("seg_start")
+        merged_payload["seg_start"] = first_starts if isinstance(first_starts, str) else "medium"
+        last_ends = segment_payloads[-1].get("seg_end")
+        merged_payload["seg_end"] = last_ends if isinstance(last_ends, str) else "medium"
+
     merged_payload["no_touch_tokens"] = merged_no_touch_tokens
 
     for step_key in _STEP_CHAIN_KEYS:
@@ -2784,11 +2829,10 @@ def normalize_char_based_spacing_input(transcription: str) -> tuple[str, bool]:
 
 
 # ---------------------------------------------------------------------------
-# Deterministic preprocessing: noise-tag removal & decorative quote stripping
+# Noise token set (used by post-processing)
 # ---------------------------------------------------------------------------
 
 # Noise / non-speech tokens whose removal is always safe.
-# Sourced from the Databricks batch translation pipeline.
 _PREPROCESSING_NOISE_TOKENS: set[str] = {t.lower() for t in [
     "_bg noise_", "Bg Noise_", "_B.G. noise_", "_BG Noise_", "_BG speech",
     "[/CNON]", "[CNON]", "[/CNPS]", "[CNPS]", "[/CSPN]", "[CSPN]", "_CSPN_",
@@ -2801,82 +2845,202 @@ _PREPROCESSING_NOISE_TOKENS: set[str] = {t.lower() for t in [
     "_NS_NOISE_", "_/click_",
 ]}
 
-# Build a regex that matches any noise token (case-insensitive, longest first).
-_PREPROCESSING_NOISE_PATTERN = re.compile(
-    "|".join(
-        re.escape(token)
-        for token in sorted(_PREPROCESSING_NOISE_TOKENS, key=len, reverse=True)
-    ),
-    flags=re.IGNORECASE,
-)
 
-# Decorative quotation marks to strip (locale-aware variants).
-_DECORATIVE_QUOTE_CHARS = set('""\u201c\u201d\u00ab\u00bb')
+# ---------------------------------------------------------------------------
+# Post-processing: character-level diff merge (from Databricks pipeline)
+# ---------------------------------------------------------------------------
 
-
-def preprocess_remove_noise_tags(text: str) -> tuple[str, bool]:
-    """Remove known ASR noise/non-speech tags from *text*.
-
-    Returns ``(cleaned_text, changed)``.
-    """
-    if not isinstance(text, str) or not text:
-        return text, False
-
-    cleaned = _PREPROCESSING_NOISE_PATTERN.sub("", text)
-    # Collapse multiple spaces left by removals.
-    cleaned = re.sub(r" {2,}", " ", cleaned).strip()
-    return cleaned, cleaned != text.strip()
+# Abbreviation pattern: 2+ single letters each followed by a dot (e.g. O.E.E., A.O.K.)
+_POSTPROC_ABBREV_RE = re.compile(r'(?:[A-Za-z]\.){2,}')
+# Spaced abbreviation pattern: e.g. "S. M. S." or "H. S. V."
+_POSTPROC_SPACED_ABBREV_RE = re.compile(r'(?<![A-Za-z])(?:[A-Za-z]\. ){1,}[A-Za-z]\.')
+# Decorative punctuation that can be safely stripped from deletions
+_POSTPROC_DECORATIVE_PUNCT_RE = re.compile(r"""["'"\u201c\u201d\u2018\u2019\u00ab\u00bb()\[\]{}&~*]""")
+# Punctuation that can be safely deleted when the entire chunk is pure punct.
+_POSTPROC_DELETABLE_PUNCT_RE = re.compile(r"""[."'\u201c\u201d\u2018\u2019\u00ab\u00bb()\[\]{}&~*]""")
 
 
-def preprocess_strip_decorative_quotes(text: str) -> tuple[str, bool]:
-    """Remove decorative/wrapping quotation marks without changing meaning.
+def _postproc_strip_alnum(s: str) -> str:
+    return re.sub(r'[^\w]', '', s, flags=re.UNICODE)
 
-    Only strips quotes at word boundaries (start/end of text, or around
-    whitespace-separated tokens).  Does not touch quotes that appear
-    mid-word (e.g. contractions).
 
-    Returns ``(cleaned_text, changed)``.
-    """
-    if not isinstance(text, str) or not text:
-        return text, False
+def _postproc_strip_word_chars(s: str) -> str:
+    return re.sub(r'\w', '', s, flags=re.UNICODE)
 
-    # Strip leading/trailing decorative quotes.
-    stripped = text.strip()
-    if len(stripped) >= 2 and stripped[0] in _DECORATIVE_QUOTE_CHARS and stripped[-1] in _DECORATIVE_QUOTE_CHARS:
-        stripped = stripped[1:-1].strip()
 
-    # Remove remaining standalone decorative quotes (surrounded by space or at boundaries).
-    cleaned = re.sub(
-        r'(?<=\s)["""\u201c\u201d\u00ab\u00bb](?=\s)|^["""\u201c\u201d\u00ab\u00bb](?=\s)|(?<=\s)["""\u201c\u201d\u00ab\u00bb]$',
-        "",
-        stripped,
+def _postproc_has_alnum(s: str) -> bool:
+    return bool(re.search(r'\w', s, flags=re.UNICODE))
+
+
+def _postproc_contains_noise_token(s: str) -> bool:
+    s_lower = s.lower()
+    return any(tok in s_lower for tok in _PREPROCESSING_NOISE_TOKENS)
+
+
+def _postproc_greedy_abbrev_split(letters: str, llm_output: str) -> list[str] | None:
+    if not letters:
+        return []
+    for end in range(len(letters), 1, -1):
+        prefix = letters[:end]
+        if re.search(
+            r'(?<![A-Za-z])' + re.escape(prefix) + r'(?![A-Za-z])',
+            llm_output,
+            re.IGNORECASE,
+        ):
+            rest = _postproc_greedy_abbrev_split(letters[end:], llm_output)
+            if rest is not None:
+                return [prefix] + rest
+    return None
+
+
+def _postproc_normalize_abbreviations(original: str, llm_output: str) -> str:
+    """Remove abbreviation dots in *original* when the LLM removed them too."""
+    # Collapse spaced abbreviations "S. M. S." -> "S.M.S."
+    original = _POSTPROC_SPACED_ABBREV_RE.sub(
+        lambda m: m.group().replace(' ', ''), original
     )
-    cleaned = re.sub(r" {2,}", " ", cleaned).strip()
-    return cleaned, cleaned != text.strip()
+
+    def _replace(match: re.Match) -> str:
+        abbrev = match.group()
+        letters = abbrev.replace('.', '')
+        if re.search(
+            r'(?<![A-Za-z])' + re.escape(letters) + r'(?![A-Za-z])',
+            llm_output,
+            re.IGNORECASE,
+        ):
+            return letters
+        parts = _postproc_greedy_abbrev_split(letters, llm_output)
+        if parts is not None:
+            return ' '.join(parts)
+        return abbrev
+
+    return _POSTPROC_ABBREV_RE.sub(_replace, original)
 
 
-def preprocess_transcription(text: str) -> tuple[str, bool]:
-    """Apply all deterministic preprocessing steps to a transcription.
+_POSTPROC_QUOTE_PAIRS = {
+    '"': '"', '\u201c': '\u201d', '\u2018': '\u2019',
+    '\u00ab': '\u00bb', '\u2039': '\u203a',
+    '\u300c': '\u300d', '\u300e': '\u300f',
+    '\u201e': '\u201d',
+}
+_POSTPROC_OPENING_QUOTES = set(_POSTPROC_QUOTE_PAIRS.keys())
 
-    Steps (in order):
-    1. Remove known noise/non-speech tags.
-    2. Strip decorative quotation marks.
 
-    Returns ``(preprocessed_text, any_change_applied)``.
+def _postproc_unquote_field(s: str) -> str:
+    if len(s) < 2:
+        return s
+    opening = s[0]
+    if opening not in _POSTPROC_OPENING_QUOTES:
+        return s
+    expected_closing = _POSTPROC_QUOTE_PAIRS[opening]
+    if s[-1] == expected_closing:
+        inner = s[1:-1]
+        if opening == '"':
+            inner = inner.replace('\\"', '"')
+        return inner
+    return s
+
+
+def postprocess_apply_safe_edits(
+    original: str,
+    llm_output: str,
+    verbose: bool = False,
+) -> tuple[str, str | None]:
+    """Filter LLM output via character-level diff: accept only punctuation
+    and casing changes, reject word-content changes.
+
+    For each diff opcode:
+      - equal:   Keep as-is.
+      - replace: If the alphanumeric letters are the same (ignoring case),
+                 it's a pure punct/cap change -> accept the LLM version.
+                 If the original is pure punctuation and the LLM introduced
+                 words, accept the punct removal but reject the new words.
+                 Otherwise the LLM changed actual word content -> keep original.
+      - insert:  Accept only if no word characters (pure punct/space addition).
+      - delete:  Accept only if no word characters (pure punct removal) or noise token.
+
+    Returns ``(merged_text, report_or_None)``.
     """
-    if not isinstance(text, str) or not text.strip():
-        return text, False
+    original = _postproc_unquote_field(original)
+    original = _postproc_normalize_abbreviations(original, llm_output)
 
-    result = text
-    changed = False
+    matcher = difflib.SequenceMatcher(None, original, llm_output, autojunk=False)
 
-    result, noise_changed = preprocess_remove_noise_tags(result)
-    changed = changed or noise_changed
+    result: list[str] = []
+    kept_changes: list[str] = []
+    rejected_changes: list[str] = []
 
-    result, quote_changed = preprocess_strip_decorative_quotes(result)
-    changed = changed or quote_changed
+    for op, i1, i2, j1, j2 in matcher.get_opcodes():
+        orig_chunk = original[i1:i2]
+        llm_chunk = llm_output[j1:j2]
 
-    return result, changed
+        if op == "equal":
+            result.append(orig_chunk)
+
+        elif op == "replace":
+            orig_alnum = _postproc_strip_alnum(orig_chunk)
+            llm_alnum = _postproc_strip_alnum(llm_chunk)
+
+            if orig_alnum.lower() == llm_alnum.lower():
+                result.append(llm_chunk)
+                if orig_chunk != llm_chunk:
+                    kept_changes.append(f"  '{orig_chunk}' -> '{llm_chunk}'")
+            elif not orig_alnum:
+                spacing = _postproc_strip_word_chars(llm_chunk)
+                if spacing:
+                    result.append(spacing)
+                kept_changes.append(f"  Removed punct '{orig_chunk}'")
+                if llm_alnum:
+                    rejected_changes.append(f"  Inserted '{llm_alnum}' (insertion rejected)")
+            else:
+                cleaned = re.sub(r'[^\w\s]', '', orig_chunk, flags=re.UNICODE)
+                result.append(cleaned)
+                if cleaned != orig_chunk:
+                    kept_changes.append(f"  Stripped punct: '{orig_chunk}' -> '{cleaned}'")
+                rejected_changes.append(f"  '{orig_chunk}' -> '{llm_chunk}' (content change rejected)")
+
+        elif op == "insert":
+            if not _postproc_has_alnum(llm_chunk):
+                result.append(llm_chunk)
+                kept_changes.append(f"  Inserted '{llm_chunk}'")
+            else:
+                rejected_changes.append(f"  Inserted '{llm_chunk}' (insertion rejected)")
+
+        elif op == "delete":
+            if _postproc_contains_noise_token(orig_chunk):
+                kept_changes.append(f"  Removed noise token '{orig_chunk}'")
+            elif not _postproc_has_alnum(orig_chunk):
+                if _POSTPROC_DELETABLE_PUNCT_RE.search(orig_chunk):
+                    kept_changes.append(f"  Removed decorative punct '{orig_chunk}'")
+                else:
+                    result.append(orig_chunk)
+            else:
+                cleaned = _POSTPROC_DECORATIVE_PUNCT_RE.sub('', orig_chunk)
+                if cleaned != orig_chunk:
+                    kept_changes.append(f"  Stripped decorative punct: '{orig_chunk}' -> '{cleaned}'")
+                if cleaned:
+                    result.append(cleaned)
+
+    merged = "".join(result)
+    merged = re.sub(r' {2,}', ' ', merged).strip()
+
+    report = None
+    if verbose:
+        lines = ["=== Transcript Merge Report ===", ""]
+        if kept_changes:
+            lines.append(f"Accepted {len(kept_changes)} punctuation/capitalization change(s):")
+            lines.extend(kept_changes)
+        else:
+            lines.append("No punctuation/capitalization changes to apply.")
+        lines.append("")
+        if rejected_changes:
+            lines.append(f"Rejected {len(rejected_changes)} content change(s):")
+            lines.extend(rejected_changes)
+        else:
+            lines.append("No content changes to reject.")
+        report = "\n".join(lines)
+
+    return merged, report
 
 
 def normalize_all_uppercase_input(transcription: str) -> tuple[str, bool]:
@@ -3127,7 +3291,7 @@ def write_fallback_text_output(
         )
     )
 
-    if source_filenames is not None and len(source_filenames) == len(normalized_text_lines):
+    if is_tsv_output and source_filenames is not None and len(source_filenames) == len(normalized_text_lines):
         fallback_lines = [
                 f"{sanitize_output_string(filename if isinstance(filename, str) else '')}\t{text}"
             for filename, text in zip(source_filenames, normalized_text_lines)
@@ -3348,47 +3512,39 @@ def build_patch_prompt(
     transcription: str,
     chain_steps: list[str] | None = None,
     locale: str | None = None,
+    prev_context: str | None = None,
+    next_context: str | None = None,
 ) -> str:
     active_chain_ids = _resolve_active_chain_ids(chain_steps)
     active_chain_names = [_CHAIN_ID_TO_NAME[chain_id] for chain_id in active_chain_ids]
     active_step_keys = resolve_active_chain_step_keys(chain_steps)
     inactive_step_keys = [step_key for step_key in _STEP_CHAIN_KEYS if step_key not in active_step_keys]
 
-    chain_steps_text = "\n".join(
-        f"{chain_id}) {chain_name}"
+    chain_steps_text = ", ".join(
+        f"{chain_id}:{chain_name}"
         for chain_id, chain_name in zip(active_chain_ids, active_chain_names)
     )
 
-    active_payload_steps_text = ", ".join(sorted(active_step_keys)) if active_step_keys else "<none>"
-    inactive_payload_steps_text = ", ".join(inactive_step_keys) if inactive_step_keys else "<none>"
-    runtime_chain_policy = (
-        "[RUNTIME_CHAIN_POLICY]\n"
-        f"- Active chain IDs: {', '.join(active_chain_ids)}\n"
-        f"- Active payload step keys: {active_payload_steps_text}\n"
-        f"- Inactive payload step keys: {inactive_payload_steps_text}\n"
-        "- For every inactive payload step key, edits MUST be [] and result MUST be pass-through unchanged.\n"
-        "- If any inactive payload step has non-empty edits, the output is invalid and will be retried.\n"
-        "- If NO_TOUCH is inactive, no_touch_tokens MUST be []."
-    )
+    active_chain_ids_text = ", ".join(active_chain_ids)
+    active_step_keys_text = ", ".join(sorted(active_step_keys)) if active_step_keys else "<none>"
+    inactive_step_keys_text = ", ".join(inactive_step_keys) if inactive_step_keys else "<none>"
 
     prompt = prompt_template
     if "{chain_steps}" in prompt:
         prompt = prompt.replace("{chain_steps}", chain_steps_text)
-    if "{runtime_chain_policy}" in prompt:
-        prompt = prompt.replace("{runtime_chain_policy}", runtime_chain_policy)
-    else:
-        prompt = f"{prompt}\n\n{runtime_chain_policy}"
+    if "{active_chain_ids}" in prompt:
+        prompt = prompt.replace("{active_chain_ids}", active_chain_ids_text)
+    if "{active_step_keys}" in prompt:
+        prompt = prompt.replace("{active_step_keys}", active_step_keys_text)
+    if "{inactive_step_keys}" in prompt:
+        prompt = prompt.replace("{inactive_step_keys}", inactive_step_keys_text)
 
-    if locale:
-        locale_info = (
-            f"[LOCALE]\n"
-            f"- The input audio locale is: {locale}\n"
-            f"- Use this locale information to guide language-specific editing decisions."
-        )
-        if "{locale}" in prompt:
-            prompt = prompt.replace("{locale}", locale_info)
-        else:
-            prompt = f"{prompt}\n\n{locale_info}"
+    if "{locale}" in prompt:
+        prompt = prompt.replace("{locale}", locale if locale else "unknown")
+    if "{prev_context}" in prompt:
+        prompt = prompt.replace("{prev_context}", prev_context if prev_context else "")
+    if "{next_context}" in prompt:
+        prompt = prompt.replace("{next_context}", next_context if next_context else "")
     if "{input_transcript}" in prompt:
         prompt = prompt.replace("{input_transcript}", transcription)
         return prompt
