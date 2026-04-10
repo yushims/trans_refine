@@ -2793,6 +2793,54 @@ def is_input_comment_line(transcription: str) -> bool:
     return isinstance(transcription, str) and transcription.lstrip().startswith("#")
 
 
+# Emoji stripping: covers all major emoji Unicode ranges.
+_EMOJI_PATTERN = re.compile(
+    "["
+    "\U0001F600-\U0001F64F"  # emoticons
+    "\U0001F300-\U0001F5FF"  # symbols & pictographs
+    "\U0001F680-\U0001F6FF"  # transport & map
+    "\U0001F1E0-\U0001F1FF"  # flags
+    "\U0001F900-\U0001F9FF"  # supplemental symbols
+    "\U0001FA00-\U0001FA6F"  # chess, extended-A
+    "\U0001FA70-\U0001FAFF"  # extended-B
+    "\U00002702-\U000027B0"  # dingbats
+    "\U0000FE00-\U0000FE0F"  # variation selectors
+    "\U0000200D"             # zero-width joiner
+    "\U000023EA-\U000023F3"  # misc symbols
+    "\U0000231A-\U0000231B"
+    "\U00002328"
+    "\U000023CF"
+    "\U000023E9-\U000023F3"
+    "\U000023F8-\U000023FA"
+    "\U000025AA-\U000025AB"
+    "\U000025B6"
+    "\U000025C0"
+    "\U000025FB-\U000025FE"
+    "\U00002600-\U000027BF"
+    "\U00002934-\U00002935"
+    "\U00002B05-\U00002B07"
+    "\U00002B1B-\U00002B1C"
+    "\U00002B50"
+    "\U00002B55"
+    "\U00003030"
+    "\U0000303D"
+    "\U00003297"
+    "\U00003299"
+    "\U0001F3FB-\U0001F3FF"  # skin tone modifiers
+    "]+",
+    flags=re.UNICODE,
+)
+
+
+def strip_emojis(text: str) -> tuple[str, bool]:
+    """Remove all emoji characters from text. Returns (cleaned, changed)."""
+    if not isinstance(text, str) or not text:
+        return text, False
+    cleaned = _EMOJI_PATTERN.sub("", text)
+    cleaned = re.sub(r" {2,}", " ", cleaned).strip()
+    return cleaned, cleaned != text.strip()
+
+
 def normalize_char_based_spacing_input(transcription: str) -> tuple[str, bool]:
     """Remove spacing artifacts for same-script char-based languages while preserving mixed-script boundaries."""
     if not isinstance(transcription, str) or not transcription:
