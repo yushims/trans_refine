@@ -2734,30 +2734,16 @@ def parse_transcriptions_from_file(
             return text
         return re.sub(r"</?\s*(?:b|strong|em|i)\b[^>]*>", "", text, flags=re.IGNORECASE)
 
-    # For OneDrive/network paths, copy to a local temp file first for fast I/O.
-    effective_path = input_path
-    _temp_copy: Path | None = None
-    input_str = str(input_path).lower()
-    if "onedrive" in input_str or "sharepoint" in input_str:
-        suffix = input_path.suffix or ".tmp"
-        fd, tmp_str = tempfile.mkstemp(suffix=suffix, prefix="_data_cleanup_")
-        import os as _os
-        _os.close(fd)
-        _temp_copy = Path(tmp_str)
-        print(f"Copying input from OneDrive to local temp: {_temp_copy}")
-        shutil.copy2(input_path, _temp_copy)
-        effective_path = _temp_copy
-
     # Detect encoding: try UTF-8 first, fall back to common legacy encodings.
-    # Single bulk read is fastest for OneDrive/network-backed filesystems.
+    # Single bulk read is fastest even for OneDrive/network-backed filesystems.
     _encoding = "utf-8"
     try:
-        raw_text = effective_path.read_text(encoding="utf-8")
+        raw_text = input_path.read_text(encoding="utf-8")
     except UnicodeDecodeError:
         raw_text = None
         for candidate in ("utf-8-sig", "cp1250", "cp1252", "latin-1"):
             try:
-                raw_text = effective_path.read_text(encoding=candidate)
+                raw_text = input_path.read_text(encoding=candidate)
                 _encoding = candidate
                 print(f"Input file is not UTF-8; using fallback encoding: {candidate}")
                 break
@@ -2769,13 +2755,6 @@ def parse_transcriptions_from_file(
 
     if not raw_text:
         return [], [], []
-
-    # Clean up temp copy now that data is in memory.
-    if _temp_copy is not None:
-        try:
-            _temp_copy.unlink(missing_ok=True)
-        except Exception:
-            pass
 
     if input_path.suffix.lower() == ".tsv":
         transcriptions: list[str] = []
