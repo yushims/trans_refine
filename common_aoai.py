@@ -7,6 +7,17 @@ import time
 import unicodedata
 from collections.abc import Callable
 
+# Module-level shutdown event: set by the caller (e.g. run_aoai.py) on SIGINT
+# so that batch polling loops can exit early.
+_shutdown_event: asyncio.Event | None = None
+
+
+def set_shutdown_event(event: asyncio.Event) -> None:
+    """Register an asyncio.Event that will interrupt batch polling on shutdown."""
+    global _shutdown_event
+    _shutdown_event = event
+
+
 from common import (
     DEFAULT_MAX_INPUT_CHARS_PER_CALL,
     extract_retry_after_seconds,
@@ -17,6 +28,59 @@ from common import (
     run_with_timeout_retry,
     take_next_transcription_segment_for_llm,
 )
+
+# ---------------------------------------------------------------------------
+# Partial-segment marker: encodes per-segment results so that only failed
+# segments need to be retried on resume.
+# ---------------------------------------------------------------------------
+
+_PARTIAL_SEGMENTS_PREFIX = "%%PARTIAL_SEGMENTS%%"
+
+
+def encode_partial_segments(
+    seg_results: list[tuple[bool, str]],
+    segment_limit: int,
+) -> str:
+    """Encode partial segment results into a single marker string.
+
+    *seg_results* is a list of ``(ok, text)`` tuples — *ok* is True when the
+    LLM returned a valid corrected_text, False when the segment failed and
+    *text* is the original source.
+    """
+    parts = [
+        {"s": "ok" if ok else "fail", "t": text}
+        for ok, text in seg_results
+    ]
+    payload = {"limit": segment_limit, "parts": parts}
+    return _PARTIAL_SEGMENTS_PREFIX + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def is_partial_segments_marker(text: str) -> bool:
+    """Return True if *text* is a partial-segment marker."""
+    return isinstance(text, str) and text.startswith(_PARTIAL_SEGMENTS_PREFIX)
+
+
+def decode_partial_segments(
+    text: str,
+) -> tuple[int, list[tuple[bool, str]]] | None:
+    """Decode a partial-segment marker string.
+
+    Returns ``(segment_limit, [(ok, text), ...])`` or ``None`` if not a
+    valid marker.
+    """
+    if not is_partial_segments_marker(text):
+        return None
+    try:
+        raw = text[len(_PARTIAL_SEGMENTS_PREFIX):]
+        payload = json.loads(raw)
+        limit = int(payload["limit"])
+        parts = [
+            (p["s"] == "ok", p["t"])
+            for p in payload["parts"]
+        ]
+        return limit, parts
+    except Exception:
+        return None
 
 
 async def aoai_send_once(
@@ -197,7 +261,11 @@ BATCH_STATUS_PRINT_INTERVAL = 1800  # print status every 30 minutes (even if unc
 
 
 def _call_with_retry(func, *args, retries: int = 5, **kwargs):
-    """Call *func* with simple retry logic and linear backoff."""
+    """Call *func* with simple retry logic and exponential backoff.
+
+    For realtime calls this wrapper is unnecessary — the caller should
+    set ``retries=1`` to fail fast.
+    """
     last_error: Exception | None = None
     for attempt in range(1, retries + 1):
         try:
@@ -233,8 +301,13 @@ async def run_batch_pipeline(
     poll_interval_seconds: int = BATCH_POLL_INTERVAL_SECONDS,
     pre_resolved_indices: set[int] | None = None,
     on_pass_complete: Callable[[list], None] | None = None,
+    use_realtime: bool = False,
 ) -> list[dict | None]:
     """Run the full batch pipeline: partition, submit, parse results.
+
+    When *use_realtime* is True, individual chat completion calls are used
+    instead of the Azure Batch API — useful for fast debugging without
+    batch submission/polling delays.
 
     Returns a list parallel to *transcriptions* with parsed payloads
     (or ``None`` for items that failed).
@@ -242,6 +315,7 @@ async def run_batch_pipeline(
     total = len(transcriptions)
     payloads: list[dict | None] = [None] * total
     resolved_indices = set(pre_resolved_indices) if pre_resolved_indices else set()
+    from common import build_empty_payload
 
     # Build (index, transcription) items for non-empty inputs.
     items: list[tuple[int, str]] = []
@@ -251,7 +325,6 @@ async def run_batch_pipeline(
         if text.strip():
             items.append((idx, text))
         else:
-            from common import build_empty_payload
             payloads[idx] = build_empty_payload()
             payloads[idx]["source_text"] = text
 
@@ -330,34 +403,74 @@ async def run_batch_pipeline(
     # Submit in partitions and collect all results.
     all_raw_results: dict[str, str] = {}
 
-    partition_starts = list(range(0, len(all_jsonl_lines), batch_size))
-    num_partitions = len(partition_starts)
+    if use_realtime:
+        # --- Realtime mode: send individual chat completion calls ---
+        rt_semaphore = asyncio.Semaphore(max(1, concurrency))
+        rt_lock = asyncio.Lock()
+        rt_done = 0
 
-    print(
-        f"Batch mode: {len(pending_items)} items "
-        f"({len(batch_entries)} requests) in {num_partitions} partition(s) "
-        f"(concurrency={concurrency})"
-    )
+        async def _realtime_call(line_json: str) -> None:
+            nonlocal rt_done
+            req = json.loads(line_json)
+            custom_id = req["custom_id"]
+            key = custom_id.removeprefix("idx-")
+            body = req["body"]
+            async with rt_semaphore:
+                try:
+                    response = await asyncio.to_thread(
+                        client.chat.completions.create,
+                        model=body["model"],
+                        messages=body["messages"],
+                        temperature=body.get("temperature", 0.0),
+                        top_p=body.get("top_p", 1.0),
+                        response_format=body.get("response_format"),
+                    )
+                    content = extract_text_content(response.choices[0].message)
+                    async with rt_lock:
+                        all_raw_results[key] = content
+                        rt_done += 1
+                        if rt_done % 10 == 0 or rt_done == len(all_jsonl_lines):
+                            print(f"  [realtime] {rt_done}/{len(all_jsonl_lines)} completed")
+                except Exception as e:
+                    async with rt_lock:
+                        rt_done += 1
+                    print(f"  [realtime] {custom_id} failed: {e}")
 
-    # Submit partitions with controlled concurrency.
-    semaphore = asyncio.Semaphore(max(1, concurrency, num_partitions))
-    results_lock = asyncio.Lock()
+        print(
+            f"Realtime mode: {len(pending_items)} items "
+            f"({len(all_jsonl_lines)} requests, concurrency={concurrency})"
+        )
+        await asyncio.gather(*[_realtime_call(line) for line in all_jsonl_lines])
+    else:
+        # --- Batch mode: submit via Azure Batch API ---
+        partition_starts = list(range(0, len(all_jsonl_lines), batch_size))
+        num_partitions = len(partition_starts)
 
-    async def _submit_partition(part_num: int, start: int) -> None:
-        async with semaphore:
-            batch_label = f" {part_num}/{num_partitions}"
-            part_lines = all_jsonl_lines[start : start + batch_size]
-            raw_results = await _submit_batch_and_wait_keyed(
-                client, part_lines, batch_label, poll_interval_seconds,
-            )
-            print(f"[batch{batch_label}] Received {len(raw_results)}/{len(part_lines)} results")
-            async with results_lock:
-                all_raw_results.update(raw_results)
+        print(
+            f"Batch mode: {len(pending_items)} items "
+            f"({len(batch_entries)} requests) in {num_partitions} partition(s) "
+            f"(concurrency={concurrency})"
+        )
 
-    await asyncio.gather(*[
-        _submit_partition(part_num, start)
-        for part_num, start in enumerate(partition_starts, 1)
-    ])
+        # Submit partitions with controlled concurrency.
+        semaphore = asyncio.Semaphore(max(1, concurrency, num_partitions))
+        results_lock = asyncio.Lock()
+
+        async def _submit_partition(part_num: int, start: int) -> None:
+            async with semaphore:
+                batch_label = f" {part_num}/{num_partitions}"
+                part_lines = all_jsonl_lines[start : start + batch_size]
+                raw_results = await _submit_batch_and_wait_keyed(
+                    client, part_lines, batch_label, poll_interval_seconds,
+                )
+                print(f"[batch{batch_label}] Received {len(raw_results)}/{len(part_lines)} results")
+                async with results_lock:
+                    all_raw_results.update(raw_results)
+
+        await asyncio.gather(*[
+            _submit_partition(part_num, start)
+            for part_num, start in enumerate(partition_starts, 1)
+        ])
 
     # Process non-segmented items.
     for custom_key, orig_idx, text, _prev_ctx, _next_ctx in batch_entries:
@@ -387,20 +500,28 @@ async def run_batch_pipeline(
             print(f"  [{orig_idx + 1}/{total}] Validation failed: {validation_error}")
 
     # Process segmented items: parse each segment, then merge.
+    # If all segments succeed, merge normally.
+    # If some segments fail, encode a partial-segments marker so the retry
+    # pass can resubmit only the failed segments.
     for orig_idx, seg_entries in segment_groups.items():
-        seg_payloads: list[dict] = []
+        seg_ok_payloads: list[dict | None] = []  # full payload for ok segments, None for failed
+        seg_results: list[tuple[bool, str]] = []  # (ok, corrected_text_or_source)
         seg_sources: list[str] = []
-        all_segments_ok = True
+        failed_seg_count = 0
+        segment_limit = max_input_chars_per_call
 
         for custom_key, seg_source in seg_entries:
+            seg_sources.append(seg_source)
             raw_content = all_raw_results.get(custom_key)
             if raw_content is None:
                 print(
                     f"  [{orig_idx + 1}/{total}] Segment {custom_key}: "
                     "no response from batch API."
                 )
-                all_segments_ok = False
-                break
+                seg_results.append((False, seg_source))
+                seg_ok_payloads.append(None)
+                failed_seg_count += 1
+                continue
 
             seg_payload, validation_error, _ = parse_validate_and_apply_text_fixes(
                 raw_content,
@@ -411,32 +532,45 @@ async def run_batch_pipeline(
             )
 
             if seg_payload is not None:
-                corrected = seg_payload.get("corrected_text")
+                corrected = seg_payload.get("corrected_text", "")
                 if isinstance(corrected, str) and corrected.strip():
-                    seg_payloads.append(seg_payload)
-                    seg_sources.append(seg_source)
+                    seg_results.append((True, corrected))
+                    seg_ok_payloads.append(seg_payload)
                 else:
                     print(
                         f"  [{orig_idx + 1}/{total}] Segment {custom_key}: "
                         "empty corrected_text."
                     )
-                    all_segments_ok = False
-                    break
+                    seg_results.append((False, seg_source))
+                    seg_ok_payloads.append(None)
+                    failed_seg_count += 1
             else:
                 print(
                     f"  [{orig_idx + 1}/{total}] Segment {custom_key}: "
                     f"validation failed: {validation_error}"
                 )
-                all_segments_ok = False
-                break
+                seg_results.append((False, seg_source))
+                seg_ok_payloads.append(None)
+                failed_seg_count += 1
 
-        if all_segments_ok and seg_payloads:
-            merged = merge_segment_payloads(seg_payloads, seg_sources)
+        if failed_seg_count == 0 and seg_ok_payloads:
+            # All segments succeeded — merge using full payloads.
+            valid_payloads = [p for p in seg_ok_payloads if isinstance(p, dict)]
+            merged = merge_segment_payloads(valid_payloads, seg_sources)
             if merged is not None:
                 payloads[orig_idx] = merged
-                print(f"  [{orig_idx + 1}/{total}] Merged {len(seg_payloads)} segments successfully.")
+                print(f"  [{orig_idx + 1}/{total}] Merged {len(seg_results)} segments successfully.")
             else:
                 print(f"  [{orig_idx + 1}/{total}] Segment merge failed.")
+        elif seg_results:
+            # Some segments failed — encode partial results for segment-level retry.
+            marker = encode_partial_segments(seg_results, segment_limit)
+            partial_payload = build_empty_payload()
+            partial_payload["corrected_text"] = marker
+            payloads[orig_idx] = partial_payload
+            print(
+                f"  [{orig_idx + 1}/{total}] {failed_seg_count}/{len(seg_results)} segments failed; encoded partial results for retry."
+            )
 
     # Write progress snapshot so resume can pick up from here.
     if on_pass_complete is not None:
@@ -491,6 +625,15 @@ async def _submit_batch_and_wait_keyed(
         prev_status: str | None = None
         last_print_time: float = 0.0
         while True:
+            # Check for shutdown request.
+            if _shutdown_event is not None and _shutdown_event.is_set():
+                print(f"[batch{batch_label}] Shutdown requested; cancelling job {batch_job.id}...")
+                try:
+                    _call_with_retry(client.batches.cancel, batch_job.id, retries=2)
+                except Exception:
+                    pass
+                return {}
+
             status = await asyncio.to_thread(
                 _call_with_retry, client.batches.retrieve, batch_job.id,
             )

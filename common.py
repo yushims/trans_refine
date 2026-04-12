@@ -6,9 +6,7 @@ import csv
 import difflib
 import json
 import re
-import shutil
 import sys
-import tempfile
 import unicodedata
 from collections import Counter
 from collections.abc import Awaitable, Callable, Iterator
@@ -209,10 +207,11 @@ def add_common_runtime_cli_arguments(
         ),
     )
     parser.add_argument(
-        "--skip-jsonl-output",
-        dest="skip_jsonl_output",
+        "--output-jsonl",
+        dest="output_jsonl",
         action="store_true",
-        help="Skip writing incremental JSONL progress output (.jsonl).",
+        default=False,
+        help="Enable writing JSONL structured output (.jsonl) alongside text output.",
     )
 
 
@@ -473,14 +472,6 @@ _CHAR_BASED_NO_SPACE_GROUPS = {
     "khmer",
     "myanmar",
 }
-_DOT_ABBREVIATION_WORD_PATTERN = re.compile(
-    r"\b(?:mr|mrs|ms|dr|prof|sr|jr|st|etc|vs|fig|no)\.$",
-    flags=re.IGNORECASE,
-)
-_DOT_ABBREVIATION_COMPOUND_PATTERN = re.compile(
-    r"\b(?:e\.g|i\.e|a\.k\.a|u\.s|u\.k)\.$",
-    flags=re.IGNORECASE,
-)
 
 
 def _is_hangul_char(char: str) -> bool:
@@ -834,10 +825,6 @@ def _is_punct_token(token: str) -> bool:
     return isinstance(token, str) and len(token) == 1 and unicodedata.category(token).startswith("P")
 
 
-def _is_cjk_char(char: str) -> bool:
-    return _is_han_char(char) or _is_kana_char(char) or _is_hangul_char(char)
-
-
 def _is_non_latin_letter(char: str) -> bool:
     if not isinstance(char, str) or len(char) != 1:
         return False
@@ -1149,11 +1136,6 @@ def _remove_speaker_labels_by_reference(
     return filtered
 
 
-def _remove_speaker_label_tokens(tokens: list[str]) -> list[str]:
-    filtered, _ = _collect_and_remove_speaker_labels(tokens)
-    return filtered
-
-
 def _is_reasonable_number_like_token(token: str) -> bool:
     if not isinstance(token, str) or not token:
         return False
@@ -1427,7 +1409,6 @@ def validate_no_long_span_removed(
         if len(deleted_tokens) <= min_deleted_tokens:
             continue
 
-        deleted_span = " ".join(deleted_tokens).strip()
         snippet = " ".join(deleted_tokens[:12])
         return (
             False,
@@ -1676,82 +1657,6 @@ def preserve_first_token_casing(
         return corrected_text[:corrected_start] + source_token + corrected_text[corrected_end:], True
 
     return corrected_text, False
-
-
-def validate_terminal_punctuation_preserved(
-    corrected_text: str,
-    source_text: str,
-) -> tuple[bool, str]:
-    if not isinstance(corrected_text, str) or not isinstance(source_text, str):
-        return True, ""
-
-    source_terminal = _terminal_punctuation_char(source_text)
-    corrected_terminal = _terminal_punctuation_char(corrected_text)
-    if source_terminal == corrected_terminal:
-        return True, ""
-
-    return (
-        False,
-        "terminal punctuation changed "
-        f"(source='{source_terminal or '<none>'}', corrected='{corrected_terminal or '<none>'}')",
-    )
-
-
-def validate_first_token_casing_preserved(
-    corrected_text: str,
-    source_text: str,
-) -> tuple[bool, str]:
-    if not isinstance(corrected_text, str) or not isinstance(source_text, str):
-        return True, ""
-
-    source_span = _leading_cased_word_span(source_text)
-    corrected_span = _leading_cased_word_span(corrected_text)
-    if source_span is None or corrected_span is None:
-        return True, ""
-
-    source_token, _, _ = source_span
-    corrected_token, _, _ = corrected_span
-    if source_token == corrected_token:
-        return True, ""
-
-    if (
-        _has_case_distinction(source_token)
-        and _has_case_distinction(corrected_token)
-        and source_token.casefold() == corrected_token.casefold()
-    ):
-        return False, f"first token casing changed (source='{source_token}', corrected='{corrected_token}')"
-
-    return True, ""
-
-
-def _is_index_inside_url_or_email(text: str, index: int) -> bool:
-    if not isinstance(text, str) or index < 0 or index >= len(text):
-        return False
-
-    for match in _URL_EMAIL_PATTERN.finditer(text):
-        if match.start() <= index < match.end():
-            return True
-    return False
-
-
-# def _looks_like_dot_abbreviation_at(text: str, index: int) -> bool:
-#     # Disabled by request: abbreviation detection is too heuristic.
-#     ...
-
-
-# def _is_sentence_boundary_punctuation_at(text: str, index: int) -> bool:
-#     # Disabled by request: sentence-boundary detection currently depends on
-#     # _looks_like_dot_abbreviation_at and is considered too heuristic.
-#     ...
-
-
-# def preserve_sentence_start_casing(
-#     corrected_text: str,
-#     no_touch_tokens: object = None,
-# ) -> tuple[str, bool]:
-#     # Disabled by request: sentence-start casing depends on punctuation boundary
-#     # heuristics that are currently considered too brittle.
-#     ...
 
 
 def _materialize_corrected_text(payload: dict) -> dict:
@@ -2082,7 +1987,6 @@ def parse_validate_and_apply_text_fixes(
             no_touch_tokens,
         )
     corrected_text, spacing_normalized = normalize_char_based_spacing_input(corrected_text)
-    corrected_text, script_spacing_inserted = insert_spaces_at_script_boundaries(corrected_text)
     # Only revert terminal punctuation when seg_end is not "high" (LLM shouldn't have changed it).
     seg_end_value = payload.get("seg_end") if isinstance(payload, dict) else None
     punctuation_normalized = False
@@ -2091,18 +1995,11 @@ def parse_validate_and_apply_text_fixes(
             corrected_text,
             source_text,
         )
-    # Disable this as it calls _looks_like_dot_abbreviation_at which is too heuristic.
-    # corrected_text, sentence_casing_normalized = preserve_sentence_start_casing(
-    #     corrected_text,
-    #     no_touch_tokens,
-    # )
 
     if (
         casing_normalized
         or spacing_normalized
-        or script_spacing_inserted
         or punctuation_normalized
-        # or sentence_casing_normalized
     ) and isinstance(payload, dict):
         payload["corrected_text"] = corrected_text
 
@@ -2354,6 +2251,60 @@ def _find_segment_cut_index(text: str, start: int, max_chars: int) -> int:
         if candidate is not None:
             return _stabilize_segment_cut_index(text, start, candidate, hard_limit)
 
+    # Sentence punctuation followed by whitespace (e.g. ". ", "! ", "? ") —
+    # strong sentence boundary that won't split decimals (3.14) or
+    # abbreviations (U.S.A.).
+    # Additional guard: only accept when both sides of the boundary are
+    # language (letter) characters — reject when a digit or symbol is
+    # adjacent (e.g. "3. 14" or "$. x").
+    sentence_ws_candidates: list[int] = []
+    for match in _SEGMENT_BOUNDARY_PATTERN.finditer(window):
+        end_pos = match.end()
+        # Check if the match is followed by whitespace (or is at the window end).
+        if end_pos < len(window) and window[end_pos].isspace():
+            # Verify language chars around the boundary.
+            char_before = window[match.start() - 1] if match.start() > 0 else ""
+            # Skip past whitespace to find the first non-space char after.
+            after_idx = end_pos + 1
+            while after_idx < len(window) and window[after_idx].isspace():
+                after_idx += 1
+            char_after = window[after_idx] if after_idx < len(window) else ""
+            if char_before and not char_before.isalpha():
+                continue
+            if char_after and not char_after.isalpha():
+                continue
+            candidate = start + end_pos
+            if candidate >= min_candidate:
+                sentence_ws_candidates.append(candidate)
+    if sentence_ws_candidates:
+        return _stabilize_segment_cut_index(text, start, sentence_ws_candidates[-1], hard_limit)
+
+    # Plain whitespace with letters on both sides — clean word boundary that
+    # avoids splitting numeric/symbolic tokens like "3 .14" or "$ 100".
+    for index in range(len(window) - 1, -1, -1):
+        if window[index].isspace():
+            char_before = window[index - 1] if index > 0 else ""
+            after_idx = index + 1
+            while after_idx < len(window) and window[after_idx].isspace():
+                after_idx += 1
+            char_after = window[after_idx] if after_idx < len(window) else ""
+            if char_before and not char_before.isalpha():
+                continue
+            if char_after and not char_after.isalpha():
+                continue
+            candidate = start + index + 1
+            if candidate >= min_candidate:
+                return _stabilize_segment_cut_index(text, start, candidate, hard_limit)
+
+    # Prefer whitespace boundaries over bare sentence punctuation to avoid splitting
+    # decimal numbers (3.14), abbreviations (Dr.), or compound tokens (U.S.A.).
+    for index in range(len(window) - 1, -1, -1):
+        if window[index].isspace():
+            candidate = start + index + 1
+            if candidate >= min_candidate:
+                return _stabilize_segment_cut_index(text, start, candidate, hard_limit)
+
+    # Fall back to sentence-ending punctuation if no whitespace was found.
     sentence_candidates: list[int] = []
     for match in _SEGMENT_BOUNDARY_PATTERN.finditer(window):
         candidate = start + match.end()
@@ -2362,12 +2313,7 @@ def _find_segment_cut_index(text: str, start: int, max_chars: int) -> int:
     if sentence_candidates:
         return _stabilize_segment_cut_index(text, start, sentence_candidates[-1], hard_limit)
 
-    for index in range(len(window) - 1, -1, -1):
-        if window[index].isspace():
-            candidate = start + index + 1
-            if candidate >= min_candidate:
-                return _stabilize_segment_cut_index(text, start, candidate, hard_limit)
-
+    # Last resort: any sentence boundary character.
     for index in range(len(window) - 1, -1, -1):
         if window[index] in _SEGMENT_BOUNDARY_SENTENCE_CHAR_SET:
             candidate = start + index + 1
@@ -2503,15 +2449,6 @@ def split_transcription_for_llm(transcription: str, max_chars_per_call: int) -> 
     return segments if segments else [transcription]
 
 
-def _is_word_like_join_char(char: str) -> bool:
-    if not isinstance(char, str) or len(char) != 1:
-        return False
-    if char.isspace():
-        return False
-    category = unicodedata.category(char)
-    return category.startswith("L") or category.startswith("N")
-
-
 def _needs_space_between_segment_parts(left: str, right: str) -> bool:
     if not isinstance(left, str) or not isinstance(right, str):
         return False
@@ -2523,11 +2460,7 @@ def _needs_space_between_segment_parts(left: str, right: str) -> bool:
     if left_char.isspace() or right_char.isspace():
         return False
 
-    left_category = unicodedata.category(left_char)
-    right_category = unicodedata.category(right_char)
-    if left_category.startswith(("P", "S")) or right_category.startswith(("P", "S")):
-        return False
-
+    # Same-script char-based languages (CJK, Thai, etc.) don't use spaces.
     left_group = _char_based_script_group(left_char)
     right_group = _char_based_script_group(right_char)
     if (
@@ -2538,7 +2471,17 @@ def _needs_space_between_segment_parts(left: str, right: str) -> bool:
     ):
         return False
 
-    return _is_word_like_join_char(left_char) and _is_word_like_join_char(right_char)
+    # At segment boundaries, insert a space unless both sides are punctuation/symbols
+    # (e.g. ")(" or "...—" should not get a space).
+    left_category = unicodedata.category(left_char)
+    right_category = unicodedata.category(right_char)
+    left_is_punct = left_category.startswith(("P", "S"))
+    right_is_punct = right_category.startswith(("P", "S"))
+    if left_is_punct and right_is_punct:
+        return False
+
+    # If at least one side has a word-like character, insert a space.
+    return True
 
 
 def join_segment_text_parts(parts: list[str]) -> str:
@@ -2736,7 +2679,6 @@ def parse_transcriptions_from_file(
 
     # Detect encoding: try UTF-8 first, fall back to common legacy encodings.
     # Single bulk read is fastest even for OneDrive/network-backed filesystems.
-    _encoding = "utf-8"
     try:
         raw_text = input_path.read_text(encoding="utf-8")
     except UnicodeDecodeError:
@@ -2744,7 +2686,6 @@ def parse_transcriptions_from_file(
         for candidate in ("utf-8-sig", "cp1250", "cp1252", "latin-1"):
             try:
                 raw_text = input_path.read_text(encoding=candidate)
-                _encoding = candidate
                 print(f"Input file is not UTF-8; using fallback encoding: {candidate}")
                 break
             except (UnicodeDecodeError, LookupError):
@@ -2935,16 +2876,19 @@ def strip_emojis(text: str) -> tuple[str, bool]:
 def insert_spaces_at_script_boundaries(text: str) -> tuple[str, bool]:
     """Insert a space at boundaries between different script/digit categories.
 
-    Handles three boundary types:
+    Handles two boundary types:
       1) Latin ↔ non-Latin letters
       2) digit ↔ non-Latin letters
-      3) digit ↔ Latin letters
+
+    Digit ↔ Latin boundaries are intentionally skipped (e.g. "abc123def"
+    stays as-is) because they frequently appear in natural text like
+    "3km", "mp3", "V2" where no space is expected.
 
     Punctuation, symbols, and decimal points reset the boundary tracker
     so no spaces are inserted around them.
     E.g. "hello你好world" -> "hello 你好 world",
-         "abc123def" -> "abc 123 def",
          "123你好" -> "123 你好",
+         "abc123def" -> "abc123def",  (digit↔Latin, no space)
          "abc.123" -> "abc.123",  (dot resets, both sides are same-cat after reset)
          "abc,你好" -> "abc,你好".  (comma resets)
     """
@@ -2962,13 +2906,24 @@ def insert_spaces_at_script_boundaries(text: str) -> tuple[str, bool]:
         elif ch.isalpha():
             cur_cat = "nonlatin" if _is_non_latin_letter(ch) else "latin"
         else:
+            cat = unicodedata.category(ch)
+            if cat in {"Mn", "Mc", "Me"}:
+                # Combining marks inherit the previous category (e.g. Thai
+                # vowel marks attached to a Thai consonant).
+                parts.append(ch)
+                continue
             # Spaces, punctuation, symbols, decimal points — reset category.
             parts.append(ch)
             prev_cat = None
             continue
 
         if prev_cat is not None and cur_cat != prev_cat:
-            if parts and not parts[-1][-1:].isspace():
+            # Skip digit ↔ Latin boundaries.
+            is_digit_latin = (
+                (prev_cat == "digit" and cur_cat == "latin")
+                or (prev_cat == "latin" and cur_cat == "digit")
+            )
+            if not is_digit_latin and parts and not parts[-1][-1:].isspace():
                 parts.append(" ")
                 changed = True
         parts.append(ch)
@@ -3303,9 +3258,6 @@ def collect_transcriptions_from_input(
     return transcriptions, source_filenames, source_rows
 
 
-_LARGE_FILE_THRESHOLD = 500_000
-
-
 def count_input_lines(input_file_value: str) -> int:
     """Fast line count without loading the entire file."""
     input_path = resolve_path(input_file_value)
@@ -3349,7 +3301,6 @@ def iter_transcription_chunks(
     input_path = resolve_path(input_file_value)
 
     # Detect encoding (single bulk read — fast even on OneDrive).
-    _encoding = "utf-8"
     try:
         raw_text = input_path.read_text(encoding="utf-8")
     except UnicodeDecodeError:
@@ -3357,7 +3308,6 @@ def iter_transcription_chunks(
         for candidate in ("utf-8-sig", "cp1250", "cp1252", "latin-1"):
             try:
                 raw_text = input_path.read_text(encoding=candidate)
-                _encoding = candidate
                 print(f"Input file is not UTF-8; using fallback encoding: {candidate}")
                 break
             except (UnicodeDecodeError, LookupError):
@@ -3486,15 +3436,19 @@ def load_existing_output_text_lines(
         return None
 
     loaded_lines: list[str] = []
-    if output_as_tsv:
-        reader = csv.reader(raw_text.splitlines(), delimiter="\t")
-        for row in reader:
-            if not row:
-                loaded_lines.append("")
-                continue
-            loaded_lines.append(sanitize_output_string(row[-1]))
-    else:
-        loaded_lines = [sanitize_output_string(line) for line in raw_text.splitlines()]
+    # Always extract last column — even .txt files may contain tab-separated columns.
+    from common_aoai import is_partial_segments_marker as _is_partial_marker
+    reader = csv.reader(raw_text.splitlines(), delimiter="\t")
+    for row in reader:
+        if not row:
+            loaded_lines.append("")
+            continue
+        cell = row[-1]
+        # Preserve partial segment markers verbatim (they contain JSON).
+        if _is_partial_marker(cell):
+            loaded_lines.append(cell)
+        else:
+            loaded_lines.append(sanitize_output_string(cell))
 
     if len(loaded_lines) < expected_count:
         loaded_lines.extend([""] * (expected_count - len(loaded_lines)))
@@ -4159,7 +4113,6 @@ def sanitize_output_string(value: str) -> str:
         .replace("\r", " ")
         .replace("\n", " ")
         .replace("\t", " ")
-        .replace('"', " ")
     )
     normalized = re.sub(r" {2,}", " ", normalized)
     return normalized.strip()
