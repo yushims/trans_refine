@@ -302,6 +302,7 @@ async def run_batch_pipeline(
     pre_resolved_indices: set[int] | None = None,
     on_pass_complete: Callable[[list], None] | None = None,
     use_realtime: bool = False,
+    batch_metadata: dict[str, str] | None = None,
 ) -> list[dict | None]:
     """Run the full batch pipeline: partition, submit, parse results.
 
@@ -462,6 +463,7 @@ async def run_batch_pipeline(
                 part_lines = all_jsonl_lines[start : start + batch_size]
                 raw_results = await _submit_batch_and_wait_keyed(
                     client, part_lines, batch_label, poll_interval_seconds,
+                    batch_metadata=batch_metadata,
                 )
                 print(f"[batch{batch_label}] Received {len(raw_results)}/{len(part_lines)} results")
                 async with results_lock:
@@ -592,6 +594,7 @@ async def _submit_batch_and_wait_keyed(
     jsonl_lines: list[str],
     batch_label: str = "",
     poll_interval_seconds: int = BATCH_POLL_INTERVAL_SECONDS,
+    batch_metadata: dict[str, str] | None = None,
 ) -> dict[str, str]:
     """Like submit_batch_and_wait but returns results keyed by the custom_id
     suffix (the part after 'idx-') as a string, supporting non-integer keys
@@ -614,11 +617,16 @@ async def _submit_batch_and_wait_keyed(
             )
         file_ids.append(batch_file.id)
 
-        batch_job = _call_with_retry(
-            client.batches.create,
+        create_kwargs: dict = dict(
             input_file_id=batch_file.id,
             endpoint="/chat/completions",
             completion_window="24h",
+        )
+        if batch_metadata:
+            create_kwargs["metadata"] = batch_metadata
+        batch_job = _call_with_retry(
+            client.batches.create,
+            **create_kwargs,
         )
         print(f"[batch{batch_label}] Submitted job {batch_job.id}")
 
