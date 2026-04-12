@@ -123,7 +123,7 @@ async def main():
     chain_steps = [step for step in (args.chain_steps or []) if isinstance(step, str) and step.strip()]
     active_step_keys = resolve_active_chain_step_keys(chain_steps)
     resume_from_output = not bool(args.no_resume)
-    skip_jsonl_output = bool(args.skip_jsonl_output)
+    output_jsonl = bool(args.output_jsonl)
     progress_write_every_arg = args.progress_write_every
     if isinstance(progress_write_every_arg, int):
         progress_write_every = max(1, progress_write_every_arg)
@@ -145,8 +145,8 @@ async def main():
     if chain_steps:
         print(f"Chain step selector count: {len(chain_steps)}")
     print(f"Resolved active chain: {format_resolved_chain_steps(chain_steps)}")
-    if skip_jsonl_output:
-        print("JSONL progress output: disabled (--skip-jsonl-output)")
+    if output_jsonl:
+        print("JSONL structured output: enabled (--output-jsonl)")
     print_common_runtime_settings(
         prompt_template_path,
         repair_prompt_template_path,
@@ -190,7 +190,7 @@ async def main():
         resume_progress_write_every = base_progress_write_every
         output_jsonl_path = (
             None
-            if skip_jsonl_output
+            if not output_jsonl
             else prepare_jsonl_output_path(output_file_value, resume_mode=resume_from_output)
         )
         streamed_jsonl_slots: set[int] = set()

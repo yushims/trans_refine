@@ -40,7 +40,15 @@ from common import (
     take_next_transcription_segment_for_llm,
     write_fallback_text_output,
 )
-from common_aoai import get_patch_payload_with_repair, run_batch_pipeline, BATCH_DEFAULT_SIZE
+from common_aoai import (
+    get_patch_payload_with_repair,
+    run_batch_pipeline,
+    set_shutdown_event,
+    BATCH_DEFAULT_SIZE,
+    is_partial_segments_marker,
+    decode_partial_segments,
+    encode_partial_segments,
+)
 
 PATCH_SCHEMA = build_patch_response_format_schema()
 
@@ -74,6 +82,13 @@ def parse_args() -> argparse.Namespace:
         default=2,
         help="Maximum retry passes for failed items after all chunks complete (default: 2, 0 disables retries).",
     )
+    parser.add_argument(
+        "--batch-use-realtime",
+        dest="batch_use_realtime",
+        action="store_true",
+        default=False,
+        help="Use real-time chat completion calls instead of the Batch API (faster for debugging).",
+    )
     return parser.parse_args()
 
 
@@ -82,6 +97,7 @@ async def main() -> None:
     load_dotenv()
     loop = asyncio.get_running_loop()
     shutdown_requested = asyncio.Event()
+    set_shutdown_event(shutdown_requested)  # Register with common_aoai for batch polling.
     installed_signal_handlers: list[tuple[signal.Signals, object]] = []
 
     def _request_shutdown(signal_name: str) -> None:
@@ -158,7 +174,7 @@ async def main() -> None:
     chain_steps = [step for step in (args.chain_steps or []) if isinstance(step, str) and step.strip()]
     active_step_keys = resolve_active_chain_step_keys(chain_steps)
     resume_from_output = not bool(args.no_resume)
-    skip_jsonl_output = bool(args.skip_jsonl_output)
+    output_jsonl = bool(args.output_jsonl)
     progress_write_every_arg = args.progress_write_every
     if isinstance(progress_write_every_arg, int):
         progress_write_every = max(1, progress_write_every_arg)
@@ -185,8 +201,8 @@ async def main() -> None:
     if chain_steps:
         print(f"Chain step selector count: {len(chain_steps)}")
     print(f"Resolved active chain: {format_resolved_chain_steps(chain_steps)}")
-    if skip_jsonl_output:
-        print("JSONL progress output: disabled (--skip-jsonl-output)")
+    if output_jsonl:
+        print("JSONL structured output: enabled (--output-jsonl)")
     print_common_runtime_settings(
         prompt_template_path,
         repair_prompt_template_path,
@@ -220,7 +236,8 @@ async def main() -> None:
     if use_chunked:
         from common import DEFAULT_AOAI_BATCH_DEPLOYMENT, sanitize_output_string
         import csv as _csv
-        batch_deployment = DEFAULT_AOAI_BATCH_DEPLOYMENT
+        # Use regular deployment for realtime calls; batch SKU doesn't support chat completions.
+        batch_deployment = args.deployment if args.batch_use_realtime else DEFAULT_AOAI_BATCH_DEPLOYMENT
         # batch_size = number of segments (API requests) per partition upload.
         # chunk_size = target estimated segments per iteration before submitting.
         # iter_transcription_chunks accumulates lines until their estimated
@@ -251,7 +268,11 @@ async def main() -> None:
             Prefix columns are kept as-is except for tab/newline characters
             that would break TSV structure.
             """
-            ct = sanitize_output_string(corrected_text)
+            # Partial segment markers must be written verbatim (they contain JSON).
+            if is_partial_segments_marker(corrected_text):
+                ct = corrected_text
+            else:
+                ct = sanitize_output_string(corrected_text)
             if isinstance(source_row, list) and source_row:
                 # Preserve prefix columns exactly, only sanitize TSV-breaking chars.
                 rebuilt = [_sanitize_tsv_cell(v) for v in source_row[:-1]]
@@ -275,15 +296,17 @@ async def main() -> None:
             if _out_text_path.exists():
                 try:
                     _raw = _out_text_path.read_text(encoding="utf-8")
-                    _is_tsv_resume = _out_text_path.suffix.lower() == ".tsv"
-                    if _is_tsv_resume:
-                        # For TSV, extract only the last column (transcription).
-                        import csv as _csv
-                        resume_lines = []
-                        for row in _csv.reader(_raw.splitlines(), delimiter="\t"):
-                            resume_lines.append(sanitize_output_string(row[-1]) if row else "")
-                    else:
-                        resume_lines = [sanitize_output_string(line) for line in _raw.splitlines()]
+                    # Always extract last column for resume — even .txt files
+                    # may contain tab-separated columns.
+                    import csv as _csv
+                    resume_lines = []
+                    for row in _csv.reader(_raw.splitlines(), delimiter="\t"):
+                        cell = row[-1] if row else ""
+                        # Preserve partial segment markers verbatim (they contain JSON).
+                        if is_partial_segments_marker(cell):
+                            resume_lines.append(cell)
+                        else:
+                            resume_lines.append(sanitize_output_string(cell))
                     non_empty = sum(1 for l in resume_lines if l.strip())
                     print(f"Loaded resume output: {non_empty:,} non-empty lines.")
                 except Exception as e:
@@ -293,9 +316,13 @@ async def main() -> None:
         from common import resolve_path as _resolve_path
         out_path = _resolve_path(output_file_value) if output_file_value else None
         out_text_path = None
+        out_jsonl_path = None
         if out_path:
             out_text_path = out_path.with_suffix(".tsv") if output_as_tsv else out_path.with_suffix(".txt")
             out_text_path.parent.mkdir(parents=True, exist_ok=True)
+            if output_jsonl:
+                out_jsonl_path = out_path.with_suffix(".jsonl")
+                out_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Determine how many chunks were already fully written in a previous run.
         # On resume, we rewrite the entire output file from scratch to avoid
@@ -303,9 +330,14 @@ async def main() -> None:
         chunks_completed_in_resume = 0
         total_written = 0
         first_write = True
+        first_jsonl_write = True
         # Track failed items across all chunks for end-of-run retry.
         # Each entry: (global_idx, preprocessed_text, original_text, filename, skip_casing_flag)
         all_failed_items: list[tuple[int, str, str, str | None, bool]] = []
+        # Carry-over: unresolved items from resumed chunks, to be
+        # injected into the next chunk that actually runs.
+        # Each entry: (global_idx, source_text, filename, source_row, resume_line)
+        carryover_items: list[tuple[int, str, str | None, list[str] | None, str]] = []
 
         for global_offset, chunk_transcriptions, chunk_filenames, chunk_source_rows in iter_transcription_chunks(
             input_file_value, chunk_size, max_input_chars_per_call=max_input_chars_per_call
@@ -314,20 +346,58 @@ async def main() -> None:
             chunk_end = global_offset + chunk_len
             print(f"\n--- Chunk [{global_offset + 1:,}..{chunk_end:,}] ({chunk_len:,} items) ---")
 
-            # Check resume: skip entire chunk if all lines are already resolved.
+            # Check resume: skip chunk if fully resolved, otherwise carry over
+            # unresolved items to be processed with the next chunk's batch.
             chunk_output_lines: list[str] | None = None
             if resume_lines is not None:
                 chunk_resume = resume_lines[global_offset:chunk_end] if global_offset < len(resume_lines) else []
-                all_resolved = (
-                    len(chunk_resume) == chunk_len
-                    and all(isinstance(l, str) and l.strip() for l in chunk_resume)
-                )
-                if all_resolved:
-                    print(f"  Chunk already completed in resume output; skipping.")
-                    # Still write these lines to the output to maintain correct order.
+                if len(chunk_resume) == chunk_len:
+                    # Count unresolved lines (empty or partial markers).
+                    unresolved_in_chunk: list[int] = []
+                    for ci, cl in enumerate(chunk_resume):
+                        if not (isinstance(cl, str) and cl.strip()) or is_partial_segments_marker(cl):
+                            unresolved_in_chunk.append(ci)
+
+                    if not unresolved_in_chunk:
+                        # Fully resolved — skip entirely.
+                        print(f"  Chunk already completed in resume output; skipping.")
+                        chunk_output_lines = list(chunk_resume)
+                        chunks_completed_in_resume += 1
+                        if out_text_path:
+                            out_lines = [
+                                _build_output_line(
+                                    text,
+                                    chunk_source_rows[i] if i < len(chunk_source_rows) else None,
+                                    chunk_filenames[i] if i < len(chunk_filenames) else None,
+                                )
+                                for i, text in enumerate(chunk_output_lines)
+                            ]
+                            content = "\n".join(out_lines) + "\n"
+                            if first_write:
+                                out_text_path.write_text(content, encoding="utf-8")
+                                first_write = False
+                            else:
+                                with out_text_path.open("a", encoding="utf-8") as fh:
+                                    fh.write(content)
+                        total_written += chunk_len
+                        continue
+
+                    # Carry over unresolved items to the next chunk's batch.
+                    # Write resolved lines now; unresolved lines get empty placeholders
+                    # that will be patched when carry-over results come back.
+                    for ci in unresolved_in_chunk:
+                        fn = chunk_filenames[ci] if chunk_filenames and ci < len(chunk_filenames) else None
+                        sr = chunk_source_rows[ci] if chunk_source_rows and ci < len(chunk_source_rows) else None
+                        rl = chunk_resume[ci] if ci < len(chunk_resume) else ""
+                        carryover_items.append((global_offset + ci, chunk_transcriptions[ci], fn, sr, rl))
+
+                    print(
+                        f"  Chunk has {chunk_len - len(unresolved_in_chunk)}/{chunk_len} resolved; "
+                        f"carrying over {len(unresolved_in_chunk)} item(s) to next batch."
+                    )
+                    # Write the chunk with resolved lines; unresolved get their
+                    # current value (empty or partial marker) as placeholder.
                     chunk_output_lines = list(chunk_resume)
-                    chunks_completed_in_resume += 1
-                    # Write to output.
                     if out_text_path:
                         out_lines = [
                             _build_output_line(
@@ -351,6 +421,13 @@ async def main() -> None:
             skip_flags: list[bool] = []
             batch_texts: list[str] = []
             pre_resolved: set[int] = set()
+
+            # Inject carry-over items from previous resumed chunks.
+            # They are appended at the end of the batch arrays.
+            chunk_carryover = list(carryover_items)
+            carryover_items.clear()
+            carryover_batch_offset = len(chunk_transcriptions)  # where carry-over starts in batch arrays
+
             for i, t in enumerate(chunk_transcriptions):
                 stripped_t, _ = strip_emojis(t)
                 prompt_t, _ = normalize_all_uppercase_input(stripped_t)
@@ -363,7 +440,39 @@ async def main() -> None:
                 elif resume_lines is not None:
                     ri = global_offset + i
                     if ri < len(resume_lines) and isinstance(resume_lines[ri], str) and resume_lines[ri].strip():
-                        pre_resolved.add(i)
+                        if is_partial_segments_marker(resume_lines[ri]):
+                            # Partial segment markers: mark as pre_resolved so
+                            # run_batch_pipeline skips them. Partial payload will
+                            # be injected into chunk_payloads after pipeline returns.
+                            pre_resolved.add(i)
+                        else:
+                            pre_resolved.add(i)
+
+            # Inject resumed partial-segment payloads into chunk_payloads slots
+            # so the per-chunk retry loop can pick them up.
+            resumed_partial_indices: list[int] = []
+            for i, t in enumerate(chunk_transcriptions):
+                if resume_lines is not None:
+                    ri = global_offset + i
+                    if ri < len(resume_lines) and is_partial_segments_marker(resume_lines[ri] if ri < len(resume_lines) else ""):
+                        resumed_partial_indices.append(i)
+
+            # Append carry-over items to the batch arrays.
+            for co_global_idx, co_text, co_fn, co_sr, co_resume_line in chunk_carryover:
+                stripped_co, _ = strip_emojis(co_text)
+                prompt_co, _ = normalize_all_uppercase_input(stripped_co)
+                batch_texts.append(prompt_co)
+                skip_flags.append(
+                    is_all_uppercase_cased_input(co_text) or is_all_lowercase_cased_input(co_text)
+                )
+                # If carry-over has a partial marker, handle like resumed partial.
+                co_batch_idx = len(batch_texts) - 1
+                if is_partial_segments_marker(co_resume_line):
+                    pre_resolved.add(co_batch_idx)
+                    resumed_partial_indices.append(co_batch_idx)
+
+            if chunk_carryover:
+                print(f"  Including {len(chunk_carryover)} carry-over item(s) from previous chunks.")
 
             # Run batch pipeline for this chunk.
             chunk_payloads = await run_batch_pipeline(
@@ -383,12 +492,96 @@ async def main() -> None:
                 max_input_chars_per_call=max_input_chars_per_call,
                 concurrency=concurrency,
                 pre_resolved_indices=pre_resolved,
+                use_realtime=args.batch_use_realtime,
             )
-            assert len(chunk_payloads) == chunk_len, (
-                f"Batch pipeline alignment error: expected {chunk_len} payloads, got {len(chunk_payloads)}"
+            total_batch_len = chunk_len + len(chunk_carryover)
+            assert len(chunk_payloads) == total_batch_len, (
+                f"Batch pipeline alignment error: expected {total_batch_len} payloads, got {len(chunk_payloads)}"
             )
+
+            # Inject resumed partial-segment payloads so per-chunk retry picks them up.
+            for i in resumed_partial_indices:
+                if i < chunk_len:
+                    ri = global_offset + i
+                    if ri < len(resume_lines):
+                        partial_p = build_empty_payload()
+                        partial_p["corrected_text"] = resume_lines[ri]
+                        chunk_payloads[i] = partial_p
+                else:
+                    # Carry-over partial: get resume line from chunk_carryover.
+                    co_idx = i - carryover_batch_offset
+                    if co_idx < len(chunk_carryover):
+                        co_resume_line = chunk_carryover[co_idx][4]
+                        partial_p = build_empty_payload()
+                        partial_p["corrected_text"] = co_resume_line
+                        chunk_payloads[i] = partial_p
+
+            # Per-chunk retry: retry failed items within this chunk immediately
+            # so that segmented long lines can be fully resolved before moving on.
+            chunk_max_retries = getattr(args, "batch_max_retries", 0)
+            # Include resumed partial-segment items in retry (they were in pre_resolved
+            # but now have partial payloads injected above).
+            resumed_partial_set = set(resumed_partial_indices)
+            for chunk_retry in range(1, chunk_max_retries + 1):
+                # Collect chunk-local failed indices (including carry-over at end).
+                chunk_failed_indices: list[int] = []
+                for i, payload in enumerate(chunk_payloads):
+                    if i in pre_resolved and i not in resumed_partial_set:
+                        continue
+                    # Only check comment lines for original chunk items (not carry-over).
+                    if i < chunk_len and is_input_comment_line(chunk_transcriptions[i]):
+                        continue
+                    if payload is None:
+                        chunk_failed_indices.append(i)
+                        continue
+                    ct = payload.get("corrected_text")
+                    if not (isinstance(ct, str) and ct.strip()) or is_partial_segments_marker(ct if isinstance(ct, str) else ""):
+                        chunk_failed_indices.append(i)
+
+                if not chunk_failed_indices:
+                    break
+
+                print(f"  Chunk retry {chunk_retry}/{chunk_max_retries}: {len(chunk_failed_indices)} failed items...")
+                retry_texts = [batch_texts[i] for i in chunk_failed_indices]
+                retry_skip = [skip_flags[i] for i in chunk_failed_indices]
+                retry_max_chars = max(1, max_input_chars_per_call // (2 ** chunk_retry)) if max_input_chars_per_call > 0 else 0
+
+                retry_payloads = await run_batch_pipeline(
+                    client=client,
+                    deployment=batch_deployment,
+                    transcriptions=retry_texts,
+                    prompt_template=prompt_template,
+                    chain_steps=chain_steps,
+                    locale=args.locale,
+                    schema=PATCH_SCHEMA,
+                    temperature=temperature,
+                    top_p=top_p,
+                    batch_size=args.batch_size,
+                    build_patch_prompt_fn=build_patch_prompt,
+                    skip_first_token_casing_preservation_flags=retry_skip,
+                    active_step_keys=active_step_keys,
+                    max_input_chars_per_call=retry_max_chars,
+                    concurrency=concurrency,
+                    use_realtime=args.batch_use_realtime,
+                )
+
+                resolved_count = 0
+                for fi, rp in zip(chunk_failed_indices, retry_payloads):
+                    if rp is not None:
+                        rct = rp.get("corrected_text", "")
+                        if isinstance(rct, str) and rct.strip() and not is_partial_segments_marker(rct):
+                            chunk_payloads[fi] = rp
+                            resolved_count += 1
+                        elif isinstance(rct, str) and is_partial_segments_marker(rct):
+                            # Updated partial marker — keep for next retry pass.
+                            chunk_payloads[fi] = rp
+                print(f"  Chunk retry {chunk_retry}: resolved {resolved_count}/{len(chunk_failed_indices)}")
+                if resolved_count == 0:
+                    break  # No progress — stop retrying this chunk.
+
             chunk_output_lines: list[str] = []
-            for i, payload in enumerate(chunk_payloads):
+            for i in range(chunk_len):
+                payload = chunk_payloads[i]
                 t = chunk_transcriptions[i]
                 if payload is None:
                     if is_input_comment_line(t):
@@ -398,13 +591,20 @@ async def main() -> None:
                         chunk_output_lines.append(resume_lines[ri] if ri < len(resume_lines) else "")
                     else:
                         chunk_output_lines.append("")
-                    # Track as failed for end-of-run retry (skip comments and pre-resolved).
-                    if i not in pre_resolved and not is_input_comment_line(t):
+                    # Track as failed for end-of-run retry (skip comments and
+                    # non-resumed pre-resolved items).
+                    if (i not in pre_resolved or i in resumed_partial_set) and not is_input_comment_line(t):
                         fn = chunk_filenames[i] if chunk_filenames and i < len(chunk_filenames) else None
                         all_failed_items.append((global_offset + i, batch_texts[i], t, fn, skip_flags[i]))
                 else:
                     ct = payload.get("corrected_text")
-                    if isinstance(ct, str) and ct.strip():
+                    if isinstance(ct, str) and is_partial_segments_marker(ct):
+                        # Partial segment results — write marker as-is for retry.
+                        chunk_output_lines.append(ct)
+                        if (i not in pre_resolved or i in resumed_partial_set) and not is_input_comment_line(t):
+                            fn = chunk_filenames[i] if chunk_filenames and i < len(chunk_filenames) else None
+                            all_failed_items.append((global_offset + i, batch_texts[i], t, fn, skip_flags[i]))
+                    elif isinstance(ct, str) and ct.strip():
                         # Post-processing: character-level diff merge to reject content changes.
                         if args.apply_safe_edits:
                             original = chunk_transcriptions[i]
@@ -415,7 +615,7 @@ async def main() -> None:
                     else:
                         # Payload present but corrected_text empty — treat as failed.
                         chunk_output_lines.append("")
-                        if i not in pre_resolved and not is_input_comment_line(t):
+                        if (i not in pre_resolved or i in resumed_partial_set) and not is_input_comment_line(t):
                             fn = chunk_filenames[i] if chunk_filenames and i < len(chunk_filenames) else None
                             all_failed_items.append((global_offset + i, batch_texts[i], t, fn, skip_flags[i]))
 
@@ -441,6 +641,65 @@ async def main() -> None:
                     with out_text_path.open("a", encoding="utf-8") as fh:
                         fh.write(content)
 
+            # Write JSONL records for this chunk.
+            if out_jsonl_path:
+                if first_jsonl_write and not resume_from_output:
+                    out_jsonl_path.write_text("", encoding="utf-8")
+                    first_jsonl_write = False
+                for i in range(len(chunk_payloads)):
+                    payload = chunk_payloads[i]
+                    if payload is not None and isinstance(payload, dict):
+                        ct = payload.get("corrected_text", "")
+                        if isinstance(ct, str) and ct.strip() and not is_partial_segments_marker(ct):
+                            if i < chunk_len:
+                                source_fn = chunk_filenames[i] if chunk_filenames and i < len(chunk_filenames) else None
+                            else:
+                                co_idx = i - carryover_batch_offset
+                                source_fn = chunk_carryover[co_idx][2] if co_idx < len(chunk_carryover) else None
+                            append_payload_jsonl_record(
+                                out_jsonl_path, payload, source_fn, active_step_keys,
+                            )
+
+            # Patch carry-over results back into the output file.
+            if chunk_carryover and out_text_path and out_text_path.exists():
+                carryover_patches: dict[int, str] = {}
+                for co_idx, (co_global_idx, co_text, co_fn, co_sr, co_resume_line) in enumerate(chunk_carryover):
+                    batch_idx = carryover_batch_offset + co_idx
+                    if batch_idx < len(chunk_payloads):
+                        co_payload = chunk_payloads[batch_idx]
+                        if co_payload is not None:
+                            co_ct = co_payload.get("corrected_text", "")
+                            if isinstance(co_ct, str) and co_ct.strip() and not is_partial_segments_marker(co_ct):
+                                if args.apply_safe_edits and isinstance(co_text, str) and co_text.strip():
+                                    merged, _ = postprocess_apply_safe_edits(co_text, co_ct)
+                                    co_ct = merged
+                                carryover_patches[co_global_idx] = co_ct
+                            elif isinstance(co_ct, str) and is_partial_segments_marker(co_ct):
+                                carryover_patches[co_global_idx] = co_ct
+                                all_failed_items.append((co_global_idx, batch_texts[batch_idx], co_text, co_fn, skip_flags[batch_idx]))
+                            else:
+                                all_failed_items.append((co_global_idx, batch_texts[batch_idx], co_text, co_fn, skip_flags[batch_idx]))
+                        else:
+                            all_failed_items.append((co_global_idx, batch_texts[batch_idx], co_text, co_fn, skip_flags[batch_idx]))
+
+                if carryover_patches:
+                    from common import sanitize_output_string as _san
+                    output_lines_all = out_text_path.read_text(encoding="utf-8").split("\n")
+                    if output_lines_all and output_lines_all[-1] == "":
+                        output_lines_all.pop()
+                    for gidx, ct in carryover_patches.items():
+                        if gidx < len(output_lines_all):
+                            sanitized_ct = ct if is_partial_segments_marker(ct) else _san(ct)
+                            line = output_lines_all[gidx]
+                            if "\t" in line:
+                                prefix, _ = line.rsplit("\t", 1)
+                                output_lines_all[gidx] = f"{prefix}\t{sanitized_ct}"
+                            else:
+                                output_lines_all[gidx] = sanitized_ct
+                    out_text_path.write_text("\n".join(output_lines_all) + "\n", encoding="utf-8")
+                    resolved_co = sum(1 for ct in carryover_patches.values() if not is_partial_segments_marker(ct))
+                    print(f"  Patched {len(carryover_patches)} carry-over item(s) ({resolved_co} resolved).")
+
             total_written += chunk_len
             print(f"  Chunk complete. Total written: {total_written:,}")
 
@@ -448,12 +707,38 @@ async def main() -> None:
         if chunks_completed_in_resume > 0:
             print(f"  ({chunks_completed_in_resume} chunks were already completed from resume.)")
 
+        # Flush any remaining carry-over items to all_failed_items.
+        if carryover_items:
+            print(f"  {len(carryover_items)} carry-over item(s) remaining after all chunks (will retry at end).")
+            for co_global_idx, co_text, co_fn, co_sr, co_resume_line in carryover_items:
+                stripped_co, _ = strip_emojis(co_text)
+                prompt_co, _ = normalize_all_uppercase_input(stripped_co)
+                co_skip = is_all_uppercase_cased_input(co_text) or is_all_lowercase_cased_input(co_text)
+                all_failed_items.append((co_global_idx, prompt_co, co_text, co_fn, co_skip))
+            carryover_items.clear()
+
         # ---------------------------------------------------------------------
         #  End-of-run retry for items that failed during chunk processing.
+        #  Handles both fully-failed items and partial-segment markers.
         # ---------------------------------------------------------------------
         batch_max_retries = getattr(args, "batch_max_retries", 0)
         if all_failed_items and batch_max_retries > 0 and out_text_path and out_text_path.exists():
             import random
+            from common import join_segment_text_parts
+
+            # Read current output to detect partial segment markers.
+            def _read_output_lines() -> list[str]:
+                raw = out_text_path.read_text(encoding="utf-8")
+                lines = raw.split("\n")
+                if lines and lines[-1] == "":
+                    lines.pop()
+                return lines
+
+            def _extract_last_column(line: str) -> str:
+                if "\t" in line:
+                    return line.rsplit("\t", 1)[1]
+                return line
+
             retry_remaining = list(all_failed_items)
             for retry_pass in range(1, batch_max_retries + 1):
                 if not retry_remaining:
@@ -469,74 +754,175 @@ async def main() -> None:
                     )
                     print(f"  Temperature jitter applied: {pass_temperature:.3f}")
 
-                # Halve max_input_chars on each retry pass: pass1 = half, pass2 = quarter, ...
                 retry_max_chars = max(1, max_input_chars_per_call // (2 ** retry_pass)) if max_input_chars_per_call > 0 else 0
 
-                retry_texts = [item[1] for item in retry_remaining]
-                retry_skip_flags = [item[4] for item in retry_remaining]
+                # Read output to check for partial segment markers.
+                current_output = _read_output_lines()
 
-                retry_payloads = await run_batch_pipeline(
-                    client=client,
-                    deployment=batch_deployment,
-                    transcriptions=retry_texts,
-                    prompt_template=prompt_template,
-                    chain_steps=chain_steps,
-                    locale=args.locale,
-                    schema=PATCH_SCHEMA,
-                    temperature=pass_temperature,
-                    top_p=top_p,
-                    batch_size=args.batch_size,
-                    build_patch_prompt_fn=build_patch_prompt,
-                    skip_first_token_casing_preservation_flags=retry_skip_flags,
-                    active_step_keys=active_step_keys,
-                    max_input_chars_per_call=retry_max_chars,
-                    concurrency=concurrency,
-                )
-                assert len(retry_payloads) == len(retry_remaining), (
-                    f"Retry alignment error: expected {len(retry_remaining)} payloads, got {len(retry_payloads)}"
-                )
+                # Separate items into: partial-segment retries vs full retries.
+                partial_items: list[tuple[int, list[tuple[bool, str]], int, str, bool]] = []
+                full_retry_items: list[tuple[int, str, str, str | None, bool]] = []
 
-                # Collect successful retries and patch output file.
-                patched_lines: dict[int, str] = {}  # global_idx -> corrected text
-                still_failed: list[tuple[int, str, str, str | None, bool]] = []
-                for item, payload in zip(retry_remaining, retry_payloads, strict=True):
+                for item in retry_remaining:
                     global_idx = item[0]
-                    if payload is not None:
-                        ct = payload.get("corrected_text", "")
-                        if isinstance(ct, str) and ct.strip():
-                            if args.apply_safe_edits:
-                                original = item[2]
-                                if isinstance(original, str) and original.strip():
-                                    merged, _ = postprocess_apply_safe_edits(original, ct)
-                                    ct = merged
-                            patched_lines[global_idx] = ct
+                    if global_idx < len(current_output):
+                        last_col = _extract_last_column(current_output[global_idx])
+                        decoded = decode_partial_segments(last_col)
+                        if decoded is not None:
+                            seg_limit, seg_parts = decoded
+                            partial_items.append((global_idx, seg_parts, seg_limit, item[2], item[4]))
+                            continue
+                    full_retry_items.append(item)
+
+                patched_lines: dict[int, str] = {}
+                still_failed: list[tuple[int, str, str, str | None, bool]] = []
+
+                # --- Handle partial-segment retries ---
+                if partial_items:
+                    # Collect only the failed segments from all partial items.
+                    # Track: (partial_item_index, segment_index, source_text)
+                    failed_seg_texts: list[str] = []
+                    failed_seg_map: list[tuple[int, int]] = []  # (partial_idx, seg_idx)
+                    for pi, (global_idx, seg_parts, seg_limit, orig_text, skip_flag) in enumerate(partial_items):
+                        for si, (ok, text) in enumerate(seg_parts):
+                            if not ok:
+                                failed_seg_texts.append(text)
+                                failed_seg_map.append((pi, si))
+
+                    if failed_seg_texts:
+                        print(f"  Retrying {len(failed_seg_texts)} failed segments from {len(partial_items)} partial items...")
+                        seg_skip_flags = [False] * len(failed_seg_texts)
+                        seg_payloads = await run_batch_pipeline(
+                            client=client,
+                            deployment=batch_deployment,
+                            transcriptions=failed_seg_texts,
+                            prompt_template=prompt_template,
+                            chain_steps=chain_steps,
+                            locale=args.locale,
+                            schema=PATCH_SCHEMA,
+                            temperature=pass_temperature,
+                            top_p=top_p,
+                            batch_size=args.batch_size,
+                            build_patch_prompt_fn=build_patch_prompt,
+                            skip_first_token_casing_preservation_flags=seg_skip_flags,
+                            active_step_keys=active_step_keys,
+                            max_input_chars_per_call=retry_max_chars,
+                            concurrency=concurrency,
+                            use_realtime=args.batch_use_realtime,
+                        )
+
+                        # Apply retry results back into partial items.
+                        for (pi, si), payload in zip(failed_seg_map, seg_payloads):
+                            if payload is not None:
+                                ct = payload.get("corrected_text", "")
+                                if isinstance(ct, str) and ct.strip():
+                                    partial_items[pi][1][si] = (True, ct)
+
+                    # Check which partial items are now fully resolved.
+                    for global_idx, seg_parts, seg_limit, orig_text, skip_flag in partial_items:
+                        still_has_failures = any(not ok for ok, _ in seg_parts)
+                        if not still_has_failures:
+                            # All segments now succeeded — merge.
+                            merged_text = join_segment_text_parts([text for _, text in seg_parts])
+                            if args.apply_safe_edits and isinstance(orig_text, str) and orig_text.strip():
+                                merged_text, _ = postprocess_apply_safe_edits(orig_text, merged_text)
+                            patched_lines[global_idx] = merged_text
+                        else:
+                            # Still has failures — re-encode partial marker.
+                            new_marker = encode_partial_segments(seg_parts, seg_limit)
+                            patched_lines[global_idx] = new_marker
+                            # Keep in retry list for next pass.
+                            still_failed.append((global_idx, orig_text, orig_text, None, skip_flag))
+
+                # --- Handle full retries (non-segmented failed items) ---
+                if full_retry_items:
+                    retry_texts = [item[1] for item in full_retry_items]
+                    retry_skip_flags = [item[4] for item in full_retry_items]
+
+                    retry_payloads = await run_batch_pipeline(
+                        client=client,
+                        deployment=batch_deployment,
+                        transcriptions=retry_texts,
+                        prompt_template=prompt_template,
+                        chain_steps=chain_steps,
+                        locale=args.locale,
+                        schema=PATCH_SCHEMA,
+                        temperature=pass_temperature,
+                        top_p=top_p,
+                        batch_size=args.batch_size,
+                        build_patch_prompt_fn=build_patch_prompt,
+                        skip_first_token_casing_preservation_flags=retry_skip_flags,
+                        active_step_keys=active_step_keys,
+                        max_input_chars_per_call=retry_max_chars,
+                        concurrency=concurrency,
+                        use_realtime=args.batch_use_realtime,
+                    )
+
+                    for item, payload in zip(full_retry_items, retry_payloads, strict=True):
+                        global_idx = item[0]
+                        if payload is not None:
+                            ct = payload.get("corrected_text", "")
+                            if isinstance(ct, str) and is_partial_segments_marker(ct):
+                                # New partial result from retry — write marker.
+                                patched_lines[global_idx] = ct
+                                still_failed.append(item)
+                            elif isinstance(ct, str) and ct.strip():
+                                if args.apply_safe_edits:
+                                    original = item[2]
+                                    if isinstance(original, str) and original.strip():
+                                        merged, _ = postprocess_apply_safe_edits(original, ct)
+                                        ct = merged
+                                patched_lines[global_idx] = ct
+                            else:
+                                still_failed.append(item)
                         else:
                             still_failed.append(item)
-                    else:
-                        still_failed.append(item)
 
+                # --- Write patched lines to output file ---
                 if patched_lines:
-                    raw = out_text_path.read_text(encoding="utf-8")
-                    output_lines = raw.split("\n")
-                    if output_lines and output_lines[-1] == "":
-                        output_lines.pop()
+                    output_lines = _read_output_lines()
                     for global_idx, ct in patched_lines.items():
                         if global_idx < len(output_lines):
+                            # Partial markers must be written verbatim (contain JSON).
+                            sanitized_ct = ct if is_partial_segments_marker(ct) else sanitize_output_string(ct)
                             line = output_lines[global_idx]
                             if "\t" in line:
-                                # Replace only the last column (transcription),
-                                # preserving all leading columns.
                                 prefix, _old_text = line.rsplit("\t", 1)
-                                output_lines[global_idx] = f"{prefix}\t{sanitize_output_string(ct)}"
+                                output_lines[global_idx] = f"{prefix}\t{sanitized_ct}"
                             else:
-                                output_lines[global_idx] = sanitize_output_string(ct)
+                                output_lines[global_idx] = sanitized_ct
                     out_text_path.write_text("\n".join(output_lines) + "\n", encoding="utf-8")
-                    print(f"  Patched {len(patched_lines):,} lines in output file.")
+                    resolved_count = sum(1 for ct in patched_lines.values() if not is_partial_segments_marker(ct))
+                    print(f"  Patched {len(patched_lines):,} lines ({resolved_count:,} fully resolved).")
 
                 retry_remaining = still_failed
 
             if retry_remaining:
-                print(f"\n{len(retry_remaining):,} items still failed after {batch_max_retries} retry pass(es).")
+                # Final pass: resolve remaining partial markers to merged text
+                # with original text for still-failed segments.
+                final_output = _read_output_lines()
+                final_patches: dict[int, str] = {}
+                for item in retry_remaining:
+                    global_idx = item[0]
+                    if global_idx < len(final_output):
+                        last_col = _extract_last_column(final_output[global_idx])
+                        decoded = decode_partial_segments(last_col)
+                        if decoded is not None:
+                            _, seg_parts = decoded
+                            merged = join_segment_text_parts([text for _, text in seg_parts])
+                            final_patches[global_idx] = merged
+                if final_patches:
+                    for global_idx, ct in final_patches.items():
+                        if global_idx < len(final_output):
+                            line = final_output[global_idx]
+                            if "\t" in line:
+                                prefix, _ = line.rsplit("\t", 1)
+                                final_output[global_idx] = f"{prefix}\t{sanitize_output_string(ct)}"
+                            else:
+                                final_output[global_idx] = sanitize_output_string(ct)
+                    out_text_path.write_text("\n".join(final_output) + "\n", encoding="utf-8")
+                    print(f"  Resolved {len(final_patches):,} remaining partial markers to merged text.")
+                print(f"\n{len(retry_remaining):,} items still had partial failures after {batch_max_retries} retry pass(es).")
         elif all_failed_items:
             print(f"\n{len(all_failed_items):,} items failed (retries disabled).")
 
@@ -560,7 +946,7 @@ async def main() -> None:
     resume_progress_write_every = base_progress_write_every
     output_jsonl_path = (
         None
-        if skip_jsonl_output
+        if not output_jsonl
         else prepare_jsonl_output_path(output_file_value, resume_mode=resume_from_output)
     )
     streamed_jsonl_slots: set[int] = set()
