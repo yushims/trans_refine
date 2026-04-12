@@ -230,6 +230,13 @@ async def main() -> None:
         api_version=api_version,
     )
 
+    # Metadata attached to each batch job for identification.
+    _input_basename = os.path.basename(args.input_file) if args.input_file else ""
+    batch_metadata = {
+        "user": os.environ.get("USERNAME") or os.environ.get("USER") or "unknown",
+        "input_file": _input_basename,
+    }
+
     # -----------------------------------------------------------------------
     #  Chunked batch mode (large files)
     # -----------------------------------------------------------------------
@@ -493,6 +500,7 @@ async def main() -> None:
                 concurrency=concurrency,
                 pre_resolved_indices=pre_resolved,
                 use_realtime=args.batch_use_realtime,
+                batch_metadata=batch_metadata,
             )
             total_batch_len = chunk_len + len(chunk_carryover)
             assert len(chunk_payloads) == total_batch_len, (
@@ -563,6 +571,7 @@ async def main() -> None:
                     max_input_chars_per_call=retry_max_chars,
                     concurrency=concurrency,
                     use_realtime=args.batch_use_realtime,
+                    batch_metadata=batch_metadata,
                 )
 
                 resolved_count = 0
@@ -809,6 +818,7 @@ async def main() -> None:
                             max_input_chars_per_call=retry_max_chars,
                             concurrency=concurrency,
                             use_realtime=args.batch_use_realtime,
+                            batch_metadata=batch_metadata,
                         )
 
                         # Apply retry results back into partial items.
@@ -856,6 +866,7 @@ async def main() -> None:
                         max_input_chars_per_call=retry_max_chars,
                         concurrency=concurrency,
                         use_realtime=args.batch_use_realtime,
+                        batch_metadata=batch_metadata,
                     )
 
                     for item, payload in zip(full_retry_items, retry_payloads, strict=True):
