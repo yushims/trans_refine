@@ -50,15 +50,19 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="List and cancel active Azure OpenAI batch jobs.")
     parser.add_argument("--endpoint", default=DEFAULT_AOAI_ENDPOINT)
     parser.add_argument("--api-version", default=DEFAULT_AOAI_API_VERSION)
-    parser.add_argument("--dry-run", action="store_true", help="List active jobs without cancelling.")
+    parser.add_argument("--cancel", action="store_true", help="Actually cancel matched active jobs. Without this flag, only lists jobs (dry run).")
     parser.add_argument("--all", action="store_true", help="Show all batch jobs, not just active ones.")
     parser.add_argument("--user", dest="user_filter", help="Only match jobs whose metadata user contains this substring.")
     parser.add_argument("--input", dest="input_filter", help="Only match jobs whose metadata input_file contains this substring.")
     parser.add_argument("--status", dest="status_filter", help="Only match jobs with this status (e.g. cancelling, validating, in_progress).")
+    parser.add_argument("--days", dest="days", type=float, default=None, help="Only match jobs created within the last N days (e.g. 1, 0.5, 7).")
     args = parser.parse_args()
 
     load_dotenv()
     client = AzureOpenAI(azure_endpoint=args.endpoint, api_version=args.api_version)
+
+    import time
+    cutoff_ts = (time.time() - args.days * 86400) if args.days is not None else None
 
     if args.status_filter:
         target_statuses = {args.status_filter.lower()}
@@ -69,6 +73,8 @@ def main() -> None:
     matched = []
     for batch in client.batches.list():
         if batch.status not in target_statuses:
+            continue
+        if cutoff_ts is not None and batch.created_at and batch.created_at < cutoff_ts:
             continue
         meta = batch.metadata if isinstance(batch.metadata, dict) else {}
         if args.input_filter:
@@ -100,13 +106,11 @@ def main() -> None:
         for b in batches:
             _print_batch(b)
             print()
-        print()
 
     print(f"Found {len(matched)} {label} batch job(s).")
+    print()
 
-    if args.dry_run or args.all:
-        if args.dry_run:
-            print("Dry run — no jobs cancelled.")
+    if not args.cancel or args.all:
         return
 
     active = [b for b in matched if b.status in ACTIVE_STATUSES]
