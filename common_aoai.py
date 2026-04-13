@@ -199,10 +199,6 @@ async def get_patch_payload_with_repair(
                 0.0,
                 min(1.0, top_p + random.uniform(-retry_top_p_jitter, retry_top_p_jitter)),
             )
-            # print(
-            #     f"[{processing_id}] Retry decode jitter applied: temperature={attempt_temperature:.3f}, "
-            #     f"top_p={attempt_top_p:.3f}"
-            # )
         attempt_temperatures.append(attempt_temperature)
         attempt_top_ps.append(attempt_top_p)
 
@@ -257,7 +253,6 @@ async def get_patch_payload_with_repair(
 
 BATCH_DEFAULT_SIZE = 10000  # 1000: ~2-5MB, 5000: ~10-25 MB, 10000: ~20-50 MB, 20000: ~40-100 MB, 50000: 100+ MB
 BATCH_POLL_INTERVAL_SECONDS = 30   # poll API every 30 seconds
-BATCH_STATUS_PRINT_INTERVAL = 1800  # print status every 30 minutes (even if unchanged)
 
 
 def _call_with_retry(func, *args, retries: int = 5, **kwargs):
@@ -367,10 +362,6 @@ async def run_batch_pipeline(
                     batch_entries.append((custom_key, idx, seg_text, prev_ctx, next_ctx))
                     seg_keys.append((custom_key, seg_text))
                 segment_groups[idx] = seg_keys
-                print(
-                    f"  [{idx + 1}/{total}] Segmented into {len(segments)} parts "
-                    f"(limit={segment_limit}, input={len(transcription)} chars)"
-                )
                 continue
 
         # Single item (no segmentation).
@@ -610,7 +601,6 @@ async def _submit_batch_and_wait_keyed(
             fh.write("\n".join(jsonl_lines))
             tmp_path = fh.name
 
-        print(f"[batch{batch_label}] Uploading {len(jsonl_lines)} requests \u2026")
         with open(tmp_path, "rb") as upload_fh:
             batch_file = _call_with_retry(
                 client.files.create, file=upload_fh, purpose="batch",
@@ -628,10 +618,9 @@ async def _submit_batch_and_wait_keyed(
             client.batches.create,
             **create_kwargs,
         )
-        print(f"[batch{batch_label}] Submitted job {batch_job.id}")
+        print(f"[batch{batch_label}] Submitted job {batch_job.id} with {len(jsonl_lines)} requests.")
 
         prev_status: str | None = None
-        last_print_time: float = 0.0
         while True:
             # Check for shutdown request.
             if _shutdown_event is not None and _shutdown_event.is_set():
@@ -645,12 +634,9 @@ async def _submit_batch_and_wait_keyed(
             status = await asyncio.to_thread(
                 _call_with_retry, client.batches.retrieve, batch_job.id,
             )
-            now = time.monotonic()
             changed = status.status != prev_status
-            elapsed = now - last_print_time
-            if changed or elapsed >= BATCH_STATUS_PRINT_INTERVAL:
+            if changed:
                 print(f"[batch{batch_label}] Status: {status.status}")
-                last_print_time = now
             prev_status = status.status
             if status.status in ("completed", "failed", "cancelled", "expired"):
                 break
