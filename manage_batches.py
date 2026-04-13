@@ -55,11 +55,29 @@ def main() -> None:
     parser.add_argument("--user", dest="user_filter", help="Only match jobs whose metadata user contains this substring.")
     parser.add_argument("--input", dest="input_filter", help="Only match jobs whose metadata input_file contains this substring.")
     parser.add_argument("--status", dest="status_filter", help="Only match jobs with this status (e.g. cancelling, validating, in_progress).")
+    parser.add_argument("--id", dest="batch_id", help="Cancel a specific batch job by ID.")
     parser.add_argument("--days", dest="days", type=float, default=None, help="Only match jobs created within the last N days (e.g. 1, 0.5, 7).")
     args = parser.parse_args()
 
     load_dotenv()
     client = AzureOpenAI(azure_endpoint=args.endpoint, api_version=args.api_version)
+
+    # Cancel a specific batch by ID.
+    if args.batch_id:
+        try:
+            b = client.batches.retrieve(args.batch_id)
+            _print_batch(b)
+            if not args.cancel:
+                print("\nUse --cancel to actually cancel this job.")
+                return
+            if b.status in ACTIVE_STATUSES:
+                client.batches.cancel(args.batch_id)
+                print(f"\nCancelled {args.batch_id}")
+            else:
+                print(f"\nJob is already {b.status}, cannot cancel.")
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+        return
 
     import time
     cutoff_ts = (time.time() - args.days * 86400) if args.days is not None else None
