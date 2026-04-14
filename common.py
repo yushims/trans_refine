@@ -473,6 +473,14 @@ _CHAR_BASED_NO_SPACE_GROUPS = {
     "myanmar",
 }
 
+# CJK numeral characters — converting these to Arabic digits (e.g. 二零二零 → 2020)
+# is a valid numeral normalization edit, not a long-span deletion.
+_CJK_NUMERAL_CHARS = frozenset(
+    "零一二三四五六七八九十百千万亿兆"  # Simplified
+    "壹贰叁肆伍陆柒捌玖拾佰仟萬億"    # Formal/traditional
+    "〇"                               # Ideographic zero
+)
+
 
 def _is_hangul_char(char: str) -> bool:
     if not isinstance(char, str) or len(char) != 1:
@@ -1318,6 +1326,63 @@ def _no_space_script_char_stream(text: str) -> list[str]:
     return chars
 
 
+def _no_space_script_char_positions(text: str) -> list[tuple[str, int]]:
+    """Like _no_space_script_char_stream but also returns each char's position in *text*."""
+    if not isinstance(text, str) or not text:
+        return []
+
+    items: list[tuple[str, int]] = []
+    for i, char in enumerate(text):
+        if char.isspace():
+            continue
+        if unicodedata.category(char).startswith(("P", "S")):
+            continue
+        if _char_based_script_group(char) in _CHAR_BASED_NO_SPACE_GROUPS:
+            items.append((char, i))
+
+    return items
+
+
+def _deleted_span_replaced_by_digits(
+    source_text: str,
+    corrected_text: str,
+    src_start: int,
+    src_end: int,
+) -> bool:
+    """Check if the source region [src_start:src_end] was replaced by digits in corrected_text.
+
+    Uses a full-text SequenceMatcher on the local region (with some context)
+    to see if the source chars were substituted by digit characters.
+    """
+    # Expand context window around the deleted span for the diff.
+    ctx = 30
+    s_lo = max(0, src_start - ctx)
+    s_hi = min(len(source_text), src_end + ctx)
+    src_window = source_text[s_lo:s_hi]
+
+    # Corresponding corrected window: approximate by same offsets, clamped.
+    c_lo = max(0, src_start - ctx)
+    c_hi = min(len(corrected_text), src_end + ctx)
+    cor_window = corrected_text[c_lo:c_hi]
+
+    if not cor_window:
+        return False
+
+    sm = difflib.SequenceMatcher(a=src_window, b=cor_window, autojunk=False)
+    for tag, _i1, _i2, j1, j2 in sm.get_opcodes():
+        if tag != "replace":
+            continue
+        inserted = cor_window[j1:j2]
+        # If the replacement consists mainly of digits (allow some punctuation
+        # like commas, periods for formatted numbers, % for percentages),
+        # treat as numeral conversion.
+        non_digit_non_punct = [c for c in inserted if not c.isdigit() and c not in ".,، %"]
+        if len(non_digit_non_punct) == 0 and any(c.isdigit() for c in inserted):
+            return True
+
+    return False
+
+
 def validate_no_long_span_removed_no_space_scripts(
     corrected_text: str,
     source_text: str,
@@ -1326,8 +1391,9 @@ def validate_no_long_span_removed_no_space_scripts(
     if not isinstance(corrected_text, str) or not isinstance(source_text, str):
         return True, ""
 
-    source_chars = _no_space_script_char_stream(source_text)
+    source_items = _no_space_script_char_positions(source_text)
     corrected_chars = _no_space_script_char_stream(corrected_text)
+    source_chars = [c for c, _ in source_items]
     if not source_chars:
         return True, ""
 
@@ -1335,11 +1401,24 @@ def validate_no_long_span_removed_no_space_scripts(
 
     matcher = difflib.SequenceMatcher(a=source_chars, b=corrected_chars, autojunk=False)
     for tag, i1, i2, _j1, _j2 in matcher.get_opcodes():
-        if tag != "delete":
+        if tag not in ("delete", "replace"):
             continue
 
         deleted_chars = source_chars[i1:i2]
         if len(deleted_chars) < min_deleted_no_space_chars:
+            continue
+
+        # Skip if deleted span is entirely CJK numeral characters — likely
+        # converted to Arabic digits (e.g. 二零二零 → 2020).
+        if all(c in _CJK_NUMERAL_CHARS for c in deleted_chars):
+            continue
+
+        # General numeral conversion check: if the deleted no-space chars
+        # were replaced by digits in the full text, it's numeral conversion
+        # (e.g. Thai สามร้อย→300, Korean 이천이십→2020, script digits ๒๐๒๐→2020).
+        src_start = source_items[i1][1]
+        src_end = source_items[i2 - 1][1] + 1
+        if _deleted_span_replaced_by_digits(source_text, corrected_text, src_start, src_end):
             continue
 
         snippet = "".join(deleted_chars[:20])
@@ -1909,11 +1988,45 @@ def strip_markdown_code_fence(text: str) -> str:
     return trimmed
 
 
+# Regex for \u escapes with 5+ hex digits — these are invalid JSON and
+# indicate the model zero-padded a codepoint (e.g. \u000159 for U+0159 ř).
+_MALFORMED_UESCAPE_RE = re.compile(r"\\u([0-9a-fA-F]{5,})")
+
+
+def fix_malformed_unicode_escapes(json_str: str) -> str:
+    r"""Normalize \u escapes with 5+ hex digits to valid 4-digit \uXXXX.
+
+    Only touches sequences that are already invalid JSON (5+ hex digits).
+    Valid 4-digit \uXXXX sequences are left untouched so json.loads() can
+    decode them normally.
+
+    The model often zero-pads codepoints (e.g. \u000159 for U+0159 ř).
+    When trailing hex chars are actually literal text (e.g. \u000159e = ř + "e"),
+    we find the shortest prefix that yields a printable BMP character.
+
+    >>> fix_malformed_unicode_escapes(r'"p\u000159\u0000edli\u000161"')
+    '"p\\u0159\\u00edli\\u0161"'
+    >>> fix_malformed_unicode_escapes(r'"\u000159edn\u0000edc"')
+    '"\\u0159edn\\u00edc"'
+    """
+    def _normalize(m: re.Match) -> str:
+        hex_digits = m.group(1)
+        for n in range(4, len(hex_digits) + 1):
+            cp = int(hex_digits[:n], 16)
+            if cp >= 0x20 and cp <= 0xFFFF and not (0xD800 <= cp <= 0xDFFF):
+                remaining = hex_digits[n:]
+                return f"\\u{cp:04x}" + remaining
+        return m.group(0)
+
+    return _MALFORMED_UESCAPE_RE.sub(_normalize, json_str)
+
+
 def parse_and_validate_json(content: str) -> tuple[dict | None, str | None]:
     trimmed = strip_markdown_code_fence(content)
 
     extracted = extract_first_json_object(trimmed)
     candidate = extracted if extracted is not None else trimmed
+    candidate = fix_malformed_unicode_escapes(candidate)
 
     try:
         payload = json.loads(candidate)
@@ -2883,6 +2996,11 @@ def insert_spaces_at_script_boundaries(text: str) -> tuple[str, bool]:
     Digit ↔ Latin boundaries are intentionally skipped (e.g. "abc123def"
     stays as-is) because they frequently appear in natural text like
     "3km", "mp3", "V2" where no space is expected.
+
+    Limitation: does not insert spaces between two different non-Latin
+    scripts (e.g. Cyrillic↔CJK "мир你好" stays as-is). All non-Latin
+    scripts are treated as a single "nonlatin" category. This is rarely
+    an issue in ASR data.
 
     Punctuation, symbols, and decimal points reset the boundary tracker
     so no spaces are inserted around them.
