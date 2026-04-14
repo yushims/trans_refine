@@ -384,10 +384,12 @@ async def run_batch_pipeline(
                 "model": deployment,
                 "messages": [{"role": "user", "content": prompt}],
                 "response_format": {
-                    "type": "json_object",
+                    "type": "json_schema",
+                    "json_schema": schema,
                 },
                 "temperature": temperature,
                 "top_p": top_p,
+                "max_tokens": 16384,
             },
         }
         all_jsonl_lines.append(json.dumps(request, ensure_ascii=False))
@@ -445,7 +447,7 @@ async def run_batch_pipeline(
         )
 
         # Submit partitions with controlled concurrency.
-        semaphore = asyncio.Semaphore(max(1, concurrency, num_partitions))
+        semaphore = asyncio.Semaphore(max(1, concurrency))
         results_lock = asyncio.Lock()
 
         async def _submit_partition(part_num: int, start: int) -> None:
@@ -491,6 +493,10 @@ async def run_batch_pipeline(
                 print(f"  [{orig_idx + 1}/{total}] Empty corrected_text; skipping.")
         else:
             print(f"  [{orig_idx + 1}/{total}] Validation failed: {validation_error}")
+            if "Unterminated string" in (validation_error or "") or "parse error" in (validation_error or "").lower():
+                print(f"  [{orig_idx + 1}/{total}] Raw content length: {len(raw_content or '')}")
+                print(f"  [{orig_idx + 1}/{total}] Raw content head: {(raw_content or '')[:300]}")
+                print(f"  [{orig_idx + 1}/{total}] Raw content tail: ...{(raw_content or '')[-80:]}")
 
     # Process segmented items: parse each segment, then merge.
     # If all segments succeed, merge normally.
@@ -667,6 +673,8 @@ async def _submit_batch_and_wait_keyed(
         )
 
         results: dict[str, str] = {}
+        skipped_status = 0
+        skipped_length = 0
         for line in result_text.strip().split("\n"):
             if not line:
                 continue
@@ -674,10 +682,27 @@ async def _submit_batch_and_wait_keyed(
             custom_id = row["custom_id"]
             key = custom_id.split("idx-", 1)[1] if "idx-" in custom_id else custom_id
             try:
-                content = row["response"]["body"]["choices"][0]["message"]["content"]
+                resp = row.get("response", {})
+                status_code = resp.get("status_code", 200)
+                if status_code != 200:
+                    error_msg = resp.get("body", {}).get("error", {}).get("message", "unknown")
+                    print(f"[batch{batch_label}] Skipping {key}: HTTP {status_code} — {error_msg[:120]}")
+                    skipped_status += 1
+                    continue
+                choice = resp["body"]["choices"][0]
+                finish_reason = choice.get("finish_reason", "")
+                if finish_reason == "length":
+                    skipped_length += 1
+                    continue
+                content = choice["message"]["content"]
                 results[key] = unicodedata.normalize("NFC", content)
             except (KeyError, IndexError, TypeError) as exc:
                 print(f"[batch{batch_label}] Could not extract content for {key}: {exc}")
+        if skipped_status or skipped_length:
+            print(
+                f"[batch{batch_label}] Skipped: {skipped_status} HTTP errors, "
+                f"{skipped_length} truncated (finish_reason=length)"
+            )
         return results
 
     finally:

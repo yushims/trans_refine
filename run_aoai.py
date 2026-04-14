@@ -7,6 +7,7 @@ from openai import AzureOpenAI
 from dotenv import load_dotenv
 from common import (
     DEFAULT_AOAI_API_VERSION,
+    DEFAULT_AOAI_BATCH_DEPLOYMENT,
     DEFAULT_AOAI_DEPLOYMENT,
     DEFAULT_AOAI_ENDPOINT,
     add_aoai_sampling_cli_arguments,
@@ -81,6 +82,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=2,
         help="Maximum retry passes for failed items after all chunks complete (default: 2, 0 disables retries).",
+    )
+    parser.add_argument(
+        "--batch-deployment",
+        dest="batch_deployment",
+        default=DEFAULT_AOAI_BATCH_DEPLOYMENT,
+        help=f"Deployment name for batch API calls (default: {DEFAULT_AOAI_BATCH_DEPLOYMENT}).",
     )
     parser.add_argument(
         "--batch-use-realtime",
@@ -241,10 +248,10 @@ async def main() -> None:
     #  Chunked batch mode (large files)
     # -----------------------------------------------------------------------
     if use_chunked:
-        from common import DEFAULT_AOAI_BATCH_DEPLOYMENT, sanitize_output_string
+        from common import sanitize_output_string
         import csv as _csv
         # Use regular deployment for realtime calls; batch SKU doesn't support chat completions.
-        batch_deployment = args.deployment if args.batch_use_realtime else DEFAULT_AOAI_BATCH_DEPLOYMENT
+        batch_deployment = args.deployment if args.batch_use_realtime else args.batch_deployment
         # batch_size = number of segments (API requests) per partition upload.
         # chunk_size = target estimated segments per iteration before submitting.
         # iter_transcription_chunks accumulates lines until their estimated
@@ -530,6 +537,71 @@ async def main() -> None:
             # Include resumed partial-segment items in retry (they were in pre_resolved
             # but now have partial payloads injected above).
             resumed_partial_set = set(resumed_partial_indices)
+
+            # Helper: build output lines from current chunk_payloads and write to file.
+            def _write_chunk_snapshot(label: str = "") -> list[str]:
+                nonlocal first_write, total_written
+                snap_output_lines: list[str] = []
+                for i in range(chunk_len):
+                    payload = chunk_payloads[i]
+                    t = chunk_transcriptions[i]
+                    if payload is None:
+                        if is_input_comment_line(t):
+                            snap_output_lines.append(t)
+                        elif resume_lines is not None:
+                            ri = global_offset + i
+                            snap_output_lines.append(resume_lines[ri] if ri < len(resume_lines) else "")
+                        else:
+                            snap_output_lines.append("")
+                    else:
+                        ct = payload.get("corrected_text")
+                        if isinstance(ct, str) and is_partial_segments_marker(ct):
+                            snap_output_lines.append(ct)
+                        elif isinstance(ct, str) and ct.strip():
+                            if args.apply_safe_edits:
+                                original = chunk_transcriptions[i]
+                                if isinstance(original, str) and original.strip():
+                                    merged, _ = postprocess_apply_safe_edits(original, ct)
+                                    ct = merged
+                            snap_output_lines.append(ct)
+                        else:
+                            snap_output_lines.append("")
+                if out_text_path:
+                    out_lines = [
+                        _build_output_line(
+                            text,
+                            chunk_source_rows[i] if i < len(chunk_source_rows) else None,
+                            chunk_filenames[i] if i < len(chunk_filenames) else None,
+                        )
+                        for i, text in enumerate(snap_output_lines)
+                    ]
+                    content = "\n".join(out_lines) + "\n"
+                    if first_write:
+                        out_text_path.write_text(content, encoding="utf-8")
+                        first_write = False
+                    else:
+                        # Re-read file, drop last chunk_len lines if already written, re-append.
+                        if label:
+                            # Overwrite the last chunk's lines in-place.
+                            existing = out_text_path.read_text(encoding="utf-8")
+                            existing_lines = existing.split("\n")
+                            if existing_lines and existing_lines[-1] == "":
+                                existing_lines.pop()
+                            # Remove previously written chunk lines.
+                            prefix_lines = existing_lines[:len(existing_lines) - chunk_len]
+                            new_content = "\n".join(prefix_lines + out_lines) + "\n"
+                            out_text_path.write_text(new_content, encoding="utf-8")
+                        else:
+                            with out_text_path.open("a", encoding="utf-8") as fh:
+                                fh.write(content)
+                    if label:
+                        non_empty = sum(1 for l in snap_output_lines if l.strip() and not is_partial_segments_marker(l))
+                        print(f"  Snapshot after {label}: {non_empty}/{chunk_len} resolved lines written.")
+                return snap_output_lines
+
+            # Write initial snapshot before retries so results are persisted.
+            _write_chunk_snapshot()
+
             for chunk_retry in range(1, chunk_max_retries + 1):
                 # Collect chunk-local failed indices (including carry-over at end).
                 chunk_failed_indices: list[int] = []
@@ -585,9 +657,13 @@ async def main() -> None:
                             # Updated partial marker — keep for next retry pass.
                             chunk_payloads[fi] = rp
                 print(f"  Chunk retry {chunk_retry}: resolved {resolved_count}/{len(chunk_failed_indices)}")
+                # Write snapshot after each retry so results are persisted.
+                _write_chunk_snapshot(label=f"retry {chunk_retry}")
                 if resolved_count == 0:
                     break  # No progress — stop retrying this chunk.
 
+            # Build final chunk output lines (already written by _write_chunk_snapshot)
+            # and collect failed items for end-of-run retry.
             chunk_output_lines: list[str] = []
             for i in range(chunk_len):
                 payload = chunk_payloads[i]
@@ -608,13 +684,11 @@ async def main() -> None:
                 else:
                     ct = payload.get("corrected_text")
                     if isinstance(ct, str) and is_partial_segments_marker(ct):
-                        # Partial segment results — write marker as-is for retry.
                         chunk_output_lines.append(ct)
                         if (i not in pre_resolved or i in resumed_partial_set) and not is_input_comment_line(t):
                             fn = chunk_filenames[i] if chunk_filenames and i < len(chunk_filenames) else None
                             all_failed_items.append((global_offset + i, batch_texts[i], t, fn, skip_flags[i]))
                     elif isinstance(ct, str) and ct.strip():
-                        # Post-processing: character-level diff merge to reject content changes.
                         if args.apply_safe_edits:
                             original = chunk_transcriptions[i]
                             if isinstance(original, str) and original.strip():
@@ -622,33 +696,13 @@ async def main() -> None:
                                 ct = merged
                         chunk_output_lines.append(ct)
                     else:
-                        # Payload present but corrected_text empty — treat as failed.
                         chunk_output_lines.append("")
                         if (i not in pre_resolved or i in resumed_partial_set) and not is_input_comment_line(t):
                             fn = chunk_filenames[i] if chunk_filenames and i < len(chunk_filenames) else None
                             all_failed_items.append((global_offset + i, batch_texts[i], t, fn, skip_flags[i]))
 
-            # Write chunk results to output file.
-            assert len(chunk_output_lines) == chunk_len, (
-                f"Output alignment error: expected {chunk_len} lines, got {len(chunk_output_lines)}"
-            )
-            if out_text_path:
-                out_lines = [
-                    _build_output_line(
-                        text,
-                        chunk_source_rows[i] if i < len(chunk_source_rows) else None,
-                        chunk_filenames[i] if i < len(chunk_filenames) else None,
-                    )
-                    for i, text in enumerate(chunk_output_lines)
-                ]
-                content = "\n".join(out_lines) + "\n"
-
-                if first_write:
-                    out_text_path.write_text(content, encoding="utf-8")
-                    first_write = False
-                else:
-                    with out_text_path.open("a", encoding="utf-8") as fh:
-                        fh.write(content)
+            # Final snapshot write (ensures last retry state is persisted).
+            _write_chunk_snapshot(label="final" if chunk_max_retries > 0 else "")
 
             # Write JSONL records for this chunk.
             if out_jsonl_path:
