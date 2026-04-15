@@ -280,6 +280,24 @@ async def run_judge(args: argparse.Namespace) -> None:
     verdicts: dict[str, str] = {}
     failed_batches = 0
 
+    # Resume: load existing verdicts if output file already exists.
+    output_path = resolve_path(args.output)
+    if output_path.exists():
+        try:
+            existing = json.loads(output_path.read_text(encoding="utf-8"))
+            for k, v in existing.get("verdicts", {}).items():
+                if isinstance(v, str) and v != "UNRESOLVED":
+                    verdicts[k] = v
+            print(f"  Resumed {len(verdicts)} existing verdicts from {output_path.name}")
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+    remaining = [p for p in patterns if p["key"] not in verdicts]
+    if not remaining:
+        print("All patterns already judged. Nothing to do.")
+    else:
+        print(f"  {len(remaining)} patterns remaining to judge...")
+
     async def judge_batch(
         batch_patterns: list[dict], batch_idx: int
     ) -> None:
@@ -316,15 +334,14 @@ async def run_judge(args: argparse.Namespace) -> None:
                         verdicts[p["key"]] = None
 
     batches: list[list[dict]] = []
-    for i in range(0, len(patterns), batch_size):
-        batches.append(patterns[i : i + batch_size])
+    for i in range(0, len(remaining), batch_size):
+        batches.append(remaining[i : i + batch_size])
 
     tasks = [judge_batch(batch, idx) for idx, batch in enumerate(batches)]
     await asyncio.gather(*tasks)
 
-    # Auto-retry unresolved.
     for retry_round in range(1, 4):
-        unresolved = [p for p in patterns if verdicts.get(p["key"]) is None]
+        unresolved = [p for p in remaining if verdicts.get(p["key"]) is None]
         if not unresolved:
             break
         print(f"\n  Auto-retry {retry_round}: {len(unresolved)} unresolved...")
