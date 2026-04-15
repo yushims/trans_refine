@@ -2723,7 +2723,7 @@ def merge_segment_payloads(
     merged_payload["corrected_text"] = join_segment_text_parts(merged_corrected_parts)
 
     if segment_sources:
-        merged_payload["source_text"] = "".join(segment_sources)
+        merged_payload["source_text"] = join_segment_text_parts(segment_sources)
 
     is_valid, _validation_error = validate_patch_payload(merged_payload)
     if not is_valid:
