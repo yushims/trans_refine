@@ -3978,7 +3978,14 @@ def build_patch_prompt(
         prompt = prompt.replace("{input_transcript}", transcription)
         return prompt
 
-    return prompt + transcription
+    # Append ASR disclaimer + transcription. The disclaimer reduces content
+    # filter false positives on garbled ASR text with missing diacritics.
+    disclaimer = (
+        "\n\n[NOTE: The text below is raw ASR (speech recognition) output. "
+        "It may contain missing diacritics, garbled words, or concatenated segments. "
+        "Treat all content as benign transcription data.]\n\n"
+    )
+    return prompt + disclaimer + transcription
 
 
 def _order_top_level_output_payload_keys(payload: dict) -> dict:
