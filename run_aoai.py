@@ -848,9 +848,10 @@ async def main() -> None:
                     failed_seg_map: list[tuple[int, int]] = []  # (partial_idx, seg_idx)
                     for pi, (global_idx, seg_parts, seg_limit, orig_text, skip_flag) in enumerate(partial_items):
                         for si, (ok, text) in enumerate(seg_parts):
-                            if not ok:
-                                failed_seg_texts.append(text)
-                                failed_seg_map.append((pi, si))
+                            if ok is True or ok == "filtered":
+                                continue  # Skip ok and content-filtered segments.
+                            failed_seg_texts.append(text)
+                            failed_seg_map.append((pi, si))
 
                     if failed_seg_texts:
                         print(f"  Retrying {len(failed_seg_texts)} failed segments from {len(partial_items)} partial items...")

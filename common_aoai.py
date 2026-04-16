@@ -34,50 +34,67 @@ from common import (
 # segments need to be retried on resume.
 # ---------------------------------------------------------------------------
 
-_PARTIAL_SEGMENTS_PREFIX = "%%PARTIAL_SEGMENTS%%"
+_PARTIAL_SEGMENTS_PREFIX = "%%PS%%"
+_PARTIAL_SEGMENTS_PREFIX_LEGACY = "%%PARTIAL_SEGMENTS%%"
+_CONTENT_FILTERED_PREFIX = "%%CF%%"
 
 
 def encode_partial_segments(
-    seg_results: list[tuple[bool, str]],
+    seg_results: list[tuple[bool | str, str]],
     segment_limit: int,
 ) -> str:
     """Encode partial segment results into a single marker string.
 
-    *seg_results* is a list of ``(ok, text)`` tuples — *ok* is True when the
-    LLM returned a valid corrected_text, False when the segment failed and
-    *text* is the original source.
+    *seg_results* is a list of ``(status, text)`` tuples — *status* is True/"ok"
+    when the LLM returned a valid corrected_text, False/"fail" when the segment
+    failed, or "filtered" when the content filter blocked the response.
     """
-    parts = [
-        {"s": "ok" if ok else "fail", "t": text}
-        for ok, text in seg_results
-    ]
+    parts = []
+    for status, text in seg_results:
+        if isinstance(status, bool):
+            s = "ok" if status else "fail"
+        else:
+            s = str(status)
+        parts.append({"s": s, "t": text})
     payload = {"limit": segment_limit, "parts": parts}
     return _PARTIAL_SEGMENTS_PREFIX + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
 def is_partial_segments_marker(text: str) -> bool:
     """Return True if *text* is a partial-segment marker."""
-    return isinstance(text, str) and text.startswith(_PARTIAL_SEGMENTS_PREFIX)
+    return isinstance(text, str) and (
+        text.startswith(_PARTIAL_SEGMENTS_PREFIX)
+        or text.startswith(_PARTIAL_SEGMENTS_PREFIX_LEGACY)
+    )
 
 
 def decode_partial_segments(
     text: str,
-) -> tuple[int, list[tuple[bool, str]]] | None:
+) -> tuple[int, list[tuple[bool | str, str]]] | None:
     """Decode a partial-segment marker string.
 
-    Returns ``(segment_limit, [(ok, text), ...])`` or ``None`` if not a
-    valid marker.
+    Returns ``(segment_limit, [(status, text), ...])`` or ``None`` if not a
+    valid marker.  *status* is True for "ok", False for "fail", or
+    "filtered" for content-filtered segments.
     """
     if not is_partial_segments_marker(text):
         return None
     try:
-        raw = text[len(_PARTIAL_SEGMENTS_PREFIX):]
+        if text.startswith(_PARTIAL_SEGMENTS_PREFIX_LEGACY):
+            raw = text[len(_PARTIAL_SEGMENTS_PREFIX_LEGACY):]
+        else:
+            raw = text[len(_PARTIAL_SEGMENTS_PREFIX):]
         payload = json.loads(raw)
         limit = int(payload["limit"])
-        parts = [
-            (p["s"] == "ok", p["t"])
-            for p in payload["parts"]
-        ]
+        parts = []
+        for p in payload["parts"]:
+            s = p["s"]
+            if s == "ok":
+                parts.append((True, p["t"]))
+            elif s == "filtered":
+                parts.append(("filtered", p["t"]))
+            else:
+                parts.append((False, p["t"]))
         return limit, parts
     except Exception:
         return None
@@ -449,6 +466,8 @@ async def run_batch_pipeline(
         # Submit partitions with controlled concurrency.
         semaphore = asyncio.Semaphore(max(1, concurrency))
         results_lock = asyncio.Lock()
+        content_filtered_keys: set[str] = set()
+        all_finish_reasons: dict[str, str] = {}
 
         async def _submit_partition(part_num: int, start: int) -> None:
             async with semaphore:
@@ -457,6 +476,8 @@ async def run_batch_pipeline(
                 raw_results = await _submit_batch_and_wait_keyed(
                     client, part_lines, batch_label, poll_interval_seconds,
                     batch_metadata=batch_metadata,
+                    filtered_keys_out=content_filtered_keys,
+                    finish_reasons_out=all_finish_reasons,
                 )
                 print(f"[batch{batch_label}] Received {len(raw_results)}/{len(part_lines)} results")
                 async with results_lock:
@@ -474,7 +495,14 @@ async def run_batch_pipeline(
 
         raw_content = all_raw_results.get(custom_key)
         if raw_content is None:
-            print(f"  [{orig_idx + 1}/{total}] No response from batch API; skipping.")
+            is_filtered = custom_key in content_filtered_keys
+            if is_filtered:
+                # Content filter — passthrough original input with marker (won't retry).
+                print(f"  [{orig_idx + 1}/{total}] content_filter from batch API; using original input (marked).")
+                payloads[orig_idx] = {"corrected_text": f"{_CONTENT_FILTERED_PREFIX}{text}", "source_text": text}
+            else:
+                # Other failure (HTTP error, timeout) — leave as None for retry.
+                print(f"  [{orig_idx + 1}/{total}] No response from batch API; marking as failed for retry.")
             continue
 
         payload, validation_error, _ = parse_validate_and_apply_text_fixes(
@@ -490,13 +518,11 @@ async def run_batch_pipeline(
             if isinstance(corrected_text, str) and corrected_text.strip():
                 payloads[orig_idx] = payload
             else:
-                print(f"  [{orig_idx + 1}/{total}] Empty corrected_text; skipping.")
+                print(f"  [{orig_idx + 1}/{total}] Empty corrected_text; marking as failed for retry.")
         else:
-            print(f"  [{orig_idx + 1}/{total}] Validation failed: {validation_error}")
-            if "Unterminated string" in (validation_error or "") or "parse error" in (validation_error or "").lower():
-                print(f"  [{orig_idx + 1}/{total}] Raw content length: {len(raw_content or '')}")
-                print(f"  [{orig_idx + 1}/{total}] Raw content head: {(raw_content or '')[:300]}")
-                print(f"  [{orig_idx + 1}/{total}] Raw content tail: ...{(raw_content or '')[-80:]}")
+            fr = all_finish_reasons.get(custom_key, "unknown")
+            print(f"  [{orig_idx + 1}/{total}] Validation failed (finish_reason={fr}): {validation_error}")
+            # All validation failures are retryable — leave as None.
 
     # Process segmented items: parse each segment, then merge.
     # If all segments succeed, merge normally.
@@ -513,11 +539,14 @@ async def run_batch_pipeline(
             seg_sources.append(seg_source)
             raw_content = all_raw_results.get(custom_key)
             if raw_content is None:
+                # Check if this was content-filtered vs other failure.
+                is_filtered = custom_key in content_filtered_keys
+                status_label = "content_filter" if is_filtered else "no response"
                 print(
                     f"  [{orig_idx + 1}/{total}] Segment {custom_key}: "
-                    "no response from batch API."
+                    f"{status_label} from batch API."
                 )
-                seg_results.append((False, seg_source))
+                seg_results.append(("filtered" if is_filtered else False, seg_source))
                 seg_ok_payloads.append(None)
                 failed_seg_count += 1
                 continue
@@ -544,9 +573,10 @@ async def run_batch_pipeline(
                     seg_ok_payloads.append(None)
                     failed_seg_count += 1
             else:
+                fr = all_finish_reasons.get(custom_key, "unknown")
                 print(
                     f"  [{orig_idx + 1}/{total}] Segment {custom_key}: "
-                    f"validation failed: {validation_error}"
+                    f"validation failed (finish_reason={fr}): {validation_error}"
                 )
                 seg_results.append((False, seg_source))
                 seg_ok_payloads.append(None)
@@ -592,6 +622,8 @@ async def _submit_batch_and_wait_keyed(
     batch_label: str = "",
     poll_interval_seconds: int = BATCH_POLL_INTERVAL_SECONDS,
     batch_metadata: dict[str, str] | None = None,
+    filtered_keys_out: set[str] | None = None,
+    finish_reasons_out: dict[str, str] | None = None,
 ) -> dict[str, str]:
     """Like submit_batch_and_wait but returns results keyed by the custom_id
     suffix (the part after 'idx-') as a string, supporting non-integer keys
@@ -675,6 +707,7 @@ async def _submit_batch_and_wait_keyed(
         results: dict[str, str] = {}
         skipped_status = 0
         skipped_length = 0
+        skipped_filter = 0
         for line in result_text.strip().split("\n"):
             if not line:
                 continue
@@ -694,14 +727,24 @@ async def _submit_batch_and_wait_keyed(
                 if finish_reason == "length":
                     skipped_length += 1
                     continue
+                if finish_reason == "content_filter":
+                    # Content filter killed the response mid-generation.
+                    # Treat as passthrough — the original input will be used.
+                    skipped_filter += 1
+                    if filtered_keys_out is not None:
+                        filtered_keys_out.add(key)
+                    continue
                 content = choice["message"]["content"]
                 results[key] = unicodedata.normalize("NFC", content)
+                if finish_reasons_out is not None:
+                    finish_reasons_out[key] = finish_reason
             except (KeyError, IndexError, TypeError) as exc:
                 print(f"[batch{batch_label}] Could not extract content for {key}: {exc}")
-        if skipped_status or skipped_length:
+        if skipped_status or skipped_length or skipped_filter:
             print(
                 f"[batch{batch_label}] Skipped: {skipped_status} HTTP errors, "
-                f"{skipped_length} truncated (finish_reason=length)"
+                f"{skipped_length} truncated (finish_reason=length), "
+                f"{skipped_filter} content_filter (input passthrough)"
             )
         return results
 
