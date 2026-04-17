@@ -597,6 +597,14 @@ async def main() -> None:
                     if label:
                         non_empty = sum(1 for l in snap_output_lines if l.strip() and not is_partial_segments_marker(l))
                         print(f"  Snapshot after {label}: {non_empty}/{chunk_len} resolved lines written.")
+                # Verify output line count after write and sync total_written.
+                if out_text_path and out_text_path.exists():
+                    actual_lines = sum(1 for _ in out_text_path.open("r", encoding="utf-8"))
+                    expected_lines = total_written + chunk_len
+                    if actual_lines != expected_lines:
+                        print(f"  WARNING: Output file has {actual_lines:,} lines but expected {expected_lines:,}. Syncing.")
+                    # Sync total_written from actual file to prevent drift.
+                    total_written = actual_lines - chunk_len
                 return snap_output_lines
 
             # Write initial snapshot before retries so results are persisted.
@@ -702,7 +710,9 @@ async def main() -> None:
                             all_failed_items.append((global_offset + i, batch_texts[i], t, fn, skip_flags[i]))
 
             # Final snapshot write (ensures last retry state is persisted).
-            _write_chunk_snapshot(label="final" if chunk_max_retries > 0 else "")
+            # Skip if no retries were attempted — initial snapshot already wrote.
+            if chunk_max_retries > 0:
+                _write_chunk_snapshot(label="final")
 
             # Write JSONL records for this chunk.
             if out_jsonl_path:

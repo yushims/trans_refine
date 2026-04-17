@@ -3459,9 +3459,8 @@ def iter_transcription_chunks(
     if input_path.suffix.lower() == ".tsv":
         lines = raw_text.splitlines()
         del raw_text
-        reader = csv.reader(lines, delimiter="\t")
-        for row_index, row in enumerate(reader):
-            row = [unicodedata.normalize("NFC", cell) for cell in row]
+        for row_index, raw_line in enumerate(lines):
+            row = [unicodedata.normalize("NFC", cell) for cell in raw_line.split("\t")]
             if not row or not any(cell.strip() for cell in row):
                 continue
             first_cell = row[0].strip() if row else ""
