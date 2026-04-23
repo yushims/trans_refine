@@ -65,11 +65,6 @@ DEFAULT_MODEL_MISMATCH_RETRIES = 1
 DEFAULT_MAX_INPUT_CHARS_PER_CALL = 300
 DEFAULT_LONG_SPAN_MIN_DELETED_TOKENS = 3
 DEFAULT_HALLUCINATION_MAX_INSERTED_TOKENS = 3
-DEFAULT_AOAI_ENDPOINT = "https://adaptationdev-resource.openai.azure.com/"
-DEFAULT_AOAI_API_VERSION = "2025-01-01-preview"
-DEFAULT_AOAI_DEPLOYMENT = "gpt-5-chat"
-DEFAULT_AOAI_BATCH_DEPLOYMENT = "gpt-4.1-3-batch"
-DEFAULT_COPILOT_MODEL = "gpt-5.2"
 
 
 _ORIGINAL_PRINT = builtins.print
@@ -204,6 +199,18 @@ def add_common_runtime_cli_arguments(
             "Disable automatic resume from existing output. "
             "By default, if an output text file (.txt or .tsv) exists, "
             "rows with non-empty output are skipped and only empty rows are retried."
+        ),
+    )
+    parser.add_argument(
+        "--retry-content-filtered",
+        dest="retry_content_filtered",
+        action="store_true",
+        default=False,
+        help=(
+            "Treat content-filtered results as failures so they are retried: "
+            "on resume, lines starting with %%CF%% are re-submitted, and "
+            "%%PS%% partial-segment markers with filtered segments have those "
+            "segments retried (instead of kept as-is)."
         ),
     )
     parser.add_argument(
@@ -872,31 +879,34 @@ def _is_colon_token(token: str) -> bool:
     return token in {":", "："}
 
 
-def _normalize_model_result_newlines(text: str, source_text: str) -> str:
+# Unicode line-break variants that appear mid-token in model output and should
+# be removed without inserting whitespace (otherwise adjacent characters in
+# no-space scripts like Chinese/Japanese get incorrectly split). ASCII line
+# breaks (\n, \r, \v, \f) are still flattened to a space since they typically
+# separate words.
+_UNICODE_LINE_BREAK_ZERO_WIDTH_RE = re.compile(
+    r"[\x1c\x1d\x1e\x85\u2028\u2029]"
+)
+
+
+def _normalize_model_result_newlines(text: str) -> str:
     if not isinstance(text, str):
         return ""
 
-    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
-
-    # Remove only model-inserted line breaks before likely speaker labels.
-    normalized = re.sub(
-        r"\n\s*(?=(?:\[[^\]\r\n]{1,24}\]|(?:spk|speaker|spkr)[_-]?\d+|[A-Za-z][A-Za-z0-9_-]{0,15})\s*[:\uff1a])",
-        " ",
-        normalized,
-        flags=re.IGNORECASE,
-    )
-
-    source_has_newline = isinstance(source_text, str) and ("\n" in source_text or "\r" in source_text)
-    if not source_has_newline:
-        # Keep single-line inputs single-line in model output.
-        normalized = re.sub(r"\s*\n\s*", " ", normalized)
-        normalized = re.sub(r" {2,}", " ", normalized)
-        return normalized.strip()
-
-    return normalized
+    # The source is one transcription per line, so the output must also stay on
+    # a single line. The model may still emit multi-line output. Unicode
+    # variants (NEL, LS, PS, FS/GS/RS) are dropped without inserting whitespace
+    # so no-space scripts are not artificially split; ASCII line breaks (\n,
+    # \r\n, \r, \v, \f) collapse to a single space since they typically mark
+    # word boundaries.
+    normalized = _UNICODE_LINE_BREAK_ZERO_WIDTH_RE.sub("", text)
+    normalized = re.sub(r"\r\n|[\r\v\f]", "\n", normalized)
+    normalized = re.sub(r"\s*\n\s*", " ", normalized)
+    normalized = re.sub(r" {2,}", " ", normalized)
+    return normalized.strip()
 
 
-def normalize_payload_result_newlines(payload: dict, source_text: str) -> None:
+def normalize_payload_result_newlines(payload: dict) -> None:
     if not isinstance(payload, dict):
         return
 
@@ -906,11 +916,11 @@ def normalize_payload_result_newlines(payload: dict, source_text: str) -> None:
             continue
         step_result = step_payload.get("result")
         if isinstance(step_result, str):
-            step_payload["result"] = _normalize_model_result_newlines(step_result, source_text)
+            step_payload["result"] = _normalize_model_result_newlines(step_result)
 
     corrected_text = payload.get("corrected_text")
     if isinstance(corrected_text, str):
-        payload["corrected_text"] = _normalize_model_result_newlines(corrected_text, source_text)
+        payload["corrected_text"] = _normalize_model_result_newlines(corrected_text)
 
 
 def _looks_like_speaker_label_token(token: str) -> bool:
@@ -1173,7 +1183,7 @@ def _is_reasonable_number_like_token(token: str) -> bool:
     return False
 
 
-def _tokenize_for_hallucination(text: str) -> list[str]:
+def _tokenize_for_content_guards(text: str) -> list[str]:
     tokens: list[str] = []
     index = 0
     length = len(text)
@@ -1186,9 +1196,25 @@ def _tokenize_for_hallucination(text: str) -> list[str]:
 
         url_email_match = _URL_EMAIL_PATTERN.match(text, index)
         if url_email_match:
-            token = url_email_match.group(0)
-            tokens.append(token)
-            index += len(token)
+            # Split URL/email into components so content guards can compare
+            # individual parts (scheme, host segments, path) against spelled-out
+            # ASR tokens like "h t t p kettőspont per per v v v pont vam pont hu".
+            # Split on punctuation boundaries, emitting each punct char separately
+            # so _is_punct_token can filter them.
+            url_text = url_email_match.group(0)
+            buf: list[str] = []
+            for ch in url_text:
+                cat = unicodedata.category(ch)
+                if cat.startswith(("P", "S")) or ch in ":/.,@":
+                    if buf:
+                        tokens.append("".join(buf))
+                        buf.clear()
+                    tokens.append(ch)
+                else:
+                    buf.append(ch)
+            if buf:
+                tokens.append("".join(buf))
+            index += len(url_text)
             continue
 
         number_match = _NUMBER_LIKE_PATTERN.match(text, index)
@@ -1258,6 +1284,158 @@ def _tokenize_for_hallucination(text: str) -> list[str]:
     return tokens
 
 
+def _is_repeated_context_span(
+    source_tokens: list[str],
+    i1: int,
+    i2: int,
+    max_pattern_len: int = 3,
+) -> bool:
+    """Check if source_tokens[i1:i2] is mostly repeated copies of preceding/following context.
+
+    ASR disfluency: "ez egy ez egy ez egy ez egy lét" → "ez egy lét"
+    The deleted span ["ez","egy","ez","egy","ez","egy"] is 3 copies of the
+    preceding ["ez","egy"].
+
+    When adjacent opcodes are merged by callers, the merged span may have a
+    small non-repeating head or tail.  This function tolerates up to *max_pattern_len* leftover tokens at either
+    end, as long as the core repeated portion has at least 2 full copies and
+    matches the preceding or following context.
+    """
+    deleted = source_tokens[i1:i2]
+    span_len = len(deleted)
+    if span_len == 0:
+        return False
+
+    for pat_len in range(1, min(max_pattern_len, span_len) + 1):
+        # Try the pattern from the start of the span.
+        pattern = deleted[:pat_len]
+        # Count how many full copies match from the start.
+        full_copies = 0
+        for k in range(0, span_len, pat_len):
+            if deleted[k:k + pat_len] == pattern:
+                full_copies += 1
+            else:
+                break
+        repeated_len = full_copies * pat_len
+        leftover = span_len - repeated_len
+        if full_copies >= 2 and leftover <= max_pattern_len:
+            # Verify pattern matches preceding or following context.
+            if i1 >= pat_len and source_tokens[i1 - pat_len:i1] == pattern:
+                return True
+            if i2 + pat_len <= len(source_tokens) and source_tokens[i2:i2 + pat_len] == pattern:
+                return True
+
+        # Try the pattern from the end of the span (handles non-repeating head).
+        pattern_end = deleted[-pat_len:]
+        full_copies_end = 0
+        for k in range(span_len - pat_len, -1, -pat_len):
+            if deleted[k:k + pat_len] == pattern_end:
+                full_copies_end += 1
+            else:
+                break
+        repeated_len_end = full_copies_end * pat_len
+        leftover_end = span_len - repeated_len_end
+        if full_copies_end >= 2 and leftover_end <= max_pattern_len:
+            if i1 >= pat_len and source_tokens[i1 - pat_len:i1] == pattern_end:
+                return True
+            if i2 + pat_len <= len(source_tokens) and source_tokens[i2:i2 + pat_len] == pattern_end:
+                return True
+
+    return False
+
+
+# Pattern for splitting tokens on URL-delimiter and punctuation boundaries so
+# the word-level diff can see spelled-out components separately.
+_WORD_DIFF_SPLIT_RE = re.compile(r"(://|[.:,;/])")
+
+
+def _tokenize_for_word_diff(text: str) -> list[str]:
+    """Split text into tokens for word-level diff used by content-guard cleaning.
+
+    Whitespace-splits first, then further splits on URL-delimiter/punctuation
+    boundaries so e.g. "http://www.foo" → ["http", "://", "www", ".", "foo"].
+    """
+    tokens: list[str] = []
+    for word in text.lower().split():
+        for part in _WORD_DIFF_SPLIT_RE.sub(r" \1 ", word).split():
+            if part:
+                tokens.append(part)
+    return tokens
+
+
+def _is_conversion_span(words: list[str]) -> bool:
+    """True if ``words`` are digit-containing or pure-symbol tokens.
+
+    Such spans represent spelled-out→symbolic/numeric conversions that should
+    be tolerated by the content guard (e.g. "kettőspont"→":" "pont"→"."
+    "ezer"→"1000").
+    """
+    for w in words:
+        if any(c.isdigit() for c in w):
+            return True
+        if not any(c.isalpha() for c in w):
+            return True
+    return False
+
+
+def _is_disfluency_delete(src_tokens: list[str], start: int, end: int) -> bool:
+    """True if ``src_tokens[start:end]`` is a repeated-pattern disfluency.
+
+    Complements :func:`_is_repeated_context_span` for content-guard cleaning:
+    uses shorter pattern range (1–4) and checks strict whole-span repetition
+    that matches adjacent context.
+    """
+    deleted = src_tokens[start:end]
+    span_len = len(deleted)
+    if span_len == 0:
+        return False
+    for pat_len in range(1, min(4, span_len) + 1):
+        if span_len % pat_len != 0:
+            continue
+        pattern = deleted[:pat_len]
+        if all(deleted[k:k + pat_len] == pattern for k in range(0, span_len, pat_len)):
+            if start >= pat_len and src_tokens[start - pat_len:start] == pattern:
+                return True
+            if end + pat_len <= len(src_tokens) and src_tokens[end:end + pat_len] == pattern:
+                return True
+    return False
+
+
+def strip_conversion_and_disfluency_spans(
+    source_text: str,
+    corrected_text: str,
+) -> tuple[str, str]:
+    """Strip spelled-out→symbol/numeric conversions and repeated-word
+    disfluencies from a (source, corrected) pair before content-guard checks.
+
+    Word-level diff identifies ``replace`` spans whose corrected side is
+    purely digits or symbols, and ``delete``/``replace`` spans that are
+    repeated-pattern disfluencies — those are removed from both sides.
+    Returns cleaned (source, corrected).  If all content was conversion,
+    returns ``("", "")`` signalling "no content remains to check".
+    """
+    src_words = _tokenize_for_word_diff(source_text)
+    out_words = _tokenize_for_word_diff(corrected_text)
+    if not src_words or not out_words:
+        return source_text, corrected_text
+
+    matcher = difflib.SequenceMatcher(a=src_words, b=out_words, autojunk=False)
+    src_keep: list[str] = []
+    out_keep: list[str] = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "replace" and _is_conversion_span(out_words[j1:j2]):
+            continue
+        if tag in ("delete", "replace") and _is_disfluency_delete(src_words, i1, i2):
+            out_keep.extend(out_words[j1:j2])
+            continue
+        src_keep.extend(src_words[i1:i2])
+        out_keep.extend(out_words[j1:j2])
+
+    if not src_keep and not out_keep:
+        return "", ""
+    return " ".join(src_keep), " ".join(out_keep)
+
+
 def validate_corrected_text_hallucination(corrected_text: str, source_text: str) -> tuple[bool, str]:
     if not isinstance(corrected_text, str):
         return False, "corrected_text must be a string"
@@ -1268,8 +1446,8 @@ def validate_corrected_text_hallucination(corrected_text: str, source_text: str)
     if not source_text.strip():
         return False, ""
 
-    source_tokens_raw = _tokenize_for_hallucination(source_text)
-    corrected_tokens_raw = _tokenize_for_hallucination(corrected_text)
+    source_tokens_raw = _tokenize_for_content_guards(source_text)
+    corrected_tokens_raw = _tokenize_for_content_guards(corrected_text)
 
     corrected_tokens, corrected_speaker_label_signatures = _collect_and_remove_speaker_labels(
         corrected_tokens_raw
@@ -1287,18 +1465,36 @@ def validate_corrected_text_hallucination(corrected_text: str, source_text: str)
 
     matcher = difflib.SequenceMatcher(a=source_folded_stream, b=corrected_folded_stream, autojunk=False)
     max_inserted_tokens = get_hallucination_guard_config()
-    for tag, _i1, _i2, j1, j2 in matcher.get_opcodes():
-        if tag != "insert":
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "insert":
+            net_inserted = j2 - j1
+        elif tag == "replace":
+            net_inserted = (j2 - j1) - (i2 - i1)
+        else:
+            continue
+
+        if net_inserted <= max_inserted_tokens:
+            continue
+
+        # Space-collapse check: joining corrected tokens == joining source tokens
+        # means the change is just whitespace insertion, not hallucination.
+        src_joined = "".join(source_folded_stream[i1:i2])
+        cor_joined = "".join(corrected_folded_stream[j1:j2])
+        if src_joined and cor_joined and difflib.SequenceMatcher(None, src_joined, cor_joined, autojunk=False).ratio() >= 0.5:
+            continue
+
+        # Numeral conversion check: if inserted tokens contain digits,
+        # the insertion is likely digit expansion from spelled-out numbers.
+        if any(any(c.isdigit() for c in t) for t in corrected_folded_stream[j1:j2]):
             continue
 
         inserted_tokens = corrected_tokens[j1:j2]
-        if len(inserted_tokens) > max_inserted_tokens:
-            snippet = " ".join(inserted_tokens[:8])
-            return False, (
-                "corrected_text contains long inserted span: "
-                f"inserted_tokens={len(inserted_tokens)}, "
-                f"max_allowed={max_inserted_tokens}, span='{snippet}'"
-            )
+        snippet = " ".join(inserted_tokens[:8])
+        return False, (
+            "corrected_text contains long inserted span: "
+            f"inserted_tokens={net_inserted}, "
+            f"max_allowed={max_inserted_tokens}, span='{snippet}'"
+        )
 
     return True, ""
 
@@ -1306,7 +1502,7 @@ def validate_corrected_text_hallucination(corrected_text: str, source_text: str)
 def _folded_non_punct_tokens(text: str) -> list[str]:
     if not isinstance(text, str) or not text.strip():
         return []
-    tokens = _tokenize_for_hallucination(text)
+    tokens = _tokenize_for_content_guards(text)
     return [token.casefold() for token in tokens if token.strip() and not _is_punct_token(token)]
 
 
@@ -1400,36 +1596,321 @@ def validate_no_long_span_removed_no_space_scripts(
     min_deleted_no_space_chars = get_long_span_preservation_guard_config()
 
     matcher = difflib.SequenceMatcher(a=source_chars, b=corrected_chars, autojunk=False)
-    for tag, i1, i2, _j1, _j2 in matcher.get_opcodes():
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag not in ("delete", "replace"):
+            continue
+        net_deleted = (i2 - i1) - (j2 - j1)
+        if net_deleted < min_deleted_no_space_chars:
             continue
 
         deleted_chars = source_chars[i1:i2]
-        if len(deleted_chars) < min_deleted_no_space_chars:
-            continue
 
-        # Skip if deleted span is entirely CJK numeral characters — likely
-        # converted to Arabic digits (e.g. 二零二零 → 2020).
         if all(c in _CJK_NUMERAL_CHARS for c in deleted_chars):
             continue
 
-        # General numeral conversion check: if the deleted no-space chars
-        # were replaced by digits in the full text, it's numeral conversion
-        # (e.g. Thai สามร้อย→300, Korean 이천이십→2020, script digits ๒๐๒๐→2020).
         src_start = source_items[i1][1]
         src_end = source_items[i2 - 1][1] + 1
         if _deleted_span_replaced_by_digits(source_text, corrected_text, src_start, src_end):
+            continue
+        # Disfluency repetition check: if deleted chars are repeated
+        # copies of the preceding/following context, it's stutter removal.
+        if _is_repeated_context_span(source_chars, i1, i2):
             continue
 
         snippet = "".join(deleted_chars[:20])
         return (
             False,
             "long no-space-script span was removed "
-            f"(deleted_chars={len(deleted_chars)}, threshold={min_deleted_no_space_chars}, "
+            f"(deleted_chars={net_deleted}, threshold={min_deleted_no_space_chars}, "
             f"span='{snippet}')",
         )
 
     return True, ""
+
+
+def _inserted_span_replaces_digits(
+    source_text: str,
+    corrected_text: str,
+    cor_start: int,
+    cor_end: int,
+) -> bool:
+    """Check if the corrected region [cor_start:cor_end] replaced digits in source_text.
+
+    This is the inverse of _deleted_span_replaced_by_digits: digit → no-space
+    script conversion (e.g. 2020 → 二零二零) is not hallucination.
+    """
+    ctx = 30
+    s_lo = max(0, cor_start - ctx)
+    s_hi = min(len(source_text), cor_end + ctx)
+    src_window = source_text[s_lo:s_hi]
+
+    c_lo = max(0, cor_start - ctx)
+    c_hi = min(len(corrected_text), cor_end + ctx)
+    cor_window = corrected_text[c_lo:c_hi]
+
+    if not src_window:
+        return False
+
+    sm = difflib.SequenceMatcher(a=src_window, b=cor_window, autojunk=False)
+    for tag, i1, i2, _j1, _j2 in sm.get_opcodes():
+        if tag != "replace":
+            continue
+        deleted = src_window[i1:i2]
+        non_digit_non_punct = [c for c in deleted if not c.isdigit() and c not in ".,، %"]
+        if len(non_digit_non_punct) == 0 and any(c.isdigit() for c in deleted):
+            return True
+
+    return False
+
+
+def validate_corrected_text_hallucination_no_space_scripts(
+    corrected_text: str,
+    source_text: str,
+) -> tuple[bool, str]:
+    """Detect hallucinated no-space-script characters inserted into corrected text.
+
+    Mirrors validate_no_long_span_removed_no_space_scripts but checks for
+    inserted chars (hallucination) instead of deleted chars (truncation).
+    """
+    if not isinstance(corrected_text, str) or not isinstance(source_text, str):
+        return True, ""
+
+    source_chars = _no_space_script_char_stream(source_text)
+    corrected_items = _no_space_script_char_positions(corrected_text)
+    corrected_chars = [c for c, _ in corrected_items]
+    if not corrected_chars:
+        return True, ""
+
+    max_inserted_chars = get_hallucination_guard_config()
+
+    matcher = difflib.SequenceMatcher(a=source_chars, b=corrected_chars, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "insert":
+            net_inserted = j2 - j1
+        elif tag == "replace":
+            net_inserted = (j2 - j1) - (i2 - i1)
+        else:
+            continue
+
+        if net_inserted <= max_inserted_chars:
+            continue
+
+        inserted_chars = corrected_chars[j1:j2]
+
+        # Skip if inserted span is entirely CJK numeral characters — likely
+        # converted from Arabic digits (e.g. 2020 → 二零二零).
+        if all(c in _CJK_NUMERAL_CHARS for c in inserted_chars):
+            continue
+
+        # General numeral conversion check: if the inserted no-space chars
+        # replaced digits in the source, it's numeral conversion, not hallucination.
+        cor_start = corrected_items[j1][1]
+        cor_end = corrected_items[j2 - 1][1] + 1
+        if _inserted_span_replaces_digits(source_text, corrected_text, cor_start, cor_end):
+            continue
+
+        snippet = "".join(inserted_chars[:20])
+        return (
+            False,
+            "corrected_text contains long inserted no-space-script span: "
+            f"inserted_chars={net_inserted}, "
+            f"max_allowed={max_inserted_chars}, span='{snippet}'",
+        )
+
+    return True, ""
+
+
+# Content-guard failure categories returned by validate_all_content_guards.
+GUARD_CATEGORY_LONG_SPAN = "long_span"           # word-level truncation
+GUARD_CATEGORY_HALLUCINATION = "hallucination"   # word-level hallucination
+GUARD_CATEGORY_LONG_SPAN_NS = "long_span_ns"     # no-space-script truncation
+GUARD_CATEGORY_HALLUCINATION_NS = "hallucination_ns"  # no-space-script hallucination
+
+
+def validate_all_content_guards(
+    corrected_text: str,
+    source_text: str,
+    processing_id: str | None = None,
+    _apply_cleaning: bool = True,
+) -> tuple[bool, str, str | None]:
+    """Run all 4 content guard checks with shared tokenization.
+
+    Checks long-span removal and hallucination for both space-delimited and
+    no-space scripts, tokenizing each text only once per tokenizer.
+    Returns ``(True, "", None)`` if all pass, or ``(False, error_message,
+    category)`` on first failure, where ``category`` is one of
+    ``GUARD_CATEGORY_*`` (long_span / hallucination / long_span_ns /
+    hallucination_ns) so callers can dispatch (e.g. repairable vs not).
+
+    When ``_apply_cleaning`` is True (default), first tries the checks on a
+    cleaned (source, corrected) pair with spelled-out→symbolic/numeric
+    conversions and repeated-word disfluencies removed.  If the cleaned pair
+    passes, the overall check passes; otherwise falls through to the raw pair.
+    This tolerates e.g. "kettőspont"→":", "h t t p"→"http", "ezer"→"1000".
+    """
+    if not isinstance(corrected_text, str) or not isinstance(source_text, str):
+        return True, "", None
+
+    # Try cleaned pair first — spelled-out→symbolic/numeric conversions and
+    # repeated-word disfluencies are removed before the guard so valid edits
+    # aren't flagged as truncation/hallucination.
+    if _apply_cleaning:
+        cleaned_src, cleaned_cor = strip_conversion_and_disfluency_spans(
+            source_text, corrected_text,
+        )
+        if not cleaned_src and not cleaned_cor:
+            return True, "", None  # every token was a conversion span
+        if (cleaned_src and cleaned_cor
+                and (cleaned_src != source_text or cleaned_cor != corrected_text)):
+            ok, _err, _cat = validate_all_content_guards(
+                cleaned_cor, cleaned_src, processing_id, _apply_cleaning=False,
+            )
+            if ok:
+                return True, "", None
+            # Cleaned pair also fails — fall through to raw to produce the
+            # most accurate error message.
+
+    min_deleted_tokens = get_long_span_preservation_guard_config()
+    max_inserted_tokens = get_hallucination_guard_config()
+
+    # --- Word-level checks (space-delimited scripts) ---
+    # Tokenize once for both long-span-removed and hallucination checks.
+    source_tokens_raw = _tokenize_for_content_guards(source_text)
+    corrected_tokens_raw = _tokenize_for_content_guards(corrected_text)
+
+    # Speaker label handling (for hallucination check).
+    corrected_tokens_no_spk, corrected_spk_sigs = _collect_and_remove_speaker_labels(
+        corrected_tokens_raw
+    )
+    source_tokens_no_spk = _remove_speaker_labels_by_reference(
+        source_tokens_raw, corrected_spk_sigs,
+    )
+
+    source_folded = [t.casefold() for t in source_tokens_no_spk if t.strip() and not _is_punct_token(t)]
+    corrected_folded = [t.casefold() for t in corrected_tokens_no_spk if t.strip() and not _is_punct_token(t)]
+
+    if source_folded:
+        matcher = difflib.SequenceMatcher(a=source_folded, b=corrected_folded, autojunk=False)
+        opcodes = matcher.get_opcodes()
+
+        # Check 1: long span removed (word-level).
+        for tag, i1, i2, j1, j2 in opcodes:
+            if tag not in ("delete", "replace"):
+                continue
+            net_deleted = (i2 - i1) - (j2 - j1)
+            if net_deleted > min_deleted_tokens:
+                # Space-collapse check: if joining source tokens is similar to joining
+                # corrected tokens, the change is mostly whitespace removal.
+                src_joined = "".join(source_folded[i1:i2])
+                cor_joined = "".join(corrected_folded[j1:j2])
+                if src_joined and cor_joined and difflib.SequenceMatcher(None, src_joined, cor_joined, autojunk=False).ratio() >= 0.5:
+                    continue
+                # Numeral conversion check: if corrected tokens contain digits,
+                # the deletion is likely spelled-out number → digit conversion.
+                if any(any(c.isdigit() for c in t) for t in corrected_folded[j1:j2]):
+                    continue
+                # URL reconstruction check: if the corrected side starts with a URL
+                # prefix, the deletion is spelled-out URL components → actual URL.
+                if cor_joined.startswith(("http", "www", "ftp")):
+                    continue
+                # Disfluency repetition check: if deleted tokens are repeated
+                # copies of the preceding/following context, it's stutter removal.
+                if _is_repeated_context_span(source_folded, i1, i2):
+                    continue
+                deleted = source_folded[i1:i2]
+                snippet = " ".join(deleted[:12])
+                return False, (
+                    f"long span was removed (deleted_tokens={net_deleted}, span='{snippet}')"
+                ), GUARD_CATEGORY_LONG_SPAN
+
+        # Check 2: hallucination (word-level).
+        corrected_tokens_filtered = [t for t in corrected_tokens_no_spk if t.strip() and not _is_punct_token(t)]
+        for tag, i1, i2, j1, j2 in opcodes:
+            if tag == "insert":
+                net_inserted = j2 - j1
+            elif tag == "replace":
+                net_inserted = (j2 - j1) - (i2 - i1)
+            else:
+                continue
+            if net_inserted <= max_inserted_tokens:
+                continue
+            # Space-collapse check: joining corrected tokens == joining source tokens
+            # means the change is just whitespace insertion, not hallucination.
+            src_joined = "".join(source_folded[i1:i2])
+            cor_joined = "".join(corrected_folded[j1:j2])
+            if src_joined and cor_joined and difflib.SequenceMatcher(None, src_joined, cor_joined, autojunk=False).ratio() >= 0.5:
+                continue
+            # Numeral conversion check: if inserted tokens contain digits,
+            # the insertion is likely digit expansion from spelled-out numbers.
+            if any(any(c.isdigit() for c in t) for t in corrected_folded[j1:j2]):
+                continue
+            inserted = corrected_tokens_filtered[j1:j2]
+            snippet = " ".join(inserted[:8])
+            return False, (
+                f"corrected_text contains long inserted span: "
+                f"inserted_tokens={net_inserted}, max_allowed={max_inserted_tokens}, span='{snippet}'"
+            ), GUARD_CATEGORY_HALLUCINATION
+
+    # --- Char-level checks (no-space scripts: CJK, Thai, etc.) ---
+    # Tokenize once for both no-space checks.
+    source_ns_items = _no_space_script_char_positions(source_text)
+    source_ns_chars = [c for c, _ in source_ns_items]
+    corrected_ns_items = _no_space_script_char_positions(corrected_text)
+    corrected_ns_chars = [c for c, _ in corrected_ns_items]
+
+    if source_ns_chars or corrected_ns_chars:
+        matcher_ns = difflib.SequenceMatcher(a=source_ns_chars, b=corrected_ns_chars, autojunk=False)
+        opcodes_ns = matcher_ns.get_opcodes()
+
+        # Check 3: long no-space span removed.
+        if source_ns_chars:
+            for tag, i1, i2, j1, j2 in opcodes_ns:
+                if tag not in ("delete", "replace"):
+                    continue
+                net_deleted = (i2 - i1) - (j2 - j1)
+                if net_deleted < min_deleted_tokens:
+                    continue
+                deleted = source_ns_chars[i1:i2]
+                if all(c in _CJK_NUMERAL_CHARS for c in deleted):
+                    continue
+                src_start = source_ns_items[i1][1]
+                src_end = source_ns_items[i2 - 1][1] + 1
+                if _deleted_span_replaced_by_digits(source_text, corrected_text, src_start, src_end):
+                    continue
+                # Disfluency repetition check.
+                if _is_repeated_context_span(source_ns_chars, i1, i2):
+                    continue
+                snippet = "".join(deleted[:20])
+                return False, (
+                    f"long no-space-script span was removed "
+                    f"(deleted_chars={net_deleted}, threshold={min_deleted_tokens}, span='{snippet}')"
+                ), GUARD_CATEGORY_LONG_SPAN_NS
+
+        # Check 4: hallucinated no-space chars inserted.
+        if corrected_ns_chars:
+            for tag, i1, i2, j1, j2 in opcodes_ns:
+                if tag == "insert":
+                    net_inserted = j2 - j1
+                elif tag == "replace":
+                    net_inserted = (j2 - j1) - (i2 - i1)
+                else:
+                    continue
+                if net_inserted <= max_inserted_tokens:
+                    continue
+                inserted = corrected_ns_chars[j1:j2]
+                if all(c in _CJK_NUMERAL_CHARS for c in inserted):
+                    continue
+                cor_start = corrected_ns_items[j1][1]
+                cor_end = corrected_ns_items[j2 - 1][1] + 1
+                if _inserted_span_replaces_digits(source_text, corrected_text, cor_start, cor_end):
+                    continue
+                snippet = "".join(inserted[:20])
+                return False, (
+                    f"corrected_text contains long inserted no-space-script span: "
+                    f"inserted_chars={net_inserted}, max_allowed={max_inserted_tokens}, span='{snippet}'"
+                ), GUARD_CATEGORY_HALLUCINATION_NS
+
+    return True, "", None
 
 
 def validate_inactive_step_edits_empty(
@@ -1480,19 +1961,41 @@ def validate_no_long_span_removed(
     matcher = difflib.SequenceMatcher(a=source_tokens, b=corrected_tokens, autojunk=False)
 
     min_deleted_tokens = get_long_span_preservation_guard_config()
-    for tag, i1, i2, _j1, _j2 in matcher.get_opcodes():
-        if tag != "delete":
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag not in ("delete", "replace"):
+            continue
+        net_deleted = (i2 - i1) - (j2 - j1)
+        if net_deleted <= min_deleted_tokens:
+            continue
+
+        # Space-collapse check: joining source tokens is similar to joining
+        # corrected tokens means the change is mostly whitespace removal.
+        src_joined = "".join(source_tokens[i1:i2])
+        cor_joined = "".join(corrected_tokens[j1:j2])
+        if src_joined and cor_joined and difflib.SequenceMatcher(None, src_joined, cor_joined, autojunk=False).ratio() >= 0.5:
+            continue
+
+        # Numeral conversion check: if corrected tokens contain digits,
+        # the deletion is likely spelled-out number → digit conversion.
+        if any(any(c.isdigit() for c in t) for t in corrected_tokens[j1:j2]):
+            continue
+
+        # URL reconstruction check: if the corrected side starts with a URL
+        # prefix, the deletion is spelled-out URL components → actual URL.
+        if cor_joined.startswith(("http", "www", "ftp")):
+            continue
+
+        # Disfluency repetition check: if deleted tokens are repeated
+        # copies of the preceding/following context, it's stutter removal.
+        if _is_repeated_context_span(source_tokens, i1, i2):
             continue
 
         deleted_tokens = source_tokens[i1:i2]
-        if len(deleted_tokens) <= min_deleted_tokens:
-            continue
-
         snippet = " ".join(deleted_tokens[:12])
         return (
             False,
             "long span was removed "
-            f"(deleted_tokens={len(deleted_tokens)}, "
+            f"(deleted_tokens={net_deleted}, "
             f"span='{snippet}')",
         )
 
@@ -1978,7 +2481,7 @@ def strip_markdown_code_fence(text: str) -> str:
     if embedded_fence_match:
         return embedded_fence_match.group(2).strip()
 
-    lines = trimmed.splitlines()
+    lines = trimmed.split('\n')
     non_empty_lines = [line for line in lines if line.strip()]
     if non_empty_lines and all(line.lstrip().startswith(">") for line in non_empty_lines):
         unquoted = "\n".join(re.sub(r"^\s*>\s?", "", line) for line in lines).strip()
@@ -2065,7 +2568,7 @@ def parse_validate_and_apply_text_fixes(
     if payload is None:
         return None, validation_error, content
 
-    normalize_payload_result_newlines(payload, source_text)
+    normalize_payload_result_newlines(payload)
 
     corrected_text = ""
     no_touch_tokens = None
@@ -2123,44 +2626,38 @@ def parse_validate_and_apply_text_fixes(
     if not inactive_edits_ok:
         return None, f"Inactive-step edits check failed: {inactive_edits_error}", content
 
-    long_span_ok, long_span_error = validate_no_long_span_removed(
-        corrected_text,
-        source_text,
-        processing_id,
+    # Shared content guards (with spelled-out→symbol/numeral/disfluency cleaning).
+    # Dispatch on category so hallucination stays non-repairable and
+    # long-span failures honour ``allow_long_span_preservation_failure``.
+    guard_ok, guard_err, guard_category = validate_all_content_guards(
+        corrected_text, source_text, processing_id,
     )
-    if not long_span_ok:
+    if guard_ok:
+        return payload, None, content
+
+    if guard_category in (GUARD_CATEGORY_LONG_SPAN, GUARD_CATEGORY_LONG_SPAN_NS):
         if allow_long_span_preservation_failure:
             print(
                 f"[{processing_id}] WARNING: Long-span preservation check failed "
-                f"but accepting final retry result: {long_span_error}"
+                f"but accepting final retry result: {guard_err}"
             )
-        else:
-            return None, f"Long-span preservation check failed: {long_span_error}", content
+            return payload, None, content
+        return None, f"Long-span preservation check failed: {guard_err}", content
 
-    long_no_space_ok, long_no_space_error = validate_no_long_span_removed_no_space_scripts(
-        corrected_text,
-        source_text,
-        processing_id,
-    )
-    if not long_no_space_ok:
-        if allow_long_span_preservation_failure:
-            print(
-                f"[{processing_id}] WARNING: Long-span preservation check failed "
-                f"but accepting final retry result: {long_no_space_error}"
-            )
-        else:
-            return None, f"Long-span preservation check failed: {long_no_space_error}", content
-
-    hallucination_ok, hallucination_error = validate_corrected_text_hallucination(
-        corrected_text,
-        source_text,
-    )
-    if not hallucination_ok:
+    if guard_category == GUARD_CATEGORY_HALLUCINATION:
         return None, _mark_non_repairable_validation_error(
-            f"Hallucination check failed: {hallucination_error}"
+            f"Hallucination check failed: corrected_text contains long inserted span: {guard_err}"
         ), content
 
-    return payload, None, content
+    if guard_category == GUARD_CATEGORY_HALLUCINATION_NS:
+        return None, _mark_non_repairable_validation_error(
+            f"Hallucination check (no-space scripts) failed: {guard_err}"
+        ), content
+
+    # Unknown category — fall back to non-repairable with raw error.
+    return None, _mark_non_repairable_validation_error(
+        f"Content guard failed: {guard_err}"
+    ), content
 
 
 def build_empty_payload() -> dict:
@@ -2752,13 +3249,17 @@ async def run_transcriptions_with_concurrency(
     transcriptions: list[str],
     concurrency: int,
     process_item: Callable[[int, str, int], Awaitable[None]],
+    global_offset: int = 0,
+    global_total: int | None = None,
 ) -> int:
     total = len(transcriptions)
+    display_total = global_total if global_total is not None else total
     semaphore = asyncio.Semaphore(concurrency)
 
     async def process_item_guarded(index: int, transcription: str) -> None:
         async with semaphore:
-            print_processing_progress(index, total)
+            display_index = global_offset + index
+            print_processing_progress(display_index, display_total)
             await process_item(index, transcription, total)
 
     await run_indexed_tasks(transcriptions, process_item_guarded)
@@ -2816,14 +3317,16 @@ def parse_transcriptions_from_file(
 
         print(f"Parsing TSV ({len(raw_text):,} chars)...")
         first_row_is_header = False
-        lines = raw_text.splitlines()
+        lines = raw_text.split('\n')
+        if lines and lines[-1] == '':
+            lines.pop()
         del raw_text  # Free memory before building the row list.
         total_lines = len(lines)
-        # Skip source_rows for large files to save memory (~50% reduction).
-        _store_source_rows = total_lines <= 500_000
-        source_rows: list[list[str] | None] = [] if _store_source_rows else [None] * 0
-        if not _store_source_rows:
-            print(f"  Large file ({total_lines:,} lines): skipping per-row storage to save memory.")
+        # For large files, store only prefix columns (without text) to save memory.
+        _store_full_rows = total_lines <= 500_000
+        source_rows: list[list[str] | None] = []
+        if not _store_full_rows:
+            print(f"  Large file ({total_lines:,} lines): storing prefix columns only to save memory.")
         reader = csv.reader(lines, delimiter="\t")
         for row_index, row in enumerate(reader):
             if row_index > 0 and row_index % 1_000_000 == 0:
@@ -2864,17 +3367,20 @@ def parse_transcriptions_from_file(
                 segment = _strip_emphasis_tags(first_cell)
             transcriptions.append(segment)
             source_filenames.append(filename)
-            if _store_source_rows:
+            if _store_full_rows:
                 source_rows.append(list(row))
+            elif len(row) >= 2:
+                # Store prefix columns + empty placeholder for text to preserve
+                # all columns while avoiding memory cost of storing transcription text.
+                source_rows.append(row[:-1] + [""])
+            else:
+                source_rows.append(None)
 
         # Free the lines list now that parsing is done.
         del lines
 
         if first_row_is_header and not transcriptions:
             print("TSV input contains only header and no data rows.")
-
-        if not _store_source_rows:
-            source_rows = [None] * len(transcriptions)
 
         return transcriptions, source_filenames, source_rows
 
@@ -2903,7 +3409,9 @@ def parse_transcriptions_from_file(
     transcriptions: list[str] = []
     source_filenames: list[str | None] = []
     source_rows: list[list[str] | None] = []
-    lines = raw_text.splitlines()
+    lines = raw_text.split('\n')
+    if lines and lines[-1] == '':
+        lines.pop()
     del raw_text
     total_lines = len(lines)
     for line_index, raw_line in enumerate(lines):
@@ -3457,7 +3965,9 @@ def iter_transcription_chunks(
     global_offset = 0
 
     if input_path.suffix.lower() == ".tsv":
-        lines = raw_text.splitlines()
+        lines = raw_text.split('\n')
+        if lines and lines[-1] == '':
+            lines.pop()
         del raw_text
         for row_index, raw_line in enumerate(lines):
             row = [unicodedata.normalize("NFC", cell) for cell in raw_line.split("\t")]
@@ -3492,7 +4002,9 @@ def iter_transcription_chunks(
                 chunk_estimated_segments = 0
         del lines
     else:
-        lines = raw_text.splitlines()
+        lines = raw_text.split('\n')
+        if lines and lines[-1] == '':
+            lines.pop()
         del raw_text
         for raw_line in lines:
             line = unicodedata.normalize("NFC", raw_line)
@@ -3555,7 +4067,10 @@ def load_existing_output_text_lines(
     loaded_lines: list[str] = []
     # Always extract last column — even .txt files may contain tab-separated columns.
     from common_aoai import is_partial_segments_marker as _is_partial_marker
-    reader = csv.reader(raw_text.splitlines(), delimiter="\t")
+    _lines = raw_text.split('\n')
+    if _lines and _lines[-1] == '':
+        _lines.pop()
+    reader = csv.reader(_lines, delimiter="\t")
     for row in reader:
         if not row:
             loaded_lines.append("")
@@ -3763,7 +4278,7 @@ def write_fallback_text_output(
 
 def strip_prompt_comments(prompt_text: str) -> str:
     filtered_lines: list[str] = []
-    for line in prompt_text.splitlines():
+    for line in prompt_text.split('\n'):
         if line.lstrip().startswith("#"):
             continue
         filtered_lines.append(line)
@@ -4232,11 +4747,21 @@ def sanitize_output_string(value: str) -> str:
     if not isinstance(value, str):
         return ""
 
-    normalized = (
-        value.replace("\r\n", " ")
-        .replace("\r", " ")
-        .replace("\n", " ")
-        .replace("\t", " ")
+    # Strip all ASCII control characters (0x00-0x1F, 0x7F) and Unicode line
+    # separators that would break line-based output formats.
+    # Preserve only \t temporarily (replaced with space below).
+    normalized = "".join(
+        " " if (
+            c == "\t"
+            or c == "\n"
+            or c == "\r"
+            or (c < " " and c != "\t")      # ASCII C0 controls (0x00-0x1F)
+            or c == "\x7f"                    # DEL
+            or c == "\x85"                    # NEL (Next Line)
+            or c == "\u2028"                  # LINE SEPARATOR
+            or c == "\u2029"                  # PARAGRAPH SEPARATOR
+        ) else c
+        for c in value
     )
     normalized = re.sub(r" {2,}", " ", normalized)
     return normalized.strip()

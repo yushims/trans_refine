@@ -71,11 +71,11 @@ if (-not $HelpOnly) {
 }
 
 if (-not $HelpOnly -and [string]::IsNullOrWhiteSpace($ApiKey)) {
-    $ApiKey = $env:AZURE_OPENAI_API_KEY
+    $ApiKey = $env:API_KEY
 }
 
 if (-not $HelpOnly -and [string]::IsNullOrWhiteSpace($ApiKey)) {
-    Write-Error "ApiKey is required. Set AZURE_OPENAI_API_KEY or pass -ApiKey <key>."
+    Write-Error "ApiKey is required. Set API_KEY or pass -ApiKey <key>."
     exit 1
 }
 
@@ -88,7 +88,7 @@ $pythonCommand = $pythonRuntime.Command
 $pythonCommandArgs = $pythonRuntime.Args
 $pythonCommandDisplay = $pythonRuntime.Display
 
-$env:AZURE_OPENAI_API_KEY = $ApiKey
+$env:API_KEY = $ApiKey
 
 Write-Host "Launching $resolvedScriptPath with $pythonCommandDisplay" -ForegroundColor Cyan
 if (-not $HelpOnly) {

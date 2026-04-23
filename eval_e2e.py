@@ -45,7 +45,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def non_empty_line_count(file_path: Path) -> int:
-    return sum(1 for line in file_path.read_text(encoding="utf-8").splitlines() if line.strip())
+    return sum(1 for line in file_path.read_text(encoding="utf-8").split('\n') if line.strip())
 
 
 def run_command(
@@ -132,7 +132,9 @@ def run_model(
         out_json = logs_dir / f"run{run_index}_{model}.json"
 
         if skip_existing_results and out_txt.exists() and out_json.exists():
-            lines = out_txt.read_text(encoding="utf-8").splitlines()
+            lines = out_txt.read_text(encoding="utf-8").split('\n')
+            if lines and lines[-1] == '':
+                lines.pop()
             non_empty = sum(1 for line in lines if line.strip())
             if len(lines) >= expected_lines and non_empty >= expected_lines:
                 print(
@@ -187,7 +189,9 @@ def run_model(
                 print(f"{model.upper()} run {run_index} attempt {attempt_index} missing text output")
                 continue
 
-            lines = out_txt.read_text(encoding="utf-8").splitlines()
+            lines = out_txt.read_text(encoding="utf-8").split('\n')
+            if lines and lines[-1] == '':
+                lines.pop()
             non_empty = sum(1 for line in lines if line.strip())
             if len(lines) >= expected_lines and non_empty >= expected_lines:
                 ok = True

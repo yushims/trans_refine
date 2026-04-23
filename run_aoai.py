@@ -6,10 +6,6 @@ import signal
 from openai import AzureOpenAI
 from dotenv import load_dotenv
 from common import (
-    DEFAULT_AOAI_API_VERSION,
-    DEFAULT_AOAI_BATCH_DEPLOYMENT,
-    DEFAULT_AOAI_DEPLOYMENT,
-    DEFAULT_AOAI_ENDPOINT,
     add_aoai_sampling_cli_arguments,
     add_common_runtime_cli_arguments,
     add_run_pipeline_cli_arguments,
@@ -57,9 +53,9 @@ PATCH_SCHEMA = build_patch_response_format_schema()
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     add_run_pipeline_cli_arguments(parser)
-    parser.add_argument("--deployment", dest="deployment", default=DEFAULT_AOAI_DEPLOYMENT)
-    parser.add_argument("--endpoint", dest="endpoint", default=DEFAULT_AOAI_ENDPOINT)
-    parser.add_argument("--api-version", dest="api_version", default=DEFAULT_AOAI_API_VERSION)
+    parser.add_argument("--deployment", dest="deployment", default=None)
+    parser.add_argument("--endpoint", dest="endpoint", default=None)
+    parser.add_argument("--api-version", dest="api_version", default=None)
     add_common_runtime_cli_arguments(parser)
     add_aoai_sampling_cli_arguments(parser)
     parser.add_argument(
@@ -86,8 +82,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--batch-deployment",
         dest="batch_deployment",
-        default=DEFAULT_AOAI_BATCH_DEPLOYMENT,
-        help=f"Deployment name for batch API calls (default: {DEFAULT_AOAI_BATCH_DEPLOYMENT}).",
+        default=None,
+        help="Deployment name for batch API calls (from BATCH_DEPLOYMENT env var).",
+    )
+    parser.add_argument(
+        "--batch-endpoint",
+        dest="batch_endpoint",
+        default=None,
+        help="Azure OpenAI endpoint for batch API calls (defaults to BATCH_ENDPOINT env or --endpoint).",
+    )
+    parser.add_argument(
+        "--batch-api-version",
+        dest="batch_api_version",
+        default=None,
+        help="API version for batch API calls (defaults to BATCH_API_VERSION env or --api-version).",
     )
     parser.add_argument(
         "--batch-use-realtime",
@@ -95,6 +103,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         default=False,
         help="Use real-time chat completion calls instead of the Batch API (faster for debugging).",
+    )
+    parser.add_argument(
+        "--batch-debug-dir",
+        dest="batch_debug_dir",
+        default=None,
+        help="Directory to save raw LLM batch results as JSONL files for debugging (one file per chunk).",
     )
     return parser.parse_args()
 
@@ -135,21 +149,38 @@ async def main() -> None:
 
     args = parse_args()
 
+    # Resolve defaults from env vars (loaded by load_dotenv above).
+    if args.endpoint is None:
+        args.endpoint = os.environ.get("ENDPOINT")
+    if args.api_version is None:
+        args.api_version = os.environ.get("API_VERSION")
+    if args.deployment is None:
+        args.deployment = os.environ.get("DEPLOYMENT")
+    if args.batch_deployment is None:
+        args.batch_deployment = os.environ.get("BATCH_DEPLOYMENT")
+    # Batch-specific endpoint/api-version/api-key: fall back to real-time values.
+    if args.batch_endpoint is None:
+        args.batch_endpoint = os.environ.get("BATCH_ENDPOINT", args.endpoint)
+    if args.batch_api_version is None:
+        args.batch_api_version = os.environ.get("BATCH_API_VERSION", args.api_version)
+
     input_file_value = args.input_file
     output_file_value = args.output_file
     output_as_tsv = bool(input_file_value and str(input_file_value).lower().endswith(".tsv"))
 
-    # In batch mode, always use chunked processing for consistent behavior.
+    # Use chunked/streaming processing when an input file is provided.
+    # Batch mode always uses chunked; real-time mode also uses chunked when
+    # there is an input file so that large files don't have to be fully loaded
+    # before LLM calls begin.
     from common import count_input_lines, iter_transcription_chunks
-    use_chunked = False
-    if args.batch_mode and input_file_value:
-        use_chunked = True
+    use_chunked = bool(input_file_value)
 
     if use_chunked:
-        # Chunked batch mode: process batch_size * concurrency lines at a time.
+        # Chunked mode: process lines in streaming chunks.
         pass  # Will be handled after client setup below.
 
     if not use_chunked:
+        # No input file (stdin) — must pre-load everything.
         input_data = collect_transcriptions_from_input(input_file_value)
         if input_data is None:
             return
@@ -181,6 +212,7 @@ async def main() -> None:
     chain_steps = [step for step in (args.chain_steps or []) if isinstance(step, str) and step.strip()]
     active_step_keys = resolve_active_chain_step_keys(chain_steps)
     resume_from_output = not bool(args.no_resume)
+    retry_content_filtered = bool(getattr(args, "retry_content_filtered", False))
     output_jsonl = bool(args.output_jsonl)
     progress_write_every_arg = args.progress_write_every
     if isinstance(progress_write_every_arg, int):
@@ -225,17 +257,33 @@ async def main() -> None:
         repair_prompt_template_path,
     )
 
-    if not os.environ.get("AZURE_OPENAI_API_KEY") and not os.environ.get("AZURE_OPENAI_AD_TOKEN"):
-        print(
-            "Missing Azure OpenAI credentials. Set AZURE_OPENAI_API_KEY (or AZURE_OPENAI_AD_TOKEN) "
-            "in the current environment or .env file."
-        )
+    api_key = os.environ.get("API_KEY")
+    if not api_key:
+        print("Missing Azure OpenAI credentials. Set API_KEY in the current environment or .env file.")
         return
 
     client = AzureOpenAI(
         azure_endpoint=endpoint,
         api_version=api_version,
+        api_key=api_key,
     )
+
+    # Create a separate client for batch API if endpoint/api-version/api-key differ.
+    batch_api_key = os.environ.get("BATCH_API_KEY")
+    if (
+        args.batch_mode
+        and (args.batch_endpoint != endpoint or args.batch_api_version != api_version or batch_api_key)
+    ):
+        batch_client_kwargs: dict = {
+            "azure_endpoint": args.batch_endpoint,
+            "api_version": args.batch_api_version,
+        }
+        if batch_api_key:
+            batch_client_kwargs["api_key"] = batch_api_key
+        batch_client = AzureOpenAI(**batch_client_kwargs)
+        print(f"Using separate batch endpoint: {args.batch_endpoint}")
+    else:
+        batch_client = client
 
     # Metadata attached to each batch job for identification.
     _input_basename = os.path.basename(args.input_file) if args.input_file else ""
@@ -247,7 +295,7 @@ async def main() -> None:
     # -----------------------------------------------------------------------
     #  Chunked batch mode (large files)
     # -----------------------------------------------------------------------
-    if use_chunked:
+    if use_chunked and args.batch_mode:
         from common import sanitize_output_string
         import csv as _csv
         # Use regular deployment for realtime calls; batch SKU doesn't support chat completions.
@@ -282,11 +330,8 @@ async def main() -> None:
             Prefix columns are kept as-is except for tab/newline characters
             that would break TSV structure.
             """
-            # Partial segment markers must be written verbatim (they contain JSON).
-            if is_partial_segments_marker(corrected_text):
-                ct = corrected_text
-            else:
-                ct = sanitize_output_string(corrected_text)
+            # All text is sanitized to prevent line splitting in the output file.
+            ct = sanitize_output_string(corrected_text)
             if isinstance(source_row, list) and source_row:
                 # Preserve prefix columns exactly, only sanitize TSV-breaking chars.
                 rebuilt = [_sanitize_tsv_cell(v) for v in source_row[:-1]]
@@ -312,17 +357,31 @@ async def main() -> None:
                     _raw = _out_text_path.read_text(encoding="utf-8")
                     # Always extract last column for resume — even .txt files
                     # may contain tab-separated columns.
+                    # Use .split('\n') instead of .splitlines() because
+                    # splitlines() also splits on \x1c, \x1d, \x1e, \x85,
+                    # \u2028, \u2029 which can appear in ASR transcription
+                    # text and would corrupt the line count.
                     import csv as _csv
                     resume_lines = []
-                    for row in _csv.reader(_raw.splitlines(), delimiter="\t"):
+                    _raw_lines = _raw.split("\n")
+                    if _raw_lines and _raw_lines[-1] == "":
+                        _raw_lines.pop()
+                    for row in _csv.reader(_raw_lines, delimiter="\t"):
                         cell = row[-1] if row else ""
-                        # Preserve partial segment markers verbatim (they contain JSON).
-                        if is_partial_segments_marker(cell):
-                            resume_lines.append(cell)
-                        else:
-                            resume_lines.append(sanitize_output_string(cell))
+                        # Sanitize all resume lines unconditionally to strip embedded
+                        # control characters that would corrupt line alignment.
+                        resume_lines.append(sanitize_output_string(cell))
                     non_empty = sum(1 for l in resume_lines if l.strip())
                     print(f"Loaded resume output: {non_empty:,} non-empty lines.")
+                    # Validate resume line count against input to detect corrupt files
+                    # (e.g. from the newline-splitting bug).
+                    input_line_count = count_input_lines(input_file_value)
+                    if input_line_count > 0 and len(resume_lines) > input_line_count:
+                        print(
+                            f"  WARNING: Resume file has {len(resume_lines):,} lines but input has {input_line_count:,}. "
+                            "Resume file appears corrupted (line splitting). Discarding resume data."
+                        )
+                        resume_lines = None
                 except Exception as e:
                     print(f"Could not load resume file: {e}")
 
@@ -436,10 +495,80 @@ async def main() -> None:
             batch_texts: list[str] = []
             pre_resolved: set[int] = set()
 
-            # Inject carry-over items from previous resumed chunks.
-            # They are appended at the end of the batch arrays.
-            chunk_carryover = list(carryover_items)
-            carryover_items.clear()
+            # Process accumulated carry-over items. If there are more than
+            # chunk_size, process them in standalone batches first to avoid
+            # overloading the current chunk's batch.
+            chunk_carryover: list[tuple[int, str, str | None, list[str] | None, str]] = []
+            if carryover_items:
+                while len(carryover_items) > chunk_size:
+                    # Flush a standalone batch of carry-over items.
+                    co_batch = carryover_items[:chunk_size]
+                    carryover_items = carryover_items[chunk_size:]
+                    print(f"  Processing {len(co_batch)} carry-over item(s) in standalone batch ({len(carryover_items)} remaining)...")
+                    co_texts: list[str] = []
+                    co_skip: list[bool] = []
+                    for _, co_text, _, _, _ in co_batch:
+                        stripped_co, _ = strip_emojis(co_text)
+                        prompt_co, _ = normalize_all_uppercase_input(stripped_co)
+                        co_texts.append(prompt_co)
+                        co_skip.append(is_all_uppercase_cased_input(co_text) or is_all_lowercase_cased_input(co_text))
+                    co_payloads = await run_batch_pipeline(
+                        client=batch_client,
+                        deployment=batch_deployment,
+                        transcriptions=co_texts,
+                        prompt_template=prompt_template,
+                        chain_steps=chain_steps,
+                        locale=args.locale,
+                        schema=PATCH_SCHEMA,
+                        temperature=temperature,
+                        top_p=top_p,
+                        batch_size=args.batch_size,
+                        build_patch_prompt_fn=build_patch_prompt,
+                        skip_first_token_casing_preservation_flags=co_skip,
+                        active_step_keys=active_step_keys,
+                        max_input_chars_per_call=max_input_chars_per_call,
+                        concurrency=concurrency,
+                        use_realtime=args.batch_use_realtime,
+                        batch_metadata=batch_metadata,
+                    )
+                    # Patch results at original lines immediately.
+                    co_patches: dict[int, str] = {}
+                    for ci, ((co_gidx, co_text, co_fn, co_sr, co_rl), co_payload) in enumerate(zip(co_batch, co_payloads)):
+                        if co_payload is not None:
+                            co_ct = co_payload.get("corrected_text", "")
+                            if isinstance(co_ct, str) and co_ct.strip() and not is_partial_segments_marker(co_ct):
+                                if args.apply_safe_edits and isinstance(co_text, str) and co_text.strip():
+                                    merged, _ = postprocess_apply_safe_edits(co_text, co_ct)
+                                    co_ct = merged
+                                co_patches[co_gidx] = co_ct
+                            elif isinstance(co_ct, str) and is_partial_segments_marker(co_ct):
+                                co_patches[co_gidx] = co_ct
+                                all_failed_items.append((co_gidx, co_texts[ci], co_text, co_fn, co_skip[ci]))
+                            else:
+                                all_failed_items.append((co_gidx, co_texts[ci], co_text, co_fn, co_skip[ci]))
+                        else:
+                            all_failed_items.append((co_gidx, co_texts[ci], co_text, co_fn, co_skip[ci]))
+                    if co_patches and out_text_path and out_text_path.exists():
+                        from common import sanitize_output_string as _co_san2
+                        co_fl = out_text_path.read_text(encoding="utf-8").split("\n")
+                        if co_fl and co_fl[-1] == "":
+                            co_fl.pop()
+                        for gidx, ct in co_patches.items():
+                            if gidx < len(co_fl):
+                                s_ct = ct if is_partial_segments_marker(ct) else _co_san2(ct)
+                                ln = co_fl[gidx]
+                                if "\t" in ln:
+                                    pfx, _ = ln.rsplit("\t", 1)
+                                    co_fl[gidx] = f"{pfx}\t{s_ct}"
+                                else:
+                                    co_fl[gidx] = s_ct
+                        out_text_path.write_text("\n".join(co_fl) + "\n", encoding="utf-8")
+                        resolved = sum(1 for ct in co_patches.values() if not is_partial_segments_marker(ct))
+                        print(f"  Standalone carry-over: patched {len(co_patches)} item(s) at original lines ({resolved} resolved).")
+                # Remaining carry-over items (≤ chunk_size) will be appended to the chunk batch.
+                chunk_carryover = list(carryover_items)
+                carryover_items.clear()
+
             carryover_batch_offset = len(chunk_transcriptions)  # where carry-over starts in batch arrays
 
             for i, t in enumerate(chunk_transcriptions):
@@ -454,7 +583,11 @@ async def main() -> None:
                 elif resume_lines is not None:
                     ri = global_offset + i
                     if ri < len(resume_lines) and isinstance(resume_lines[ri], str) and resume_lines[ri].strip():
-                        if is_partial_segments_marker(resume_lines[ri]):
+                        resume_cell = resume_lines[ri]
+                        if retry_content_filtered and resume_cell.startswith("%%CF%%"):
+                            # Treat content-filtered cell as empty so it gets retried.
+                            pass
+                        elif is_partial_segments_marker(resume_cell):
                             # Partial segment markers: mark as pre_resolved so
                             # run_batch_pipeline skips them. Partial payload will
                             # be injected into chunk_payloads after pipeline returns.
@@ -490,7 +623,7 @@ async def main() -> None:
 
             # Run batch pipeline for this chunk.
             chunk_payloads = await run_batch_pipeline(
-                client=client,
+                client=batch_client,
                 deployment=batch_deployment,
                 transcriptions=batch_texts,
                 prompt_template=prompt_template,
@@ -508,6 +641,8 @@ async def main() -> None:
                 pre_resolved_indices=pre_resolved,
                 use_realtime=args.batch_use_realtime,
                 batch_metadata=batch_metadata,
+                batch_debug_dir=args.batch_debug_dir,
+                batch_debug_chunk_id=f"{global_offset + 1}_{chunk_end}",
             )
             total_batch_len = chunk_len + len(chunk_carryover)
             assert len(chunk_payloads) == total_batch_len, (
@@ -554,10 +689,10 @@ async def main() -> None:
                         else:
                             snap_output_lines.append("")
                     else:
-                        ct = payload.get("corrected_text")
-                        if isinstance(ct, str) and is_partial_segments_marker(ct):
+                        ct = sanitize_output_string(payload.get("corrected_text") or "")
+                        if is_partial_segments_marker(ct):
                             snap_output_lines.append(ct)
-                        elif isinstance(ct, str) and ct.strip():
+                        elif ct.strip():
                             if args.apply_safe_edits:
                                 original = chunk_transcriptions[i]
                                 if isinstance(original, str) and original.strip():
@@ -635,7 +770,7 @@ async def main() -> None:
                 retry_max_chars = max(1, max_input_chars_per_call // (2 ** chunk_retry)) if max_input_chars_per_call > 0 else 0
 
                 retry_payloads = await run_batch_pipeline(
-                    client=client,
+                    client=batch_client,
                     deployment=batch_deployment,
                     transcriptions=retry_texts,
                     prompt_template=prompt_template,
@@ -733,7 +868,7 @@ async def main() -> None:
                                 out_jsonl_path, payload, source_fn, active_step_keys,
                             )
 
-            # Patch carry-over results back into the output file.
+            # Patch carry-over results back into their original lines in the output file.
             if chunk_carryover and out_text_path and out_text_path.exists():
                 carryover_patches: dict[int, str] = {}
                 for co_idx, (co_global_idx, co_text, co_fn, co_sr, co_resume_line) in enumerate(chunk_carryover):
@@ -756,22 +891,22 @@ async def main() -> None:
                             all_failed_items.append((co_global_idx, batch_texts[batch_idx], co_text, co_fn, skip_flags[batch_idx]))
 
                 if carryover_patches:
-                    from common import sanitize_output_string as _san
-                    output_lines_all = out_text_path.read_text(encoding="utf-8").split("\n")
-                    if output_lines_all and output_lines_all[-1] == "":
-                        output_lines_all.pop()
+                    from common import sanitize_output_string as _co_san
+                    co_file_lines = out_text_path.read_text(encoding="utf-8").split("\n")
+                    if co_file_lines and co_file_lines[-1] == "":
+                        co_file_lines.pop()
                     for gidx, ct in carryover_patches.items():
-                        if gidx < len(output_lines_all):
-                            sanitized_ct = ct if is_partial_segments_marker(ct) else _san(ct)
-                            line = output_lines_all[gidx]
-                            if "\t" in line:
-                                prefix, _ = line.rsplit("\t", 1)
-                                output_lines_all[gidx] = f"{prefix}\t{sanitized_ct}"
+                        if gidx < len(co_file_lines):
+                            sanitized_ct = ct if is_partial_segments_marker(ct) else _co_san(ct)
+                            co_line = co_file_lines[gidx]
+                            if "\t" in co_line:
+                                co_prefix, _ = co_line.rsplit("\t", 1)
+                                co_file_lines[gidx] = f"{co_prefix}\t{sanitized_ct}"
                             else:
-                                output_lines_all[gidx] = sanitized_ct
-                    out_text_path.write_text("\n".join(output_lines_all) + "\n", encoding="utf-8")
+                                co_file_lines[gidx] = sanitized_ct
+                    out_text_path.write_text("\n".join(co_file_lines) + "\n", encoding="utf-8")
                     resolved_co = sum(1 for ct in carryover_patches.values() if not is_partial_segments_marker(ct))
-                    print(f"  Patched {len(carryover_patches)} carry-over item(s) ({resolved_co} resolved).")
+                    print(f"  Patched {len(carryover_patches)} carry-over item(s) at original lines ({resolved_co} resolved).")
 
             total_written += chunk_len
             print(f"  Chunk complete. Total written: {total_written:,}")
@@ -858,8 +993,10 @@ async def main() -> None:
                     failed_seg_map: list[tuple[int, int]] = []  # (partial_idx, seg_idx)
                     for pi, (global_idx, seg_parts, seg_limit, orig_text, skip_flag) in enumerate(partial_items):
                         for si, (ok, text) in enumerate(seg_parts):
-                            if ok is True or ok == "filtered":
-                                continue  # Skip ok and content-filtered segments.
+                            if ok is True:
+                                continue  # Skip successful segments.
+                            if ok == "filtered" and not retry_content_filtered:
+                                continue  # Skip content-filtered segments (unless retry requested).
                             failed_seg_texts.append(text)
                             failed_seg_map.append((pi, si))
 
@@ -867,7 +1004,7 @@ async def main() -> None:
                         print(f"  Retrying {len(failed_seg_texts)} failed segments from {len(partial_items)} partial items...")
                         seg_skip_flags = [False] * len(failed_seg_texts)
                         seg_payloads = await run_batch_pipeline(
-                            client=client,
+                            client=batch_client,
                             deployment=batch_deployment,
                             transcriptions=failed_seg_texts,
                             prompt_template=prompt_template,
@@ -915,7 +1052,7 @@ async def main() -> None:
                     retry_skip_flags = [item[4] for item in full_retry_items]
 
                     retry_payloads = await run_batch_pipeline(
-                        client=client,
+                        client=batch_client,
                         deployment=batch_deployment,
                         transcriptions=retry_texts,
                         prompt_template=prompt_template,
@@ -1005,7 +1142,299 @@ async def main() -> None:
         return
 
     # -----------------------------------------------------------------------
-    #  Real-time mode (default)
+    #  Chunked real-time mode (streaming from file)
+    # -----------------------------------------------------------------------
+    if use_chunked and not args.batch_mode:
+        from common import sanitize_output_string, resolve_path as _resolve_path
+
+        # Use the same chunk_size as batch mode but for real-time calls.
+        rt_chunk_size = args.batch_size * concurrency
+
+        def _sanitize_tsv_cell(value: str) -> str:
+            if not isinstance(value, str):
+                return ""
+            return value.replace("\t", " ").replace("\n", " ").replace("\r", " ")
+
+        def _build_output_line(
+            corrected_text: str,
+            source_row: list[str] | None,
+            filename: str | None,
+        ) -> str:
+            ct = sanitize_output_string(corrected_text)
+            if isinstance(source_row, list) and source_row:
+                rebuilt = [_sanitize_tsv_cell(v) for v in source_row[:-1]]
+                rebuilt.append(ct)
+                return "\t".join(rebuilt)
+            if isinstance(filename, str) and filename:
+                return f"{_sanitize_tsv_cell(filename)}\t{ct}"
+            return ct
+
+        # Load resume lines if output file exists.
+        import csv as _rt_csv
+        resume_lines: list[str] | None = None
+        if resume_from_output and output_file_value:
+            _out_path = _resolve_path(output_file_value)
+            _out_text_path = _out_path.with_suffix(".tsv") if output_as_tsv else _out_path.with_suffix(".txt")
+            if not _out_text_path.exists():
+                _alt_path = _out_path.with_suffix(".txt") if output_as_tsv else _out_path.with_suffix(".tsv")
+                if _alt_path.exists():
+                    _out_text_path = _alt_path
+            if _out_text_path.exists():
+                try:
+                    _raw = _out_text_path.read_text(encoding="utf-8")
+                    resume_lines = []
+                    _raw_lines = _raw.split("\n")
+                    if _raw_lines and _raw_lines[-1] == "":
+                        _raw_lines.pop()
+                    for row in _rt_csv.reader(_raw_lines, delimiter="\t"):
+                        cell = row[-1] if row else ""
+                        resume_lines.append(sanitize_output_string(cell))
+                    non_empty = sum(1 for l in resume_lines if l.strip())
+                    print(f"Loaded resume output: {non_empty:,} non-empty lines.")
+                    input_line_count = count_input_lines(input_file_value)
+                    if input_line_count > 0 and len(resume_lines) > input_line_count:
+                        print(
+                            f"  WARNING: Resume file has {len(resume_lines):,} lines but input has {input_line_count:,}. "
+                            "Resume file appears corrupted. Discarding resume data."
+                        )
+                        resume_lines = None
+                except Exception as e:
+                    print(f"Could not load resume file: {e}")
+
+        # Prepare output paths.
+        out_path = _resolve_path(output_file_value) if output_file_value else None
+        out_text_path = None
+        if out_path:
+            out_text_path = out_path.with_suffix(".tsv") if output_as_tsv else out_path.with_suffix(".txt")
+            out_text_path.parent.mkdir(parents=True, exist_ok=True)
+
+        first_write = True
+        total_written = 0
+        global_line_count = count_input_lines(input_file_value)
+
+        print(
+            f"Streaming real-time mode (deployment={deployment}, "
+            f"chunk_size={rt_chunk_size:,}, concurrency={concurrency}, "
+            f"total_lines={global_line_count:,})"
+        )
+
+        for global_offset, chunk_transcriptions, chunk_filenames, chunk_source_rows in iter_transcription_chunks(
+            input_file_value, rt_chunk_size, max_input_chars_per_call=max_input_chars_per_call
+        ):
+            if shutdown_requested.is_set():
+                break
+
+            chunk_len = len(chunk_transcriptions)
+            chunk_end = global_offset + chunk_len
+            print(f"\n--- Chunk [{global_offset + 1:,}..{chunk_end:,}] ({chunk_len:,} items) ---")
+
+            # Check resume: skip chunk if fully resolved.
+            chunk_resume: list[str] | None = None
+            if resume_lines is not None:
+                cr = resume_lines[global_offset:chunk_end] if global_offset < len(resume_lines) else []
+                if len(cr) == chunk_len and all(isinstance(cl, str) and cl.strip() for cl in cr):
+                    print(f"  Chunk already completed in resume output; skipping.")
+                    if out_text_path:
+                        out_lines = [
+                            _build_output_line(
+                                cr[i],
+                                chunk_source_rows[i] if i < len(chunk_source_rows) else None,
+                                chunk_filenames[i] if i < len(chunk_filenames) else None,
+                            )
+                            for i in range(chunk_len)
+                        ]
+                        content = "\n".join(out_lines) + "\n"
+                        if first_write:
+                            out_text_path.write_text(content, encoding="utf-8")
+                            first_write = False
+                        else:
+                            with out_text_path.open("a", encoding="utf-8") as fh:
+                                fh.write(content)
+                    total_written += chunk_len
+                    continue
+                # Partial resume — use what we have.
+                if len(cr) == chunk_len:
+                    chunk_resume = cr
+
+            # Per-chunk arrays.
+            chunk_payloads: list[dict | None] = [None] * chunk_len
+            chunk_output_lines: list[str] = [""] * chunk_len
+
+            # Pre-fill from resume.
+            if chunk_resume is not None:
+                for ci, cl in enumerate(chunk_resume):
+                    if isinstance(cl, str) and cl.strip():
+                        chunk_output_lines[ci] = cl
+
+            async def _process_chunk_item(index: int, transcription: str, total: int) -> None:
+                if shutdown_requested.is_set():
+                    return
+                slot = index - 1  # index is 1-based within chunk
+                global_index = global_offset + slot + 1
+                processing_id = f"{global_index:,}/{chunk_end:,}"
+
+                if is_input_comment_line(transcription):
+                    chunk_output_lines[slot] = transcription
+                    return
+
+                if not transcription.strip():
+                    chunk_payloads[slot] = build_empty_payload()
+                    chunk_payloads[slot]["source_text"] = transcription
+                    return
+
+                # Resume check.
+                if chunk_resume is not None:
+                    existing = chunk_output_lines[slot]
+                    if isinstance(existing, str) and existing.strip():
+                        chunk_payloads[slot] = build_empty_payload()
+                        chunk_payloads[slot]["source_text"] = transcription
+                        chunk_payloads[slot]["corrected_text"] = existing
+                        return
+
+                stripped_transcription, _ = strip_emojis(transcription)
+                prompt_transcription, _ = normalize_all_uppercase_input(stripped_transcription)
+                source_was_all_uppercase = is_all_uppercase_cased_input(transcription)
+                source_was_all_lowercase = is_all_lowercase_cased_input(transcription)
+                skip_casing = source_was_all_uppercase or source_was_all_lowercase
+
+                try:
+                    source_length = len(prompt_transcription)
+                    segment_payloads: list[dict] = []
+                    segment_sources: list[str] = []
+                    payload: dict | None = None
+                    segment_index = 1
+                    start_offset = 0
+
+                    while start_offset < source_length:
+                        remaining_length = source_length - start_offset
+                        if max_input_chars_per_call > 0:
+                            current_limit = min(max_input_chars_per_call, remaining_length)
+                        else:
+                            current_limit = remaining_length
+
+                        segment_succeeded = False
+                        while True:
+                            seg_text, _ = take_next_transcription_segment_for_llm(
+                                prompt_transcription, start_offset, current_limit,
+                            )
+                            if not seg_text:
+                                seg_text = prompt_transcription[start_offset:start_offset + 1]
+
+                            seg_id = f"{processing_id} seg {segment_index}"
+                            _CTX_LEN = 50
+                            seg_prev_ctx = segment_sources[-1][-_CTX_LEN:] if segment_sources else None
+                            seg_next_end = start_offset + len(seg_text)
+                            seg_next_ctx = prompt_transcription[seg_next_end:seg_next_end + _CTX_LEN] if seg_next_end < source_length else None
+
+                            prompt = build_patch_prompt(
+                                prompt_template, seg_text, chain_steps,
+                                locale=args.locale,
+                                prev_context=seg_prev_ctx,
+                                next_context=seg_next_ctx,
+                            )
+
+                            seg_payload = await get_patch_payload_with_repair(
+                                client=client, deployment=deployment,
+                                prompt=prompt, transcription=seg_text,
+                                processing_id=seg_id,
+                                repair_prompt_template=repair_prompt_template,
+                                patch_schema=PATCH_SCHEMA,
+                                timeout_seconds=timeout_seconds,
+                                timeout_retries=timeout_retries,
+                                empty_result_retries=empty_result_retries,
+                                temperature=temperature, top_p=top_p,
+                                retry_temperature_jitter=retry_temperature_jitter,
+                                retry_top_p_jitter=retry_top_p_jitter,
+                                skip_first_token_casing_preservation=skip_casing,
+                                active_step_keys=active_step_keys,
+                            )
+
+                            if seg_payload is not None:
+                                segment_payloads.append(seg_payload)
+                                segment_sources.append(seg_text)
+                                start_offset += len(seg_text)
+                                segment_index += 1
+                                segment_succeeded = True
+                                break
+
+                            if len(seg_text) > 1 and current_limit > 1:
+                                next_limit = max(1, min(current_limit - 1, len(seg_text) - 1, current_limit // 2))
+                                if next_limit < current_limit:
+                                    current_limit = next_limit
+                                    continue
+
+                            payload = None
+                            break
+
+                        if not segment_succeeded:
+                            break
+
+                    if len(segment_sources) > 1:
+                        payload = merge_segment_payloads(segment_payloads, segment_sources) if len(segment_payloads) == len(segment_sources) else None
+                    elif segment_payloads:
+                        payload = segment_payloads[0]
+                    else:
+                        payload = None
+
+                    assign_payload_or_emit_empty(payload, chunk_payloads, slot, global_index, chunk_end)
+                    resolved = chunk_payloads[slot]
+                    if isinstance(resolved, dict):
+                        fn = chunk_filenames[slot] if slot < len(chunk_filenames) else None
+                        if isinstance(fn, str) and fn:
+                            resolved["source_filename"] = fn
+                        resolved["source_text"] = transcription
+                        ct = resolved.get("corrected_text")
+                        if args.apply_safe_edits and isinstance(ct, str) and ct.strip() and transcription.strip():
+                            merged, _ = postprocess_apply_safe_edits(transcription, ct)
+                            if merged != ct:
+                                resolved["corrected_text"] = merged
+                                ct = merged
+                        chunk_output_lines[slot] = ct if isinstance(ct, str) else ""
+
+                except asyncio.CancelledError:
+                    chunk_payloads[slot] = build_empty_payload()
+                    chunk_payloads[slot]["source_text"] = transcription
+                    chunk_output_lines[slot] = ""
+                except Exception as error:
+                    chunk_payloads[slot] = build_empty_payload()
+                    chunk_payloads[slot]["source_text"] = transcription
+                    chunk_output_lines[slot] = ""
+                    print(f"[{processing_id}] Error: {error}; emitting empty payload.")
+
+            # Process this chunk with concurrency.
+            await run_transcriptions_with_concurrency(
+                chunk_transcriptions, concurrency, _process_chunk_item,
+                global_offset=global_offset,
+                global_total=global_line_count,
+            )
+
+            # Write chunk output.
+            if out_text_path:
+                out_lines = [
+                    _build_output_line(
+                        chunk_output_lines[i],
+                        chunk_source_rows[i] if i < len(chunk_source_rows) else None,
+                        chunk_filenames[i] if i < len(chunk_filenames) else None,
+                    )
+                    for i in range(chunk_len)
+                ]
+                content = "\n".join(out_lines) + "\n"
+                if first_write:
+                    out_text_path.write_text(content, encoding="utf-8")
+                    first_write = False
+                else:
+                    with out_text_path.open("a", encoding="utf-8") as fh:
+                        fh.write(content)
+
+            total_written += chunk_len
+            print(f"  Chunk complete. Total written: {total_written:,}")
+
+        if shutdown_requested.is_set():
+            print("Shutdown handler completed final progress flush.")
+        return
+
+    # -----------------------------------------------------------------------
+    #  Real-time mode — stdin fallback (no input file)
     # -----------------------------------------------------------------------
     payloads: list[dict | None] = [None] * len(transcriptions)
     text_output_lines: list[str] = [""] * len(transcriptions)

@@ -1,10 +1,12 @@
 import argparse
 import asyncio
 import json
+import os
 import random
 from pathlib import Path
 
 from openai import AzureOpenAI
+from dotenv import load_dotenv
 
 from common_eval import (
     build_aligned_edits,
@@ -18,9 +20,6 @@ from common_eval import (
 from common import (
     _CHAIN_ID_TO_NAME,
     _resolve_active_chain_ids,
-    DEFAULT_AOAI_API_VERSION,
-    DEFAULT_AOAI_DEPLOYMENT,
-    DEFAULT_AOAI_ENDPOINT,
     add_aoai_sampling_cli_arguments,
     add_chain_steps_cli_argument,
     add_common_runtime_cli_arguments,
@@ -95,16 +94,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt-file", dest="prompt_file", default="prompt_eval.md")
     parser.add_argument("--repair-prompt-file", dest="repair_prompt_file", default="prompt_repair.md")
     add_chain_steps_cli_argument(parser)
-    parser.add_argument("--deployment", dest="deployment", default=DEFAULT_AOAI_DEPLOYMENT)
-    parser.add_argument("--endpoint", dest="endpoint", default=DEFAULT_AOAI_ENDPOINT)
-    parser.add_argument("--api-version", dest="api_version", default=DEFAULT_AOAI_API_VERSION)
+    parser.add_argument("--deployment", dest="deployment", default=None)
+    parser.add_argument("--endpoint", dest="endpoint", default=None)
+    parser.add_argument("--api-version", dest="api_version", default=None)
     add_common_runtime_cli_arguments(parser)
     add_aoai_sampling_cli_arguments(parser)
     return parser.parse_args()
 
 
 async def main() -> None:
+    load_dotenv()
     args = parse_args()
+
+    if args.endpoint is None:
+        args.endpoint = os.environ.get("ENDPOINT")
+    if args.api_version is None:
+        args.api_version = os.environ.get("API_VERSION")
+    if args.deployment is None:
+        args.deployment = os.environ.get("DEPLOYMENT")
 
     input_file_value = args.orginal_trans_file
     input_file = Path(input_file_value)
@@ -148,6 +155,7 @@ async def main() -> None:
     client = AzureOpenAI(
         azure_endpoint=endpoint,
         api_version=api_version,
+        api_key=os.environ.get("API_KEY"),
     )
 
     print(f"Using deployment: {deployment}")
@@ -163,7 +171,9 @@ async def main() -> None:
     print(f"Empty-result retries: {empty_result_retries}")
     print(f"Active eval chain steps: {chain_steps_text}")
 
-    src_lines = input_file.read_text(encoding="utf-8").splitlines()
+    src_lines = input_file.read_text(encoding="utf-8").split('\n')
+    if src_lines and src_lines[-1] == '':
+        src_lines.pop()
     eval_template = load_prompt_template(prompt_file)
     repair_prompt_template = load_prompt_template(repair_prompt_file)
     patch_result_files = [value.strip() for value in str(args.patch_result_file).split(",") if value.strip()]
@@ -203,7 +213,9 @@ async def main() -> None:
             )
             continue
 
-        out_lines = path.read_text(encoding="utf-8").splitlines()
+        out_lines = path.read_text(encoding="utf-8").split('\n')
+        if out_lines and out_lines[-1] == '':
+            out_lines.pop()
         line_results: list[dict] = []
         max_lines = max(len(src_lines), len(out_lines))
         semaphore = asyncio.Semaphore(concurrency)

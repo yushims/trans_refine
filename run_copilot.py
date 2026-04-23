@@ -1,11 +1,12 @@
 import argparse
 import asyncio
+import os
 import signal
 from typing import Any
 
 from copilot import CopilotClient  # pyright: ignore[reportMissingImports]
+from dotenv import load_dotenv
 from common import (
-    DEFAULT_COPILOT_MODEL,
     add_common_runtime_cli_arguments,
     add_run_pipeline_cli_arguments,
     add_model_mismatch_retries_cli_argument,
@@ -44,7 +45,7 @@ from common_copilot import (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     add_run_pipeline_cli_arguments(parser)
-    parser.add_argument("--model", dest="model", default=DEFAULT_COPILOT_MODEL)
+    parser.add_argument("--model", dest="model", default=None)
     add_common_runtime_cli_arguments(parser)
     add_model_mismatch_retries_cli_argument(parser)
     parser.add_argument("--list-models-only", dest="list_models_only", action="store_true")
@@ -54,6 +55,7 @@ def parse_args() -> argparse.Namespace:
 
 async def main():
     install_safe_console_output()
+    load_dotenv()
     loop = asyncio.get_running_loop()
     shutdown_requested = asyncio.Event()
     installed_signal_handlers: list[tuple[signal.Signals, object]] = []
@@ -85,6 +87,8 @@ async def main():
             continue
 
     args = parse_args()
+    if args.model is None:
+        args.model = os.environ.get("COPILOT_MODEL")
 
     input_file_value = args.input_file
     output_file_value = args.output_file
