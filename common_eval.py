@@ -21,7 +21,7 @@ from common import (
     _OPENING_PUNCT_TOKENS,
     _char_based_script_group,
     _is_punct_token,
-    _tokenize_for_hallucination,
+    _tokenize_for_content_guards,
     build_repair_prompt_after_invalid_json,
     extract_retry_after_seconds,
     strip_markdown_code_fence,
@@ -718,8 +718,8 @@ def build_aligned_edits(original_text: str, patched_text: str) -> str:
         return expanded_left, expanded_right
 
     # Reuse hallucination tokenization so eval alignment matches detection granularity.
-    source_units = _expand_alignment_units(_tokenize_for_hallucination(source))
-    target_units = _expand_alignment_units(_tokenize_for_hallucination(target))
+    source_units = _expand_alignment_units(_tokenize_for_content_guards(source))
+    target_units = _expand_alignment_units(_tokenize_for_content_guards(target))
 
     matcher = difflib.SequenceMatcher(a=source_units, b=target_units, autojunk=False)
     opcodes = matcher.get_opcodes()

@@ -50,7 +50,9 @@ def main() -> None:
         sys.exit(1)
 
     print(f"Reading input: {input_path}")
-    lines = input_path.read_text(encoding="utf-8").splitlines()
+    lines = input_path.read_text(encoding="utf-8").split('\n')
+    if lines and lines[-1] == '':
+        lines.pop()
     print(f"  {len(lines):,} lines, max-chars={max_chars:,}")
 
     segmented_lines: list[str] = []

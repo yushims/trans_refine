@@ -112,7 +112,9 @@ def main() -> None:
 
     # Build global source label map from all input lines.
     print(f"Reading input: {input_path}")
-    inp_lines = input_path.read_text(encoding="utf-8").splitlines()
+    inp_lines = input_path.read_text(encoding="utf-8").split('\n')
+    if inp_lines and inp_lines[-1] == '':
+        inp_lines.pop()
     print(f"  {len(inp_lines):,} lines")
 
     source_labels: dict[str, str] = {}
@@ -128,7 +130,9 @@ def main() -> None:
 
     # Fix output file.
     print(f"Reading output to fix: {fix_path}")
-    fix_lines = fix_path.read_text(encoding="utf-8").splitlines()
+    fix_lines = fix_path.read_text(encoding="utf-8").split('\n')
+    if fix_lines and fix_lines[-1] == '':
+        fix_lines.pop()
     print(f"  {len(fix_lines):,} lines")
 
     fixed_lines: list[str] = []

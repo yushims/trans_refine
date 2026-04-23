@@ -2,12 +2,12 @@
 
 import argparse
 import datetime
+import os
 import sys
 from collections import defaultdict
 
 from openai import AzureOpenAI
 from dotenv import load_dotenv
-from common import DEFAULT_AOAI_API_VERSION, DEFAULT_AOAI_ENDPOINT
 
 
 ACTIVE_STATUSES = {"validating", "in_progress", "finalizing"}
@@ -48,8 +48,8 @@ def _print_batch(b) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="List and cancel active Azure OpenAI batch jobs.")
-    parser.add_argument("--endpoint", default=DEFAULT_AOAI_ENDPOINT)
-    parser.add_argument("--api-version", default=DEFAULT_AOAI_API_VERSION)
+    parser.add_argument("--endpoint", default=None)
+    parser.add_argument("--api-version", default=None)
     parser.add_argument("--cancel", action="store_true", help="Actually cancel matched active jobs. Without this flag, only lists jobs (dry run).")
     parser.add_argument("--all", action="store_true", help="Show all batch jobs, not just active ones.")
     parser.add_argument("--user", dest="user_filter", help="Only match jobs whose metadata user contains this substring.")
@@ -60,7 +60,13 @@ def main() -> None:
     args = parser.parse_args()
 
     load_dotenv()
-    client = AzureOpenAI(azure_endpoint=args.endpoint, api_version=args.api_version)
+    if args.endpoint is None:
+        args.endpoint = os.environ.get("BATCH_ENDPOINT") or os.environ.get("ENDPOINT")
+    if args.api_version is None:
+        args.api_version = os.environ.get("BATCH_API_VERSION") or os.environ.get("API_VERSION")
+    api_key = os.environ.get("BATCH_API_KEY") or os.environ.get("API_KEY")
+    client = AzureOpenAI(azure_endpoint=args.endpoint, api_version=args.api_version,
+                         api_key=api_key)
 
     # Cancel a specific batch by ID.
     if args.batch_id:

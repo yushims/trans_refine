@@ -1,12 +1,13 @@
 import argparse
 import asyncio
 import json
+import os
 from pathlib import Path
 
 from copilot import CopilotClient  # pyright: ignore[reportMissingImports]
+from dotenv import load_dotenv
 
 from common import (
-    DEFAULT_COPILOT_MODEL,
     add_chain_steps_cli_argument,
     add_common_runtime_cli_arguments,
     add_model_mismatch_retries_cli_argument,
@@ -30,14 +31,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prefix", default="eval")
     parser.add_argument("--prompt-file", default="prompt_eval.md")
     add_chain_steps_cli_argument(parser)
-    parser.add_argument("--model", default=DEFAULT_COPILOT_MODEL)
+    parser.add_argument("--model", default=None)
     add_common_runtime_cli_arguments(parser, timeout_default=120.0)
     add_model_mismatch_retries_cli_argument(parser)
     return parser.parse_args()
 
 
 async def main_async() -> None:
+    load_dotenv()
     args = parse_args()
+    if args.model is None:
+        args.model = os.environ.get("COPILOT_MODEL")
 
     input_file = Path(args.orginal_trans_file)
     if not input_file.exists():
@@ -58,7 +62,9 @@ async def main_async() -> None:
     concurrency = max(1, int(args.concurrency))
     chain_steps_text = format_resolved_chain_steps(args.chain_steps)
 
-    src_lines = input_file.read_text(encoding="utf-8").splitlines()
+    src_lines = input_file.read_text(encoding="utf-8").split('\n')
+    if src_lines and src_lines[-1] == '':
+        src_lines.pop()
     eval_template = load_prompt_template(prompt_file)
     patch_result_files = [value.strip() for value in str(args.patch_result_file).split(",") if value.strip()]
     if not patch_result_files:
@@ -108,7 +114,9 @@ async def main_async() -> None:
                 )
                 continue
 
-            out_lines = path.read_text(encoding="utf-8").splitlines()
+            out_lines = path.read_text(encoding="utf-8").split('\n')
+            if out_lines and out_lines[-1] == '':
+                out_lines.pop()
             line_results: list[dict] = []
             max_lines = max(len(src_lines), len(out_lines))
             semaphore = asyncio.Semaphore(concurrency)

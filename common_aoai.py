@@ -120,10 +120,22 @@ async def aoai_send_once(
         "top_p": top_p,
     }
 
-    completion = await asyncio.wait_for(
-        asyncio.to_thread(client.chat.completions.create, **request_kwargs),
-        timeout=timeout_seconds,
-    )
+    try:
+        completion = await asyncio.wait_for(
+            asyncio.to_thread(client.chat.completions.create, **request_kwargs),
+            timeout=timeout_seconds,
+        )
+    except Exception as e:
+        status_code = getattr(e, "status_code", None)
+        if status_code == 400 and "unsupported" in str(e).lower():
+            # Deployment may not support json_schema — fall back to json_object.
+            request_kwargs["response_format"] = {"type": "json_object"}
+            completion = await asyncio.wait_for(
+                asyncio.to_thread(client.chat.completions.create, **request_kwargs),
+                timeout=timeout_seconds,
+            )
+        else:
+            raise
 
     choices = getattr(completion, "choices", None)
     if not choices:
@@ -315,6 +327,8 @@ async def run_batch_pipeline(
     on_pass_complete: Callable[[list], None] | None = None,
     use_realtime: bool = False,
     batch_metadata: dict[str, str] | None = None,
+    batch_debug_dir: str | None = None,
+    batch_debug_chunk_id: str | None = None,
 ) -> list[dict | None]:
     """Run the full batch pipeline: partition, submit, parse results.
 
@@ -488,6 +502,27 @@ async def run_batch_pipeline(
             for part_num, start in enumerate(partition_starts, 1)
         ])
 
+    # --- Debug: save/load raw LLM results ---
+    if batch_debug_dir:
+        from pathlib import Path
+        debug_dir = Path(batch_debug_dir)
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        chunk_label = batch_debug_chunk_id or "chunk"
+        # Save raw LLM results as JSON (one key per result)
+        debug_path = debug_dir / f"batch_raw_{chunk_label}.json"
+        raw_debug = {key: content for key, content in sorted(all_raw_results.items())}
+        with open(debug_path, "w", encoding="utf-8") as df:
+            json.dump(raw_debug, df, ensure_ascii=False, indent=2)
+        # Save full inputs for cross-reference
+        debug_inputs_path = debug_dir / f"batch_inputs_{chunk_label}.json"
+        inputs_debug = [
+            {"key": custom_key, "orig_idx": orig_idx, "text": text}
+            for custom_key, orig_idx, text, prev_ctx, next_ctx in batch_entries
+        ]
+        with open(debug_inputs_path, "w", encoding="utf-8") as df:
+            json.dump(inputs_debug, df, ensure_ascii=False, indent=2)
+        print(f"  Debug: saved {len(all_raw_results)} raw results to {debug_path}")
+
     # Process non-segmented items.
     for custom_key, orig_idx, text, _prev_ctx, _next_ctx in batch_entries:
         if orig_idx in segment_groups:
@@ -656,9 +691,12 @@ async def _submit_batch_and_wait_keyed(
             client.batches.create,
             **create_kwargs,
         )
-        print(f"[batch{batch_label}] Submitted job {batch_job.id} with {len(jsonl_lines)} requests.")
+        _now = time.strftime("%H:%M:%S")
+        print(f"[batch{batch_label}] {_now} Submitted job {batch_job.id} with {len(jsonl_lines)} requests.")
 
         prev_status: str | None = None
+        _submit_t = time.monotonic()
+        _phase_t = _submit_t
         while True:
             # Check for shutdown request.
             if _shutdown_event is not None and _shutdown_event.is_set():
@@ -674,7 +712,12 @@ async def _submit_batch_and_wait_keyed(
             )
             changed = status.status != prev_status
             if changed:
-                print(f"[batch{batch_label}] Status: {status.status}")
+                _now = time.strftime("%H:%M:%S")
+                _elapsed = time.monotonic() - _phase_t
+                _total = time.monotonic() - _submit_t
+                _prev_label = f" ({prev_status} took {_elapsed:.0f}s)" if prev_status else ""
+                print(f"[batch{batch_label}] {_now} Status: {status.status}{_prev_label}  [total {_total:.0f}s]")
+                _phase_t = time.monotonic()
             prev_status = status.status
             if status.status in ("completed", "failed", "cancelled", "expired"):
                 break
@@ -756,3 +799,4 @@ async def _submit_batch_and_wait_keyed(
                 _call_with_retry(client.files.delete, fid)
             except Exception:
                 pass
+

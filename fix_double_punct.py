@@ -25,9 +25,6 @@ from collections import defaultdict
 from pathlib import Path
 
 from common import (
-    DEFAULT_AOAI_API_VERSION,
-    DEFAULT_AOAI_DEPLOYMENT,
-    DEFAULT_AOAI_ENDPOINT,
     install_safe_console_output,
     resolve_path,
 )
@@ -210,15 +207,23 @@ def run_extract(args: argparse.Namespace) -> None:
 # Phase 2: JUDGE
 # ---------------------------------------------------------------------------
 
-def _build_judge_prompt(batch_patterns: list[dict]) -> str:
+def _build_judge_prompt(batch_patterns: list[dict], minimal_context: bool = False) -> str:
     items: list[str] = []
     for idx, p in enumerate(batch_patterns, 1):
-        ex = p["examples"][0]
-        left = ex["left"][-25:] if len(ex["left"]) > 25 else ex["left"]
-        right = ex["right"][:25] if len(ex["right"]) > 25 else ex["right"]
-        match = ex["match"]
-        snippet = f"{left}\u25b8{match}\u25c2{right}"
-        items.append(f"{idx}. key={repr(p['key'])} context: \"{snippet}\"")
+        if minimal_context:
+            ex = p["examples"][0]
+            left = " ".join(ex["left"].split()[-2:])[-15:]
+            right = " ".join(ex["right"].split()[:2])[:15]
+            match = ex["match"]
+            snippet = f"{left}\u25b8{match}\u25c2{right}"
+            items.append(f"{idx}. key={repr(p['key'])} context: \"{snippet}\"")
+        else:
+            ex = p["examples"][0]
+            left = ex["left"][-10:] if len(ex["left"]) > 10 else ex["left"]
+            right = ex["right"][:10] if len(ex["right"]) > 10 else ex["right"]
+            match = ex["match"]
+            snippet = f"{left}\u25b8{match}\u25c2{right}"
+            items.append(f"{idx}. key={repr(p['key'])} context: \"{snippet}\"")
 
     return (
         "You are a text proofreading assistant. Below are text snippets where "
@@ -260,13 +265,13 @@ async def run_judge(args: argparse.Namespace) -> None:
     print(f"Judging {len(patterns)} unique patterns...")
 
     endpoint = args.endpoint or os.environ.get(
-        "AZURE_OPENAI_ENDPOINT", DEFAULT_AOAI_ENDPOINT
+        "AZURE_OPENAI_ENDPOINT"
     )
     deployment = args.deployment or os.environ.get(
-        "AZURE_OPENAI_DEPLOYMENT", DEFAULT_AOAI_DEPLOYMENT
+        "AZURE_OPENAI_DEPLOYMENT"
     )
     api_version = args.api_version or os.environ.get(
-        "AZURE_OPENAI_API_VERSION", DEFAULT_AOAI_API_VERSION
+        "API_VERSION"
     )
     batch_size = args.batch_size
     concurrency = args.concurrency
@@ -298,12 +303,15 @@ async def run_judge(args: argparse.Namespace) -> None:
     else:
         print(f"  {len(remaining)} patterns remaining to judge...")
 
+    filtered_keys: set[str] = set()
+
     async def judge_batch(
-        batch_patterns: list[dict], batch_idx: int
+        batch_patterns: list[dict], batch_idx: int,
+        use_minimal_context: bool = False,
     ) -> None:
         nonlocal failed_batches
         async with semaphore:
-            prompt = _build_judge_prompt(batch_patterns)
+            prompt = _build_judge_prompt(batch_patterns, minimal_context=use_minimal_context)
             try:
                 response = await client.chat.completions.create(
                     model=deployment,
@@ -328,7 +336,13 @@ async def run_judge(args: argparse.Namespace) -> None:
                 )
             except Exception as e:
                 failed_batches += 1
-                print(f"  Batch {batch_idx + 1} FAILED: {e}")
+                is_permanent = getattr(e, 'status_code', 0) == 400
+                if is_permanent:
+                    print(f"  Batch {batch_idx + 1} FILTERED (400): will retry with minimal context")
+                    for p in batch_patterns:
+                        filtered_keys.add(p["key"])
+                else:
+                    print(f"  Batch {batch_idx + 1} FAILED: {e}")
                 for p in batch_patterns:
                     if p["key"] not in verdicts:
                         verdicts[p["key"]] = None
@@ -344,10 +358,16 @@ async def run_judge(args: argparse.Namespace) -> None:
         unresolved = [p for p in remaining if verdicts.get(p["key"]) is None]
         if not unresolved:
             break
-        print(f"\n  Auto-retry {retry_round}: {len(unresolved)} unresolved...")
+        use_minimal = any(p["key"] in filtered_keys for p in unresolved)
+        print(f"\n  Auto-retry {retry_round}: {len(unresolved)} unresolved"
+              f"{' (minimal context)' if use_minimal else ''}...")
         retry_batches = [unresolved[i:i + batch_size] for i in range(0, len(unresolved), batch_size)]
-        retry_tasks = [judge_batch(batch, idx) for idx, batch in enumerate(retry_batches)]
+        retry_tasks = [judge_batch(batch, idx, use_minimal_context=use_minimal) for idx, batch in enumerate(retry_batches)]
         await asyncio.gather(*retry_tasks)
+
+    for key in filtered_keys:
+        if verdicts.get(key) is None:
+            verdicts[key] = key  # Keep original punctuation
 
     await client.close()
 

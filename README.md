@@ -70,12 +70,12 @@ python -c "from copilot import CopilotClient; print('Copilot import OK')"
 ./run-aoai.ps1
 ```
 
-`run-aoai.ps1` uses `AZURE_OPENAI_API_KEY` automatically when `-ApiKey` is not provided.
+`run-aoai.ps1` uses `API_KEY` automatically when `-ApiKey` is not provided.
 
 Example (current PowerShell session only):
 
 ```powershell
-$env:AZURE_OPENAI_API_KEY = "<your-key>"
+$env:API_KEY = "<your-key>"
 ./run-aoai.ps1
 ```
 
@@ -120,12 +120,12 @@ Use the unified retry flag across all evaluated models:
 ./eval_e2e.ps1 --skip-existing-results
 ```
 
-`eval_e2e.ps1` uses `AZURE_OPENAI_API_KEY` automatically when `-ApiKey` is not provided.
+`eval_e2e.ps1` uses `API_KEY` automatically when `-ApiKey` is not provided.
 
 Example (current PowerShell session only):
 
 ```powershell
-$env:AZURE_OPENAI_API_KEY = "<your-key>"
+$env:API_KEY = "<your-key>"
 ./eval_e2e.ps1 --empty-result-retries 2
 ```
 
