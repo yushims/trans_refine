@@ -4070,12 +4070,14 @@ def load_existing_output_text_lines(
     _lines = raw_text.split('\n')
     if _lines and _lines[-1] == '':
         _lines.pop()
-    reader = csv.reader(_lines, delimiter="\t")
-    for row in reader:
-        if not row:
+    # Do NOT use csv.reader: the writer doesn't CSV-quote, so a cell starting
+    # with `"` would make csv.reader slurp subsequent file lines as one quoted
+    # field, collapsing multiple rows into one record and shifting indices.
+    for _raw_l in _lines:
+        if not _raw_l:
             loaded_lines.append("")
             continue
-        cell = row[-1]
+        cell = _raw_l.rsplit("\t", 1)[1] if "\t" in _raw_l else _raw_l
         # Preserve partial segment markers verbatim (they contain JSON).
         if _is_partial_marker(cell):
             loaded_lines.append(cell)

@@ -361,13 +361,16 @@ async def main() -> None:
                     # splitlines() also splits on \x1c, \x1d, \x1e, \x85,
                     # \u2028, \u2029 which can appear in ASR transcription
                     # text and would corrupt the line count.
-                    import csv as _csv
+                    # Do NOT use csv.reader: the writer doesn't CSV-quote,
+                    # so a cell starting with `"` would make csv.reader slurp
+                    # subsequent file lines as one quoted field, collapsing
+                    # multiple rows into one record and shifting indices.
                     resume_lines = []
                     _raw_lines = _raw.split("\n")
                     if _raw_lines and _raw_lines[-1] == "":
                         _raw_lines.pop()
-                    for row in _csv.reader(_raw_lines, delimiter="\t"):
-                        cell = row[-1] if row else ""
+                    for _raw_l in _raw_lines:
+                        cell = _raw_l.rsplit("\t", 1)[1] if "\t" in _raw_l else _raw_l
                         # Sanitize all resume lines unconditionally to strip embedded
                         # control characters that would corrupt line alignment.
                         resume_lines.append(sanitize_output_string(cell))
@@ -1170,7 +1173,6 @@ async def main() -> None:
             return ct
 
         # Load resume lines if output file exists.
-        import csv as _rt_csv
         resume_lines: list[str] | None = None
         if resume_from_output and output_file_value:
             _out_path = _resolve_path(output_file_value)
@@ -1186,8 +1188,12 @@ async def main() -> None:
                     _raw_lines = _raw.split("\n")
                     if _raw_lines and _raw_lines[-1] == "":
                         _raw_lines.pop()
-                    for row in _rt_csv.reader(_raw_lines, delimiter="\t"):
-                        cell = row[-1] if row else ""
+                    # Do NOT use csv.reader: the writer doesn't CSV-quote,
+                    # so a cell starting with `"` would make csv.reader slurp
+                    # subsequent file lines as one quoted field, collapsing
+                    # multiple rows into one record and shifting indices.
+                    for _raw_l in _raw_lines:
+                        cell = _raw_l.rsplit("\t", 1)[1] if "\t" in _raw_l else _raw_l
                         resume_lines.append(sanitize_output_string(cell))
                     non_empty = sum(1 for l in resume_lines if l.strip())
                     print(f"Loaded resume output: {non_empty:,} non-empty lines.")
