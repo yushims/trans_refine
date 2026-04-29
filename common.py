@@ -470,10 +470,12 @@ _OPENING_PUNCT_TOKENS = {
     "［",
     "｛",
 }
+# Scripts that do not use spaces between words. Hangul (Korean) is intentionally
+# excluded: ko-KR uses spaces between words, so Hangul should be treated like
+# Latin/Cyrillic for spacing and validation purposes.
 _CHAR_BASED_NO_SPACE_GROUPS = {
     "han",
     "kana",
-    "hangul",
     "thai",
     "lao",
     "khmer",

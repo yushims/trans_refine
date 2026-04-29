@@ -30,6 +30,15 @@ from common import (
 )
 
 
+# Scripts that should be rendered as character-level edits in the aligned-edit
+# display (build_aligned_edits / _join_change_segments). This includes Hangul
+# in addition to the runtime no-space-script set, because Korean ASR text often
+# arrives without spaces and per-syllable edit display is more readable in that
+# case. Korean does use spaces between words at runtime, so this set is kept
+# separate from `_CHAR_BASED_NO_SPACE_GROUPS` (which drives spacing/validation).
+_CHAR_BASED_DISPLAY_GROUPS = _CHAR_BASED_NO_SPACE_GROUPS | {"hangul"}
+
+
 _STEP_NAME_TO_PAYLOAD_KEY = {
     "SPEAKER": "ct_speaker",
     "COMBINE": "ct_combine",
@@ -152,7 +161,7 @@ def _contains_no_space_script_char(text: str) -> bool:
     if not isinstance(text, str):
         return False
     for char in text:
-        if _char_based_script_group(char) in _CHAR_BASED_NO_SPACE_GROUPS:
+        if _char_based_script_group(char) in _CHAR_BASED_DISPLAY_GROUPS:
             return True
     return False
 
@@ -406,7 +415,7 @@ def build_aligned_edits(original_text: str, patched_text: str) -> str:
         return (
             left_group is not None
             and left_group == right_group
-            and left_group in _CHAR_BASED_NO_SPACE_GROUPS
+            and left_group in _CHAR_BASED_DISPLAY_GROUPS
         )
 
     def _expand_alignment_units(units: list[str]) -> list[str]:
@@ -416,7 +425,7 @@ def build_aligned_edits(original_text: str, patched_text: str) -> str:
                 continue
 
             first_group = _char_based_script_group(unit[0])
-            if first_group not in _CHAR_BASED_NO_SPACE_GROUPS:
+            if first_group not in _CHAR_BASED_DISPLAY_GROUPS:
                 expanded.append(unit)
                 continue
 
