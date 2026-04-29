@@ -136,13 +136,14 @@ def scan_missing_space_candidates(text: str) -> list[dict]:
 
             if is_word:
                 # Skip same-script no-space languages (CJK, Thai, etc.).
-                # Treat Han, Kana, and Hangul as compatible (East Asian text
-                # mixes these freely without spaces).
+                # Treat Han and Kana as compatible (Japanese mixes these
+                # freely without spaces). Hangul is excluded here because
+                # ko-KR uses spaces between words.
                 char_before = text[i - 1] if i > 0 else ""
                 char_after = text[j]
                 left_group = _char_based_script_group(char_before)
                 right_group = _char_based_script_group(char_after)
-                east_asian_compat = {"han", "kana", "hangul"}
+                east_asian_compat = {"han", "kana"}
                 if left_group in east_asian_compat and right_group in east_asian_compat:
                     i = j
                     continue
