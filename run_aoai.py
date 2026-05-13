@@ -24,12 +24,15 @@ from common import (
     normalize_all_uppercase_input,
     is_input_comment_line,
     install_safe_console_output,
+    is_recognized_header_line,
+    detect_input_column_delimiter,
     load_patch_and_repair_templates,
     load_existing_output_text_lines,
     merge_segment_payloads,
     prepare_jsonl_output_path,
     postprocess_apply_safe_edits,
     print_common_runtime_settings,
+    read_input_header_line,
     resolve_active_chain_step_keys,
     resolve_patch_and_repair_template_paths,
     run_transcriptions_with_concurrency,
@@ -313,6 +316,11 @@ async def main() -> None:
             f"concurrency={concurrency})"
         )
 
+        # Mirror the input's original column delimiter (tab vs. single space)
+        # so whitespace-separated `.tsv` inputs produce whitespace-separated
+        # outputs instead of being silently rewritten with tabs.
+        _col_delim = detect_input_column_delimiter(input_file_value)
+
         def _sanitize_tsv_cell(value: str) -> str:
             """Strip only characters that break TSV structure, preserving content."""
             if not isinstance(value, str):
@@ -336,9 +344,9 @@ async def main() -> None:
                 # Preserve prefix columns exactly, only sanitize TSV-breaking chars.
                 rebuilt = [_sanitize_tsv_cell(v) for v in source_row[:-1]]
                 rebuilt.append(ct)
-                return "\t".join(rebuilt)
+                return _col_delim.join(rebuilt)
             if isinstance(filename, str) and filename:
-                return f"{_sanitize_tsv_cell(filename)}\t{ct}"
+                return f"{_sanitize_tsv_cell(filename)}{_col_delim}{ct}"
             return ct
 
         # Load resume lines if output file exists.
@@ -369,6 +377,10 @@ async def main() -> None:
                     _raw_lines = _raw.split("\n")
                     if _raw_lines and _raw_lines[-1] == "":
                         _raw_lines.pop()
+                    # Skip a header line if the existing output starts with one
+                    # (input had a header → output preserves it verbatim).
+                    if _raw_lines and is_recognized_header_line(_raw_lines[0]):
+                        _raw_lines.pop(0)
                     for _raw_l in _raw_lines:
                         cell = _raw_l.rsplit("\t", 1)[1] if "\t" in _raw_l else _raw_l
                         # Sanitize all resume lines unconditionally to strip embedded
@@ -407,6 +419,13 @@ async def main() -> None:
         total_written = 0
         first_write = True
         first_jsonl_write = True
+
+        # If the input file has a recognized header, write it verbatim as the
+        # first line of the output so the original delimiter is preserved.
+        _input_header_line = read_input_header_line(input_file_value)
+        if out_text_path is not None and _input_header_line:
+            out_text_path.write_text(_input_header_line + "\n", encoding="utf-8")
+            first_write = False
         # Track failed items across all chunks for end-of-run retry.
         # Each entry: (global_idx, preprocessed_text, original_text, filename, skip_casing_flag)
         all_failed_items: list[tuple[int, str, str, str | None, bool]] = []
@@ -738,11 +757,13 @@ async def main() -> None:
                 # Verify output line count after write and sync total_written.
                 if out_text_path and out_text_path.exists():
                     actual_lines = sum(1 for _ in out_text_path.open("r", encoding="utf-8"))
-                    expected_lines = total_written + chunk_len
+                    # Account for the optional header line written before any data.
+                    header_offset = 1 if _input_header_line else 0
+                    expected_lines = total_written + chunk_len + header_offset
                     if actual_lines != expected_lines:
                         print(f"  WARNING: Output file has {actual_lines:,} lines but expected {expected_lines:,}. Syncing.")
                     # Sync total_written from actual file to prevent drift.
-                    total_written = actual_lines - chunk_len
+                    total_written = actual_lines - chunk_len - header_offset
                 return snap_output_lines
 
             # Write initial snapshot before retries so results are persisted.
@@ -946,8 +967,21 @@ async def main() -> None:
                 return lines
 
             def _extract_last_column(line: str) -> str:
-                if "\t" in line:
-                    return line.rsplit("\t", 1)[1]
+                if _col_delim == "\t":
+                    if "\t" in line:
+                        return line.rsplit("\t", 1)[1]
+                    return line
+                # Whitespace-separated: peel the first N-1 whitespace tokens
+                # as prefix; the remainder (which may contain spaces) is the
+                # trailing content column.
+                _prefix_splits = (
+                    max(0, len(_input_header_line.split()) - 1)
+                    if _input_header_line
+                    else 1
+                )
+                parts = line.split(None, _prefix_splits)
+                if len(parts) > _prefix_splits and _prefix_splits > 0:
+                    return parts[_prefix_splits]
                 return line
 
             retry_remaining = list(all_failed_items)
@@ -1128,14 +1162,38 @@ async def main() -> None:
                             merged = join_segment_text_parts([text for _, text in seg_parts])
                             final_patches[global_idx] = merged
                 if final_patches:
+                    # Determine how to peel the trailing content column from
+                    # each row. For whitespace-separated inputs the content
+                    # column may contain spaces, so we split from the left by
+                    # the prefix-column count derived from the header.
+                    if _col_delim == "\t":
+                        _prefix_splits = -1  # unused
+                    else:
+                        _prefix_splits = (
+                            max(0, len(_input_header_line.split()) - 1)
+                            if _input_header_line
+                            else 1
+                        )
                     for global_idx, ct in final_patches.items():
                         if global_idx < len(final_output):
                             line = final_output[global_idx]
-                            if "\t" in line:
-                                prefix, _ = line.rsplit("\t", 1)
-                                final_output[global_idx] = f"{prefix}\t{sanitize_output_string(ct)}"
+                            if _col_delim == "\t":
+                                if "\t" in line:
+                                    prefix, _ = line.rsplit("\t", 1)
+                                    final_output[global_idx] = f"{prefix}\t{sanitize_output_string(ct)}"
+                                else:
+                                    final_output[global_idx] = sanitize_output_string(ct)
                             else:
-                                final_output[global_idx] = sanitize_output_string(ct)
+                                # Whitespace-separated: preserve the first
+                                # `_prefix_splits` whitespace-delimited tokens
+                                # as prefix columns, replace the trailing
+                                # content column with the corrected text.
+                                parts = line.split(None, _prefix_splits)
+                                if len(parts) > _prefix_splits and _prefix_splits > 0:
+                                    prefix = " ".join(parts[:_prefix_splits])
+                                    final_output[global_idx] = f"{prefix} {sanitize_output_string(ct)}"
+                                else:
+                                    final_output[global_idx] = sanitize_output_string(ct)
                     out_text_path.write_text("\n".join(final_output) + "\n", encoding="utf-8")
                     print(f"  Resolved {len(final_patches):,} remaining partial markers to merged text.")
                 print(f"\n{len(retry_remaining):,} items still had partial failures after {batch_max_retries} retry pass(es).")
@@ -1153,6 +1211,11 @@ async def main() -> None:
         # Use the same chunk_size as batch mode but for real-time calls.
         rt_chunk_size = args.batch_size * concurrency
 
+        # Mirror the input's original column delimiter (tab vs. single space)
+        # so whitespace-separated `.tsv` inputs produce whitespace-separated
+        # outputs instead of being silently rewritten with tabs.
+        _col_delim = detect_input_column_delimiter(input_file_value)
+
         def _sanitize_tsv_cell(value: str) -> str:
             if not isinstance(value, str):
                 return ""
@@ -1167,9 +1230,9 @@ async def main() -> None:
             if isinstance(source_row, list) and source_row:
                 rebuilt = [_sanitize_tsv_cell(v) for v in source_row[:-1]]
                 rebuilt.append(ct)
-                return "\t".join(rebuilt)
+                return _col_delim.join(rebuilt)
             if isinstance(filename, str) and filename:
-                return f"{_sanitize_tsv_cell(filename)}\t{ct}"
+                return f"{_sanitize_tsv_cell(filename)}{_col_delim}{ct}"
             return ct
 
         # Load resume lines if output file exists.
@@ -1188,6 +1251,10 @@ async def main() -> None:
                     _raw_lines = _raw.split("\n")
                     if _raw_lines and _raw_lines[-1] == "":
                         _raw_lines.pop()
+                    # Skip a header line if the existing output starts with one
+                    # (input had a header → output preserves it verbatim).
+                    if _raw_lines and is_recognized_header_line(_raw_lines[0]):
+                        _raw_lines.pop(0)
                     # Do NOT use csv.reader: the writer doesn't CSV-quote,
                     # so a cell starting with `"` would make csv.reader slurp
                     # subsequent file lines as one quoted field, collapsing
@@ -1217,6 +1284,13 @@ async def main() -> None:
         first_write = True
         total_written = 0
         global_line_count = count_input_lines(input_file_value)
+
+        # If the input file has a recognized header, write it verbatim as the
+        # first line of the output so the original delimiter is preserved.
+        _input_header_line = read_input_header_line(input_file_value)
+        if out_text_path is not None and _input_header_line:
+            out_text_path.write_text(_input_header_line + "\n", encoding="utf-8")
+            first_write = False
 
         print(
             f"Streaming real-time mode (deployment={deployment}, "

@@ -3268,47 +3268,226 @@ async def run_transcriptions_with_concurrency(
     return total
 
 
+# ---------------------------------------------------------------------------
+# Shared input-file parsing helpers
+# ---------------------------------------------------------------------------
+
+# TSV header column labels (lowercased, with spaces replaced by underscores).
+_TSV_FILENAME_HEADER_LABELS = {
+    "filename", "file", "file_name", "corpusname", "corpus", "corpus_name",
+}
+_TSV_TEXT_HEADER_LABELS = {
+    "input", "input_segment", "segment", "transcription", "text", "content",
+}
+
+_EMPHASIS_TAG_RE = re.compile(r"</?\s*(?:b|strong|em|i)\b[^>]*>", flags=re.IGNORECASE)
+
+
+def _select_source_identifier(cells: list[str]) -> str | None:
+    """Return the most useful row-level identifier from *cells*.
+
+    Treats the last column as the segment text and prefers the metadata
+    column immediately before it; falls back to any earlier non-empty
+    column. Returns None for single-column rows.
+    """
+    if not cells or len(cells) < 2:
+        return None
+    preferred = cells[-2].strip()
+    if preferred:
+        return preferred
+    for value in reversed(cells[:-1]):
+        candidate = value.strip()
+        if candidate:
+            return candidate
+    return None
+
+
+def _strip_emphasis_tags(text: str) -> str:
+    if not isinstance(text, str) or not text:
+        return text
+    return _EMPHASIS_TAG_RE.sub("", text)
+
+
+def _read_input_text_with_fallback_encodings(input_path: Path) -> str | None:
+    """Read *input_path* as text, trying UTF-8 first then common fallbacks.
+
+    Returns the decoded text or None if all encodings fail. Prints a
+    diagnostic when a fallback encoding is used.
+    """
+    try:
+        return input_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        for candidate in ("utf-8-sig", "cp1250", "cp1252", "latin-1"):
+            try:
+                text = input_path.read_text(encoding=candidate)
+                print(f"Input file is not UTF-8; using fallback encoding: {candidate}")
+                return text
+            except (UnicodeDecodeError, LookupError):
+                continue
+    return None
+
+
+def _detect_whitespace_tsv(lines: list[str]) -> tuple[bool, int]:
+    """Detect whether a `.tsv` file is actually whitespace-separated.
+
+    If the first non-empty line has no tab but contains 2+ whitespace-separated
+    tokens, returns ``(True, header_column_count - 1)`` so callers can split
+    data rows with that maxsplit (preserving spaces inside the trailing
+    content column). Otherwise returns ``(False, 0)``.
+    """
+    for line in lines:
+        if not line.strip():
+            continue
+        if "\t" in line:
+            return False, 0
+        header_tokens = line.split()
+        if len(header_tokens) >= 2:
+            return True, max(0, len(header_tokens) - 1)
+        return False, 0
+    return False, 0
+
+
+def _split_tsv_row(
+    raw_line: str,
+    whitespace_separated: bool,
+    whitespace_max_splits: int,
+) -> list[str]:
+    """Split a raw TSV line into NFC-normalized cells.
+
+    Honours the whitespace-vs-tab choice from `_detect_whitespace_tsv`.
+    """
+    if whitespace_separated:
+        if not raw_line:
+            return []
+        return [
+            unicodedata.normalize("NFC", cell)
+            for cell in raw_line.split(None, whitespace_max_splits)
+        ]
+    return [unicodedata.normalize("NFC", cell) for cell in raw_line.split("\t")]
+
+
+def _is_tsv_header_row(first_cell: str, last_cell: str, num_cols: int) -> bool:
+    """Return True if (first_cell, last_cell) look like a recognized header."""
+    if num_cols <= 0:
+        return False
+    fl = first_cell.lower().replace(" ", "_")
+    ll = last_cell.lower().replace(" ", "_")
+    if num_cols >= 2 and fl in _TSV_FILENAME_HEADER_LABELS and ll in _TSV_TEXT_HEADER_LABELS:
+        return True
+    if num_cols == 1 and fl in _TSV_TEXT_HEADER_LABELS:
+        return True
+    return False
+
+
+def is_recognized_header_text_cell(cell: str) -> bool:
+    """Return True if *cell* is a recognized last-column header label.
+
+    Used by resume-mode loaders to detect and skip a header line that was
+    written to the output file from a header-bearing input.
+    """
+    if not isinstance(cell, str):
+        return False
+    return cell.strip().lower().replace(" ", "_") in _TSV_TEXT_HEADER_LABELS
+
+
+def is_recognized_header_line(line: str) -> bool:
+    """Return True if *line* parses (tab- or whitespace-split) as a header row.
+
+    Used by resume-mode loaders so that a verbatim header line written from
+    a whitespace-separated input is correctly identified and skipped.
+    """
+    if not isinstance(line, str) or not line.strip():
+        return False
+    if "\t" in line:
+        cells = [c.strip() for c in line.split("\t")]
+    else:
+        cells = line.split()
+        if len(cells) < 2:
+            return is_recognized_header_text_cell(line)
+    if not cells:
+        return False
+    return _is_tsv_header_row(cells[0], cells[-1], len(cells))
+
+
+def read_input_header_line(input_file_value: str | None) -> str | None:
+    """Return the input file's recognized header line verbatim, or None.
+
+    Reads only the first non-empty line (with line terminators stripped).
+    Honours whitespace-separated `.tsv` files (no tabs but multiple
+    whitespace tokens). Returns None for non-TSV inputs, missing files,
+    decode failures, or first lines that don't match a recognized header
+    pattern. The raw line is returned so callers can preserve the original
+    delimiter (tab vs. whitespace) when writing it back to the output.
+    """
+    if not input_file_value:
+        return None
+    input_path = resolve_path(input_file_value)
+    if not input_path.exists() or input_path.suffix.lower() != ".tsv":
+        return None
+    try:
+        with input_path.open("r", encoding="utf-8", errors="replace") as fh:
+            first_line: str | None = None
+            for raw in fh:
+                line = raw.rstrip("\r\n")
+                if line.strip():
+                    first_line = line
+                    break
+    except OSError:
+        return None
+    if first_line is None:
+        return None
+
+    if "\t" in first_line:
+        cells = [cell.strip() for cell in first_line.split("\t")]
+    else:
+        tokens = first_line.split()
+        if len(tokens) < 2:
+            return None
+        cells = tokens
+
+    first_cell = cells[0] if cells else ""
+    last_cell = cells[-1] if cells else ""
+    if _is_tsv_header_row(first_cell, last_cell, len(cells)):
+        return first_line
+    return None
+
+
+def detect_input_column_delimiter(input_file_value: str | None) -> str:
+    """Return the column delimiter used by *input_file_value*.
+
+    Returns ``" "`` when the `.tsv` file is whitespace-separated (no tabs in
+    the first non-empty line but 2+ whitespace tokens), otherwise ``"\\t"``.
+    Used so output rows can mirror the input's original delimiter instead of
+    being rewritten with tabs.
+    """
+    if not input_file_value:
+        return "\t"
+    input_path = resolve_path(input_file_value)
+    if not input_path.exists() or input_path.suffix.lower() != ".tsv":
+        return "\t"
+    try:
+        with input_path.open("r", encoding="utf-8", errors="replace") as fh:
+            for raw in fh:
+                line = raw.rstrip("\r\n")
+                if not line.strip():
+                    continue
+                if "\t" in line:
+                    return "\t"
+                if len(line.split()) >= 2:
+                    return " "
+                return "\t"
+    except OSError:
+        return "\t"
+    return "\t"
+
+
 def parse_transcriptions_from_file(
     input_path: Path,
 ) -> tuple[list[str], list[str | None], list[list[str] | None]]:
-    def _select_source_identifier(cells: list[str]) -> str | None:
-        if not cells or len(cells) < 2:
-            return None
-
-        # Treat the last column as the segment text; prefer the metadata column
-        # immediately before it as a stable row-level identifier.
-        preferred = cells[-2].strip()
-        if preferred:
-            return preferred
-
-        for value in reversed(cells[:-1]):
-            candidate = value.strip()
-            if candidate:
-                return candidate
-
-        return None
-
-    def _strip_emphasis_tags(text: str) -> str:
-        if not isinstance(text, str) or not text:
-            return text
-        return re.sub(r"</?\s*(?:b|strong|em|i)\b[^>]*>", "", text, flags=re.IGNORECASE)
-
-    # Detect encoding: try UTF-8 first, fall back to common legacy encodings.
-    # Single bulk read is fastest even for OneDrive/network-backed filesystems.
-    try:
-        raw_text = input_path.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
-        raw_text = None
-        for candidate in ("utf-8-sig", "cp1250", "cp1252", "latin-1"):
-            try:
-                raw_text = input_path.read_text(encoding=candidate)
-                print(f"Input file is not UTF-8; using fallback encoding: {candidate}")
-                break
-            except (UnicodeDecodeError, LookupError):
-                continue
-        if raw_text is None:
-            print(f"Could not decode input file with any supported encoding: {input_path}")
-            return [], [], []
+    raw_text = _read_input_text_with_fallback_encodings(input_path)
+    if raw_text is None:
+        print(f"Could not decode input file with any supported encoding: {input_path}")
+        return [], [], []
 
     if not raw_text:
         return [], [], []
@@ -3329,37 +3508,26 @@ def parse_transcriptions_from_file(
         source_rows: list[list[str] | None] = []
         if not _store_full_rows:
             print(f"  Large file ({total_lines:,} lines): storing prefix columns only to save memory.")
-        reader = csv.reader(lines, delimiter="\t")
-        for row_index, row in enumerate(reader):
+
+        whitespace_separated, whitespace_max_splits = _detect_whitespace_tsv(lines)
+        if whitespace_separated:
+            print(
+                f"  No tabs detected; treating as whitespace-separated "
+                f"(maxsplit={whitespace_max_splits})."
+            )
+
+        for row_index, raw_line in enumerate(lines):
             if row_index > 0 and row_index % 1_000_000 == 0:
                 print(f"  Parsed {row_index:,}/{total_lines:,} rows...")
-            row = [unicodedata.normalize("NFC", cell) for cell in row]
+            row = _split_tsv_row(raw_line, whitespace_separated, whitespace_max_splits)
             if not row or not any(cell.strip() for cell in row):
                 continue
 
-            first_cell = row[0].strip() if len(row) > 0 else ""
-            last_cell = row[-1].strip() if len(row) > 0 else ""
-            if row_index == 0:
-                first_label = first_cell.lower().replace(" ", "_")
-                last_label = last_cell.lower().replace(" ", "_")
-                if first_label in {"filename", "file", "file_name"} and last_label in {
-                    "input",
-                    "input_segment",
-                    "segment",
-                    "transcription",
-                    "text",
-                }:
-                    first_row_is_header = True
-                    continue
-                if len(row) == 1 and first_label in {
-                    "input",
-                    "input_segment",
-                    "segment",
-                    "transcription",
-                    "text",
-                }:
-                    first_row_is_header = True
-                    continue
+            first_cell = row[0].strip()
+            last_cell = row[-1].strip()
+            if row_index == 0 and _is_tsv_header_row(first_cell, last_cell, len(row)):
+                first_row_is_header = True
+                continue
 
             if len(row) >= 2:
                 filename = _select_source_identifier(row)
@@ -3928,36 +4096,12 @@ def iter_transcription_chunks(
     """
     input_path = resolve_path(input_file_value)
 
-    # Detect encoding (single bulk read — fast even on OneDrive).
-    try:
-        raw_text = input_path.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
-        raw_text = None
-        for candidate in ("utf-8-sig", "cp1250", "cp1252", "latin-1"):
-            try:
-                raw_text = input_path.read_text(encoding=candidate)
-                print(f"Input file is not UTF-8; using fallback encoding: {candidate}")
-                break
-            except (UnicodeDecodeError, LookupError):
-                continue
-        if raw_text is None:
-            print(f"Could not decode input file: {input_path}")
-            return
-
+    raw_text = _read_input_text_with_fallback_encodings(input_path)
+    if raw_text is None:
+        print(f"Could not decode input file: {input_path}")
+        return
     if not raw_text:
         return
-
-    def _select_source_identifier(cells: list[str]) -> str | None:
-        if not cells or len(cells) < 2:
-            return None
-        preferred = cells[-2].strip()
-        if preferred:
-            return preferred
-        for value in reversed(cells[:-1]):
-            candidate = value.strip()
-            if candidate:
-                return candidate
-        return None
 
     # Parse lines and yield chunks as they fill up — no need to store the whole file.
     chunk_transcriptions: list[str] = []
@@ -3971,20 +4115,17 @@ def iter_transcription_chunks(
         if lines and lines[-1] == '':
             lines.pop()
         del raw_text
+
+        whitespace_separated, whitespace_max_splits = _detect_whitespace_tsv(lines)
+
         for row_index, raw_line in enumerate(lines):
-            row = [unicodedata.normalize("NFC", cell) for cell in raw_line.split("\t")]
+            row = _split_tsv_row(raw_line, whitespace_separated, whitespace_max_splits)
             if not row or not any(cell.strip() for cell in row):
                 continue
-            first_cell = row[0].strip() if row else ""
-            last_cell = row[-1].strip() if row else ""
-            # Skip header.
-            if row_index == 0:
-                fl = first_cell.lower().replace(" ", "_")
-                ll = last_cell.lower().replace(" ", "_")
-                if (fl in {"filename", "file", "file_name"} and ll in {"input", "input_segment", "segment", "transcription", "text"}):
-                    continue
-                if len(row) == 1 and fl in {"input", "input_segment", "segment", "transcription", "text"}:
-                    continue
+            first_cell = row[0].strip()
+            last_cell = row[-1].strip()
+            if row_index == 0 and _is_tsv_header_row(first_cell, last_cell, len(row)):
+                continue
             if len(row) >= 2:
                 chunk_filenames.append(_select_source_identifier(row))
                 chunk_transcriptions.append(last_cell)
