@@ -23,14 +23,25 @@ If any field is unknown, use valid defaults instead of explanation.
 """.strip()
 
 
+def _is_claude_model(model_name: str) -> bool:
+    return isinstance(model_name, str) and model_name.lower().startswith("claude-")
+
+
 def build_copilot_session_parameters(model_name: str) -> dict[str, Any]:
+    """Build keyword arguments for ``CopilotClient.create_session(**params)``.
+
+    Targets ``github-copilot-sdk>=0.3``: ``system_message`` is a TypedDict,
+    and ``response_format`` is no longer accepted. The Copilot CLI returns
+    JSON reliably for our prompts without it.
+    """
     session_parameters: dict[str, Any] = {
         "model": model_name,
         "tools": [],
         "streaming": False,
-        "system_message": STRICT_JSON_SYSTEM,
-        "response_format": {"type": "json_object"},
+        "system_message": {"mode": "append", "content": STRICT_JSON_SYSTEM},
     }
+    # Reasoning effort is supported only for the GPT-5.x reasoning family;
+    # Claude models accept it too but we leave it unset to use server defaults.
     if model_name in ["gpt-5.2"]:
         session_parameters["reasoning_effort"] = "low"
     return session_parameters
@@ -121,7 +132,7 @@ async def send_copilot_once(
         if getattr(event, "id", None) is not None
     }
 
-    await session.send({"prompt": prompt, "mode": "immediate"})
+    await session.send(prompt, mode="immediate")
 
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout_seconds

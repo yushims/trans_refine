@@ -859,7 +859,11 @@ async def send_copilot_prompt_once(
     prompt: str,
     timeout_seconds: float,
 ) -> str:
-    session = await client.create_session(build_copilot_session_parameters(model_name))
+    from copilot.session import PermissionHandler  # local import to keep top-level deps minimal
+    session = await client.create_session(
+        on_permission_request=PermissionHandler.approve_all,
+        **build_copilot_session_parameters(model_name),
+    )
     return await send_copilot_once(
         session,
         prompt,

@@ -333,7 +333,11 @@ async def main():
                 session_parameters = build_copilot_session_parameters(model)
 
                 async def create_session() -> Any:
-                    return await client.create_session(session_parameters)
+                    from copilot.session import PermissionHandler
+                    return await client.create_session(
+                        on_permission_request=PermissionHandler.approve_all,
+                        **session_parameters,
+                    )
 
                 source_length = len(prompt_transcription)
                 if max_input_chars_per_call > 0 and source_length > max_input_chars_per_call:
@@ -396,7 +400,6 @@ async def main():
                             skip_first_token_casing_preservation,
                             active_step_keys,
                             _on_final_failure,
-                            False,
                         )
 
                         if segment_payload is not None:
