@@ -267,6 +267,22 @@ def add_run_pipeline_cli_arguments(
         default=False,
         help="Apply character-level diff post-processing to accept only safe edits (punctuation/casing) and reject word-content changes.",
     )
+    parser.add_argument(
+        "--use-skill",
+        dest="use_skill",
+        default=None,
+        help=(
+            "Name of a Claude Agent Skill to use instead of a flat prompt file (e.g. 'asr-patch-router'). "
+            "When set, the patch prompt is loaded from <skill-dir>/<use-skill>/SKILL.md. "
+            "Overrides --patch-prompt-file unless that flag is also explicitly set."
+        ),
+    )
+    parser.add_argument(
+        "--skill-dir",
+        dest="skill_dir",
+        default="claude_skill",
+        help="Root directory containing Claude skill folders. Used only when --use-skill is set. Default: claude_skill.",
+    )
 
 
 def add_aoai_sampling_cli_arguments(
@@ -2808,6 +2824,32 @@ def resolve_patch_and_repair_template_paths(
         return None, None, repair_path_error
 
     return prompt_template_path, repair_prompt_template_path, None
+
+
+def resolve_skill_patch_prompt_override(
+    use_skill: str | None,
+    skill_dir: str | None,
+    explicit_patch_prompt_file: str | None,
+) -> tuple[str | None, str | None]:
+    """Return (patch_prompt_file_override, error).
+
+    If ``use_skill`` is set and the user did NOT explicitly pass
+    ``--patch-prompt-file``, return the resolved ``SKILL.md`` path so the
+    existing template-loading path picks it up. Otherwise return the explicit
+    value unchanged.
+    """
+    if not use_skill:
+        return explicit_patch_prompt_file, None
+    if explicit_patch_prompt_file:
+        # User explicitly overrode the patch prompt; respect it.
+        return explicit_patch_prompt_file, None
+    base = Path(skill_dir) if skill_dir else Path("claude_skill")
+    if not base.is_absolute():
+        base = (Path(__file__).parent / base).resolve()
+    skill_path = base / use_skill / "SKILL.md"
+    if not skill_path.exists():
+        return None, f"Skill SKILL.md not found: {skill_path}"
+    return str(skill_path), None
 
 
 def print_common_runtime_settings(

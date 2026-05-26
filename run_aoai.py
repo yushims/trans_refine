@@ -321,6 +321,33 @@ async def main() -> None:
         # outputs instead of being silently rewritten with tabs.
         _col_delim = detect_input_column_delimiter(input_file_value)
 
+        # Determine expected column count so resume-line parsing can correctly
+        # extract just the last (content) cell for whitespace-separated TSVs.
+        _resume_header_line = read_input_header_line(input_file_value)
+        if _resume_header_line:
+            if "\t" in _resume_header_line:
+                _resume_input_ncols = _resume_header_line.count("\t") + 1
+            else:
+                _resume_input_ncols = len(_resume_header_line.split())
+        else:
+            _resume_input_ncols = 0
+
+        def _extract_resume_last_cell(line: str) -> str:
+            """Return the last column of a previously written output line.
+
+            For tab-separated outputs, splits on the final tab. For
+            whitespace-separated outputs with a known column count, splits on
+            whitespace with maxsplit=ncols-1 so the prefix columns are not
+            captured in the content cell.
+            """
+            if "\t" in line:
+                return line.rsplit("\t", 1)[1]
+            if _col_delim != "\t" and _resume_input_ncols > 1:
+                parts = line.split(None, _resume_input_ncols - 1)
+                if len(parts) == _resume_input_ncols:
+                    return parts[-1]
+            return line
+
         def _sanitize_tsv_cell(value: str) -> str:
             """Strip only characters that break TSV structure, preserving content."""
             if not isinstance(value, str):
@@ -382,7 +409,7 @@ async def main() -> None:
                     if _raw_lines and is_recognized_header_line(_raw_lines[0]):
                         _raw_lines.pop(0)
                     for _raw_l in _raw_lines:
-                        cell = _raw_l.rsplit("\t", 1)[1] if "\t" in _raw_l else _raw_l
+                        cell = _extract_resume_last_cell(_raw_l)
                         # Sanitize all resume lines unconditionally to strip embedded
                         # control characters that would corrupt line alignment.
                         resume_lines.append(sanitize_output_string(cell))
@@ -1216,6 +1243,25 @@ async def main() -> None:
         # outputs instead of being silently rewritten with tabs.
         _col_delim = detect_input_column_delimiter(input_file_value)
 
+        # Expected column count for resume-line parsing (whitespace-separated TSVs).
+        _resume_header_line = read_input_header_line(input_file_value)
+        if _resume_header_line:
+            if "\t" in _resume_header_line:
+                _resume_input_ncols = _resume_header_line.count("\t") + 1
+            else:
+                _resume_input_ncols = len(_resume_header_line.split())
+        else:
+            _resume_input_ncols = 0
+
+        def _extract_resume_last_cell(line: str) -> str:
+            if "\t" in line:
+                return line.rsplit("\t", 1)[1]
+            if _col_delim != "\t" and _resume_input_ncols > 1:
+                parts = line.split(None, _resume_input_ncols - 1)
+                if len(parts) == _resume_input_ncols:
+                    return parts[-1]
+            return line
+
         def _sanitize_tsv_cell(value: str) -> str:
             if not isinstance(value, str):
                 return ""
@@ -1260,7 +1306,7 @@ async def main() -> None:
                     # subsequent file lines as one quoted field, collapsing
                     # multiple rows into one record and shifting indices.
                     for _raw_l in _raw_lines:
-                        cell = _raw_l.rsplit("\t", 1)[1] if "\t" in _raw_l else _raw_l
+                        cell = _extract_resume_last_cell(_raw_l)
                         resume_lines.append(sanitize_output_string(cell))
                     non_empty = sum(1 for l in resume_lines if l.strip())
                     print(f"Loaded resume output: {non_empty:,} non-empty lines.")

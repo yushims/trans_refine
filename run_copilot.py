@@ -31,6 +31,7 @@ from common import (
     print_common_runtime_settings,
     resolve_active_chain_step_keys,
     resolve_patch_and_repair_template_paths,
+    resolve_skill_patch_prompt_override,
     run_transcriptions_with_concurrency,
     take_next_transcription_segment_for_llm,
     write_fallback_text_output,
@@ -135,6 +136,16 @@ async def main():
         progress_write_every = 100 if resume_from_output else 1
     base_progress_write_every = progress_write_every
 
+    skill_override_value, skill_error = resolve_skill_patch_prompt_override(
+        getattr(args, "use_skill", None),
+        getattr(args, "skill_dir", None),
+        args.patch_prompt_file,
+    )
+    if skill_error:
+        print(skill_error)
+        return
+    args.patch_prompt_file = skill_override_value
+
     prompt_template_path, repair_prompt_template_path, template_error = resolve_patch_and_repair_template_paths(
         args.patch_prompt_file,
         args.repair_prompt_file,
@@ -146,6 +157,8 @@ async def main():
         return
 
     print(f"Using model: {model}")
+    if args.use_skill:
+        print(f"Using Claude skill: {args.use_skill} (skill-dir: {args.skill_dir})")
     if chain_steps:
         print(f"Chain step selector count: {len(chain_steps)}")
     print(f"Resolved active chain: {format_resolved_chain_steps(chain_steps)}")
