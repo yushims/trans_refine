@@ -112,15 +112,38 @@ The `translation` key remains present in the final JSON regardless.
 
 ## Step 6 — Output contract
 
-Return **exactly one** JSON object, no markdown/prose, with these exact keys:
+Return **exactly one** JSON object, no markdown/prose, matching this schema exactly. Every key, type, and shape below is mandatory — emitting `tokenization` as a string or array (instead of an object containing `tokens`) is a schema violation and will be retried.
 
-```
-tokenization, translation, aggressiveness_level, speaker_scope, seg_start, seg_end,
-ct_speaker, ct_combine, no_touch_tokens, ct_lexical, ct_disfluency, ct_format,
-ct_numeral, ct_punct, ct_casing, ct_remain_fix
+### Output Schema
+
+```json
+{
+  "tokenization": {"tokens": []},
+  "translation": "string",
+  "aggressiveness_level": "low/medium/high",
+  "speaker_scope": "single/multi",
+  "seg_start": "high/medium/low",
+  "seg_end": "high/medium/low",
+  "ct_speaker": {"edits": [[before, after]], "result": "string"},
+  "ct_combine": {"edits": [], "result": "string"},
+  "no_touch_tokens": [],
+  "ct_lexical": {"edits": [], "result": "string"},
+  "ct_disfluency": {"edits": [], "result": "string"},
+  "ct_format": {"edits": [], "result": "string"},
+  "ct_numeral": {"edits": [], "result": "string"},
+  "ct_punct": {"edits": [], "result": "string"},
+  "ct_casing": {"edits": [], "result": "string"},
+  "ct_remain_fix": {"edits": [], "result": "string"}
+}
 ```
 
-Each `ct_*` value is `{"edits": [[before, after], ...], "result": "string"}`.
+Shape rules:
+
+- `tokenization` MUST be an object of the form `{"tokens": [<string>, ...]}`. Never a string, never a bare array.
+- `translation` MUST be a string (use `""` when `needs_translation` is false).
+- `no_touch_tokens` MUST be an array of strings (use `[]` when `NO_TOUCH` is inactive).
+- Every `ct_*` MUST be `{"edits": [[before, after], ...], "result": "string"}`. Inactive steps use `"edits": []` and pass-through `"result"`.
+- No markdown fencing, no extra keys, no commentary outside the JSON object.
 
 ## Non-negotiables (enforced across all step skills)
 

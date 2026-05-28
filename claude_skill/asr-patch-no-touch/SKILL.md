@@ -23,3 +23,35 @@ description: Extract immutable spans (proper names, legal entities, technical br
 ```
 
 If `NO_TOUCH` is inactive, `no_touch_tokens` MUST be `[]`.
+
+## Standalone invocation (full top-level schema)
+
+When this skill is invoked directly via `--use-skill asr-patch-no-touch --chain-steps NO_TOUCH` (no router), you MUST still emit the full ASR-patch top-level JSON schema below. Returning only the step-local fragment fails the pipeline's schema check.
+
+- Put identified protected spans in the top-level `no_touch_tokens` array.
+- Every `ct_*` MUST be `{"edits": [], "result": "<unchanged source text>"}` (this step makes no textual edits).
+- `tokenization` MUST be `{"tokens": [...]}` — best-effort tokenization of the source text.
+- `translation` MUST be a string; use `""` if you cannot produce one.
+- `aggressiveness_level`, `speaker_scope`, `seg_start`, `seg_end` MUST be present as strings using the allowed values.
+- No markdown fencing, no extra keys, no commentary outside the JSON object.
+
+```json
+{
+  "tokenization": {"tokens": []},
+  "translation": "string",
+  "aggressiveness_level": "low/medium/high",
+  "speaker_scope": "single/multi",
+  "seg_start": "high/medium/low",
+  "seg_end": "high/medium/low",
+  "ct_speaker":    {"edits": [], "result": "string"},
+  "ct_combine":    {"edits": [], "result": "string"},
+  "no_touch_tokens": ["span1", "span2"],
+  "ct_lexical":    {"edits": [], "result": "string"},
+  "ct_disfluency": {"edits": [], "result": "string"},
+  "ct_format":     {"edits": [], "result": "string"},
+  "ct_numeral":    {"edits": [], "result": "string"},
+  "ct_punct":      {"edits": [], "result": "string"},
+  "ct_casing":     {"edits": [], "result": "string"},
+  "ct_remain_fix": {"edits": [], "result": "string"}
+}
+```
